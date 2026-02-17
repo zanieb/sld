@@ -1069,6 +1069,13 @@ struct SymbolTableWriter<'layout, 'out> {
     is_dynamic: bool,
 }
 
+/// Returns true if a symbol should be treated as local in the symbol table.
+/// This includes both originally-local symbols and symbols downgraded by version scripts.
+#[inline]
+fn is_symtab_local(sym: &crate::elf::Symbol, flags: ValueFlags) -> bool {
+    sym.is_local() || flags.is_downgraded_to_local()
+}
+
 impl<'layout, 'out> SymbolTableWriter<'layout, 'out> {
     fn new(
         start_string_offset: u32,
@@ -1116,6 +1123,7 @@ impl<'layout, 'out> SymbolTableWriter<'layout, 'out> {
         name: &[u8],
         output_section_id: OutputSectionId,
         value: u64,
+        flags: ValueFlags,
     ) -> Result<&mut SymtabEntry> {
         let shndx = self
             .output_sections
@@ -1128,7 +1136,7 @@ impl<'layout, 'out> SymbolTableWriter<'layout, 'out> {
                     output_section_id,
                 )
             })?;
-        self.copy_symbol_shndx(sym, name, shndx, value)
+        self.copy_symbol_shndx(sym, name, shndx, value, flags)
     }
 
     #[inline(always)]
@@ -1138,25 +1146,39 @@ impl<'layout, 'out> SymbolTableWriter<'layout, 'out> {
         name: &[u8],
         shndx: u16,
         value: u64,
+        flags: ValueFlags,
     ) -> Result<&mut SymtabEntry> {
         let e = LittleEndian;
-        let is_local = sym.is_local();
+        let is_local = is_symtab_local(sym, flags);
         let size = sym.st_size(e);
         let entry = self.define_symbol(is_local, shndx, value, size, name)?;
         entry.st_info = sym.st_info();
         entry.st_other = sym.st_other();
+        // Fix binding if symbol was downgraded to local by version script
+        if flags.is_downgraded_to_local() {
+            entry.set_st_info(object::elf::STB_LOCAL, sym.st_type());
+        }
         Ok(entry)
     }
 
-    fn copy_absolute_symbol(&mut self, sym: &crate::elf::Symbol, name: &[u8]) -> Result {
+    fn copy_absolute_symbol(
+        &mut self,
+        sym: &crate::elf::Symbol,
+        name: &[u8],
+        flags: ValueFlags,
+    ) -> Result<&mut SymtabEntry> {
         let e = LittleEndian;
-        let is_local = sym.is_local();
+        let is_local = is_symtab_local(sym, flags);
         let value = sym.st_value(e);
         let size = sym.st_size(e);
         let entry = self.define_symbol(is_local, object::elf::SHN_ABS, value, size, name)?;
         entry.st_info = sym.st_info();
         entry.st_other = sym.st_other();
-        Ok(())
+        // Fix binding if symbol was downgraded to local by version script
+        if flags.is_downgraded_to_local() {
+            entry.set_st_info(object::elf::STB_LOCAL, sym.st_type());
+        }
+        Ok(entry)
     }
 
     #[inline(always)]
@@ -1284,9 +1306,13 @@ fn write_object<P: Platform>(
                     .object
                     .symbol(object.symbol_id_range.id_to_input(symbol_id))?;
                 let name = object.object.symbol_name(symbol)?;
-                table_writer
-                    .dynsym_writer
-                    .copy_symbol_shndx(symbol, name, 0, 0)?;
+                table_writer.dynsym_writer.copy_symbol_shndx(
+                    symbol,
+                    name,
+                    0,
+                    0,
+                    ValueFlags::empty(),
+                )?;
                 if layout.gnu_version_enabled() {
                     table_writer
                         .version_writer
@@ -1570,7 +1596,7 @@ fn write_symbols(
                     }
                 } else if sym.is_absolute(e) {
                     symbol_writer
-                        .copy_absolute_symbol(sym, info.name)
+                        .copy_absolute_symbol(sym, info.name, flags.get())
                         .with_context(|| {
                             format!("Failed to absolute {}", layout.symbol_debug(symbol_id))
                         })?;
@@ -1592,7 +1618,7 @@ fn write_symbols(
             }
 
             let entry = symbol_writer
-                .copy_symbol(sym, info.name, section_id, symbol_value)
+                .copy_symbol(sym, info.name, section_id, symbol_value, flags.get())
                 .with_context(|| format!("Failed to copy {}", layout.symbol_debug(symbol_id)))?;
 
             // Adjust symbol size for relaxation-induced byte deletions.
@@ -3690,7 +3716,7 @@ fn write_copy_relocation_dynamic_symbol_definition(
         .local_symbol_resolution(sym_def.symbol_id)
         .context("Copy relocation for unresolved symbol")?;
     dynamic_symbol_writer
-        .copy_symbol_shndx(sym, name, shndx, res.raw_value)
+        .copy_symbol_shndx(sym, name, shndx, res.raw_value, ValueFlags::empty())
         .with_context(|| {
             format!(
                 "Failed to copy dynamic {}",
@@ -3764,14 +3790,20 @@ fn write_regular_object_dynamic_symbol_definition(
                 symbol_value -= layout.tls_start_address();
             }
             dynamic_symbol_writer
-                .copy_symbol(sym, name, output_section_id, symbol_value)
+                .copy_symbol(
+                    sym,
+                    name,
+                    output_section_id,
+                    symbol_value,
+                    ValueFlags::empty(),
+                )
                 .with_context(|| {
                     format!("Failed to copy dynamic {}", layout.symbol_debug(symbol_id))
                 })?;
         }
     } else {
         dynamic_symbol_writer
-            .copy_symbol_shndx(sym, name, 0, 0)
+            .copy_symbol_shndx(sym, name, 0, 0, ValueFlags::empty())
             .with_context(|| {
                 format!(
                     "Failed to copy dynamic {}",
@@ -4456,6 +4488,7 @@ fn write_dynamic_file<P: Platform>(
                     name,
                     output_section_id::BSS,
                     res.value(),
+                    ValueFlags::empty(),
                 )?;
             } else {
                 let entry = table_writer
