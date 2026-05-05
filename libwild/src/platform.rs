@@ -970,6 +970,9 @@ pub(crate) trait Symbol: std::fmt::Debug + Copy + Send + Sync + 'static {
 
     fn has_name(&self) -> bool;
 
+    /// Returns whether this symbol should be omitted from the output symtab by default.
+    fn is_default_strippable(&self, name: &[u8]) -> bool;
+
     fn debug_string(&self) -> String;
 
     /// Returns whether this symbol has been declared as a TLS variable.

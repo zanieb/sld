@@ -2910,6 +2910,11 @@ impl platform::Symbol for SymtabEntry {
         object::read::elf::Sym::st_name(self, LittleEndian) != 0
     }
 
+    fn is_default_strippable(&self, name: &[u8]) -> bool {
+        (self.is_local() && name.starts_with(b".L"))
+            || crate::symbol_db::is_mapping_symbol_name(name)
+    }
+
     fn debug_string(&self) -> String {
         SymDebug(self).to_string()
     }
