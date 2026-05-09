@@ -1929,6 +1929,10 @@ impl ProgramInputs {
             }
         }
 
+        let incremental_output = Linker::Wild.output_path(self.name(), &incremental_config);
+        let _ = std::fs::remove_file(&incremental_output);
+        let _ = std::fs::remove_dir_all(append_to_path(&incremental_output, ".incr"));
+
         let link_output_1 =
             Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
         let original_content = std::fs::read(&link_output_1.binary).with_context(|| {
@@ -1961,6 +1965,13 @@ impl ProgramInputs {
         if !log.contains("reused existing output") {
             bail!(
                 "Incremental test failed for {}: second link did not reuse existing output. Log:\n{}",
+                self.name(),
+                log
+            );
+        }
+        if cfg!(unix) && !log.contains("before loading inputs") {
+            bail!(
+                "Incremental test failed for {}: second link did not use the metadata fast path. Log:\n{}",
                 self.name(),
                 log
             );
@@ -2018,6 +2029,13 @@ impl ProgramInputs {
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
+            if !log.contains("full relink: input file changed") {
+                bail!(
+                    "Incremental test failed for {}: changed-input relink was not classified as an input change. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
             if !log.contains("unchanged input sections") {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not reuse unchanged input sections. Log:\n{}",

@@ -31,7 +31,23 @@ pub(crate) struct BenchConfig {
     pub(crate) wild_extra_flags: Vec<String>,
     /// Paths relative to the save-dir to mutate before each timed run.
     #[serde(default)]
-    pub(crate) mutate_files: Vec<String>,
+    pub(crate) mutate_files: Vec<Mutation>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum Mutation {
+    AppendZero(String),
+    ElfSectionByte { path: String, section: String },
+}
+
+impl Mutation {
+    pub(crate) fn path(&self) -> &str {
+        match self {
+            Mutation::AppendZero(path) => path,
+            Mutation::ElfSectionByte { path, .. } => path,
+        }
+    }
 }
 
 impl Config {
@@ -63,6 +79,33 @@ mutate_files = ["changed.o"]
         .unwrap();
 
         let bench = config.benches.get("changed-incremental").unwrap();
-        assert_eq!(bench.mutate_files, ["changed.o"]);
+        assert_eq!(
+            bench.mutate_files,
+            [super::Mutation::AppendZero("changed.o".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parses_incremental_elf_section_mutation() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ path = "changed.o", section = ".data" }]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(
+            bench.mutate_files,
+            [super::Mutation::ElfSectionByte {
+                path: "changed.o".to_owned(),
+                section: ".data".to_owned(),
+            }]
+        );
     }
 }

@@ -70,8 +70,10 @@ wild_extra_flags = ["--incremental"]
 The runner performs a warmup run first, so the timed runs measure reuse of the incremental state.
 
 To measure changed-input incremental relinks, use `mutate_files` with paths relative to the
-save-dir. The runner appends one zero byte to each listed file before every timed run. The warmup
-run is not mutated, so it seeds the initial incremental state; each timed run then measures a real
+save-dir. A string entry appends one zero byte to the listed file before every timed run. A table
+entry with `path` and `section` flips the first byte of that ELF section instead, which is useful
+when the benchmark should prove that changed inputs also change the linked output. The warmup run is
+not mutated, so it seeds the initial incremental state; each timed run then measures a real
 changed-input relink. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
 
 ```toml
@@ -80,6 +82,14 @@ save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
 mutate_files = ["path/to/input.o"]
+```
+
+```toml
+[bench.ripgrep-incremental-changed-data]
+save = "ripgrep"
+skip_linkers = ["bfd", "lld", "mold"]
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ path = "path/to/input.o", section = ".data" }]
 ```
 
 ### Run benchmark with hyperfine

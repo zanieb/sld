@@ -235,7 +235,9 @@ impl Linker {
 
         // Write the dependency file and inputs trace after successful linking.
         if result.is_ok() {
-            if let Some(dep_file_path) = &args.dependency_file() {
+            if let Some(dep_file_path) = &args.dependency_file()
+                && !file_loader.loaded_files.is_empty()
+            {
                 write_dependency_file(dep_file_path, args.output(), &file_loader.loaded_files)
                     .with_context(|| {
                         format!(
@@ -244,7 +246,7 @@ impl Linker {
                         )
                     })?;
             }
-            if args.should_write_trace_file() {
+            if args.should_write_trace_file() && !file_loader.loaded_files.is_empty() {
                 let mut buf = BufWriter::new(std::io::stdout());
                 for input in &file_loader.loaded_files {
                     writeln!(buf, "{}", input.filename.display())?;
@@ -260,6 +262,10 @@ impl Linker {
         file_loader: &mut FileLoader<'data>,
         args: &'data P::Args,
     ) -> error::Result<LinkerOutput<'data>> {
+        if incremental::maybe_reuse_output_before_loading(args)? {
+            return Ok(LinkerOutput { layout: None });
+        }
+
         let mut plugin = P::maybe_init_linker_plugin(args, &self.linker_plugin_arena, &self.herd)?;
 
         let loaded = file_loader.load_inputs::<P>(&args.common().inputs, args, &mut plugin);
@@ -270,6 +276,7 @@ impl Linker {
 
         let incremental_state = incremental::maybe_prepare(args, file_loader)?;
         if incremental_state.can_reuse_output() {
+            incremental_state.finish(args, file_loader)?;
             return Ok(LinkerOutput { layout: None });
         }
 

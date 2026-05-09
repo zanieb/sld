@@ -8,8 +8,11 @@ use crate::LinkerKind;
 use crate::Result;
 use crate::Run;
 use crate::config::Config;
+use crate::config::Mutation;
 use anyhow::Context as _;
 use anyhow::bail;
+use object::Object as _;
+use object::ObjectSection as _;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::io::Read as _;
@@ -172,17 +175,58 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
         .parent()
         .with_context(|| format!("Benchmark path `{}` has no parent", bench.path.display()))?;
 
-    for relative_path in &bench.config.mutate_files {
-        let path = save_dir.join(relative_path);
+    for mutation in &bench.config.mutate_files {
+        let relative_path = mutation.path();
         ensure_relative_path(relative_path)?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("Failed to open mutation input `{}`", path.display()))?;
-        file.write_all(&[0])
-            .with_context(|| format!("Failed to mutate input `{}`", path.display()))?;
+        let path = save_dir.join(relative_path);
+        match mutation {
+            Mutation::AppendZero(_) => append_zero(&path)?,
+            Mutation::ElfSectionByte { section, .. } => mutate_elf_section_byte(&path, section)?,
+        }
     }
 
+    Ok(())
+}
+
+fn append_zero(path: &Path) -> Result {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Failed to open mutation input `{}`", path.display()))?;
+    file.write_all(&[0])
+        .with_context(|| format!("Failed to mutate input `{}`", path.display()))?;
+    Ok(())
+}
+
+fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let object = object::File::parse(&*bytes)
+        .with_context(|| format!("Failed to parse ELF mutation input `{}`", path.display()))?;
+    let section = object.section_by_name(section_name).with_context(|| {
+        format!(
+            "Mutation input `{}` does not contain section `{section_name}`",
+            path.display()
+        )
+    })?;
+    let (start, size) = section.file_range().with_context(|| {
+        format!(
+            "Mutation section `{section_name}` in `{}` has no file range",
+            path.display()
+        )
+    })?;
+    if size == 0 {
+        bail!(
+            "Mutation section `{section_name}` in `{}` is empty",
+            path.display()
+        );
+    }
+    let byte = bytes
+        .get_mut(start as usize)
+        .with_context(|| format!("Mutation section `{section_name}` starts past end of file"))?;
+    *byte ^= 1;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
     Ok(())
 }
 
@@ -357,11 +401,62 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
 #[cfg(test)]
 mod tests {
     use super::ensure_relative_path;
+    use super::mutate_elf_section_byte;
+    use super::mutate_inputs;
+    use crate::Benchmark;
+    use crate::config::BenchConfig;
+    use crate::config::Mutation;
+    use object::Object as _;
 
     #[test]
     fn mutation_paths_must_be_save_dir_relative() {
         assert!(ensure_relative_path("objects/main.o").is_ok());
         assert!(ensure_relative_path("../main.o").is_err());
         assert!(ensure_relative_path("/tmp/main.o").is_err());
+    }
+
+    #[test]
+    fn append_zero_mutation_changes_configured_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let input = save_dir.join("changed.o");
+        std::fs::write(&input, b"abc").unwrap();
+        let bench = Benchmark {
+            name: "append".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::AppendZero("changed.o".to_owned())],
+                ..BenchConfig::default()
+            },
+        };
+
+        mutate_inputs(&bench).unwrap();
+
+        assert_eq!(std::fs::read(&input).unwrap(), b"abc\0");
+    }
+
+    #[test]
+    fn elf_section_byte_mutation_changes_section_contents() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&current_exe) else {
+            return;
+        };
+        let Ok(object) = object::File::parse(&*bytes) else {
+            return;
+        };
+        if object.section_by_name(".data").is_none() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current-exe");
+        std::fs::write(&path, &bytes).unwrap();
+
+        mutate_elf_section_byte(&path, ".data").unwrap();
+
+        assert_ne!(std::fs::read(&path).unwrap(), bytes);
     }
 }
