@@ -7,15 +7,21 @@ use crate::timing_phase;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use std::fmt::Write as _;
+use std::fs::Metadata;
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-const STATE_VERSION: &str = "wild-incremental-state-v2";
-const PREVIOUS_STATE_VERSION: &str = "wild-incremental-state-v1";
+const STATE_VERSION: &str = "wild-incremental-state-v3";
+const STATE_VERSION_V2: &str = "wild-incremental-state-v2";
+const STATE_VERSION_V1: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 
@@ -59,10 +65,22 @@ struct FileState {
     content: FileContentState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct FileContentState {
     len: u64,
     hash: String,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    dev: u64,
+    ino: u64,
+    modified_sec: i64,
+    modified_nsec: i64,
+    changed_sec: i64,
+    changed_nsec: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -95,8 +113,13 @@ pub(crate) fn maybe_prepare(
 
     timing_phase!("Prepare incremental link");
 
-    let current = CurrentState::new(args, file_loader);
-    let previous = PersistedState::read(&current.state_dir);
+    let state_dir = state_dir_for_output(args.output());
+    let previous = PersistedState::read(&state_dir);
+    let current = CurrentState::new(
+        args,
+        file_loader,
+        previous.as_ref().ok().and_then(|p| p.as_ref()),
+    );
     let (mode, previous) = match previous {
         Ok(Some(previous)) => (
             classify_incremental_mode(args.output(), &current, &previous),
@@ -137,6 +160,45 @@ pub(crate) fn maybe_prepare(
         current_sections: Mutex::new(Vec::new()),
         reused_sections: AtomicUsize::new(0),
     })
+}
+
+pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> Result<bool> {
+    if !args.common().incremental
+        || args.should_write_trace_file()
+        || args.common().save_dir.is_active()
+    {
+        return Ok(false);
+    }
+    if args
+        .dependency_file()
+        .is_some_and(|dependency_file| !dependency_file.exists())
+    {
+        return Ok(false);
+    }
+
+    timing_phase!("Check incremental fast path");
+
+    let state_dir = state_dir_for_output(args.output());
+    let Some(previous) = PersistedState::read(&state_dir).unwrap_or_default() else {
+        return Ok(false);
+    };
+
+    if previous.args_hash != args_hash(args) {
+        return Ok(false);
+    }
+    if !previous.output.identity_matches_path(args.output())? {
+        return Ok(false);
+    }
+
+    for input in &previous.input_files {
+        let path = decode_path(&input.path)?;
+        if !input.content.identity_matches_path(&path)? {
+            return Ok(false);
+        }
+    }
+
+    append_log(&state_dir, "reused existing output before loading inputs")?;
+    Ok(true)
 }
 
 impl PreparedState {
@@ -189,7 +251,7 @@ impl PreparedState {
     pub(crate) fn finish(
         &self,
         args: &impl platform::Args,
-        file_loader: &FileLoader<'_>,
+        _file_loader: &FileLoader<'_>,
     ) -> Result {
         if self.mode == IncrementalMode::Disabled {
             return Ok(());
@@ -197,14 +259,18 @@ impl PreparedState {
 
         timing_phase!("Write incremental state");
 
-        let output = FileContentState::from_path(args.output()).with_context(|| {
-            format!(
-                "Failed to fingerprint output file `{}` for incremental state",
-                args.output().display()
-            )
-        })?;
+        let output =
+            FileContentState::from_path_identity_only(args.output()).with_context(|| {
+                format!(
+                    "Failed to record output file `{}` for incremental state",
+                    args.output().display()
+                )
+            })?;
 
         let mut sections = self.current_sections.lock().unwrap().clone();
+        if sections.is_empty() && self.mode == IncrementalMode::Reuse {
+            sections.extend(self.previous_sections.iter().cloned());
+        }
         sections.sort();
 
         let state = PersistedState {
@@ -215,7 +281,6 @@ impl PreparedState {
         };
 
         state.write(&self.current.state_dir)?;
-        snapshot_input_files(&self.current.state_dir, file_loader);
         let reused = self.reused_sections.load(Ordering::Relaxed);
         if reused > 0 {
             append_log(
@@ -239,19 +304,25 @@ fn classify_incremental_mode(
         };
     }
 
-    match FileContentState::from_path(output) {
-        Ok(output_state) if output_state == previous.output => {}
-        Ok(_) => {
-            return IncrementalMode::Relink {
-                reason: "output file changed since previous link".to_owned(),
-                can_reuse_unchanged_sections: false,
-            };
-        }
-        Err(error) => {
-            return IncrementalMode::Relink {
-                reason: format!("output file could not be reused: {error:?}"),
-                can_reuse_unchanged_sections: false,
-            };
+    if !previous
+        .output
+        .identity_matches_path(output)
+        .unwrap_or(false)
+    {
+        match FileContentState::from_path(output) {
+            Ok(output_state) if output_state == previous.output => {}
+            Ok(_) => {
+                return IncrementalMode::Relink {
+                    reason: "output file changed since previous link".to_owned(),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
+            Err(error) => {
+                return IncrementalMode::Relink {
+                    reason: format!("output file could not be reused: {error:?}"),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
         }
     }
 
@@ -307,29 +378,16 @@ fn reusable_input_files(current: &[FileState], previous: &[FileState]) -> HashSe
         .collect()
 }
 
-fn snapshot_input_files(state_dir: &Path, file_loader: &FileLoader<'_>) {
-    let snapshots_dir = state_dir.join("inputs");
-    let tmp_dir = state_dir.join("inputs.tmp");
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    if std::fs::create_dir_all(&tmp_dir).is_err() {
-        return;
-    }
-
-    for (index, input_file) in file_loader.loaded_files.iter().enumerate() {
-        let snapshot_path = tmp_dir.join(format!("{index}"));
-        let _ = std::fs::hard_link(&input_file.filename, snapshot_path);
-    }
-
-    let _ = std::fs::remove_dir_all(&snapshots_dir);
-    let _ = std::fs::rename(tmp_dir, snapshots_dir);
-}
-
 impl CurrentState {
-    fn new(args: &impl platform::Args, file_loader: &FileLoader<'_>) -> Self {
+    fn new(
+        args: &impl platform::Args,
+        file_loader: &FileLoader<'_>,
+        previous: Option<&PersistedState>,
+    ) -> Self {
         Self {
             state_dir: state_dir_for_output(args.output()),
-            args_hash: hash_text(&format!("{args:?}")),
-            input_files: fingerprint_loaded_files(file_loader),
+            args_hash: args_hash(args),
+            input_files: fingerprint_loaded_files(file_loader, previous),
         }
     }
 
@@ -359,7 +417,7 @@ impl PersistedState {
     fn parse(contents: &str) -> Result<Self> {
         let mut lines = contents.lines();
         let version = lines.next().context("Missing incremental state header")?;
-        if version != STATE_VERSION && version != PREVIOUS_STATE_VERSION {
+        if version != STATE_VERSION && version != STATE_VERSION_V2 && version != STATE_VERSION_V1 {
             return Err(crate::error!(
                 "Unsupported incremental state version `{version}`"
             ));
@@ -378,7 +436,7 @@ impl PersistedState {
             input_files.push(parse_input_line(line)?);
         }
 
-        let sections = if version == STATE_VERSION {
+        let sections = if version == STATE_VERSION || version == STATE_VERSION_V2 {
             let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
                 .parse()
                 .context("Invalid incremental section count")?;
@@ -429,16 +487,21 @@ impl PersistedState {
         writeln!(&mut out, "args\t{}", self.args_hash).unwrap();
         writeln!(
             &mut out,
-            "output\t{}\t{}",
-            self.output.len, self.output.hash
+            "output\t{}\t{}\t{}",
+            self.output.len,
+            self.output.hash,
+            self.output.render_identity()
         )
         .unwrap();
         writeln!(&mut out, "inputs\t{}", self.input_files.len()).unwrap();
         for input in &self.input_files {
             writeln!(
                 &mut out,
-                "input\t{}\t{}\t{}",
-                input.path, input.content.len, input.content.hash
+                "input\t{}\t{}\t{}\t{}",
+                input.path,
+                input.content.len,
+                input.content.hash,
+                input.content.render_identity()
             )
             .unwrap();
         }
@@ -456,6 +519,12 @@ impl PersistedState {
             .unwrap();
         }
         out
+    }
+}
+
+impl PartialEq for FileContentState {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.hash == other.hash
     }
 }
 
@@ -477,27 +546,171 @@ impl SectionRecord {
 }
 
 impl FileContentState {
+    fn from_path_identity_only(path: &Path) -> Result<Self> {
+        let Some(identity) = FileIdentity::from_path(path)? else {
+            return Self::from_path(path);
+        };
+        Ok(Self {
+            len: identity.len,
+            hash: String::new(),
+            identity: Some(identity),
+        })
+    }
+
     fn from_path(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
-        Ok(Self::from_bytes(&bytes))
+        let mut state = Self::from_bytes(&bytes);
+        state.identity = FileIdentity::from_path(path).ok().flatten();
+        Ok(state)
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             len: bytes.len() as u64,
             hash: hash_bytes(bytes),
+            identity: None,
         }
+    }
+
+    fn from_input_file(
+        input_file: &crate::input_data::InputFile,
+        previous: Option<&FileContentState>,
+    ) -> Self {
+        let identity = FileIdentity::from_path(&input_file.filename).ok().flatten();
+        if let (Some(identity), Some(previous)) = (identity.as_ref(), previous)
+            && previous.identity.as_ref() == Some(identity)
+        {
+            let mut state = previous.clone();
+            state.identity = Some(identity.clone());
+            return state;
+        }
+
+        let mut state = Self::from_bytes(input_file.data());
+        state.identity = identity;
+        state
+    }
+
+    fn identity_matches_path(&self, path: &Path) -> Result<bool> {
+        let Some(previous) = self.identity.as_ref() else {
+            return Ok(false);
+        };
+        Ok(FileIdentity::from_path(path)?.as_ref() == Some(previous))
+    }
+
+    fn render_identity(&self) -> String {
+        self.identity
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), FileIdentity::render)
     }
 }
 
-fn fingerprint_loaded_files(file_loader: &FileLoader<'_>) -> Vec<FileState> {
+impl FileIdentity {
+    fn from_path(path: &Path) -> Result<Option<Self>> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata for `{}`", path.display()))?;
+        #[cfg(unix)]
+        {
+            Ok(Some(Self::from_metadata(&metadata)))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            modified_sec: metadata.mtime(),
+            modified_nsec: metadata.mtime_nsec(),
+            changed_sec: metadata.ctime(),
+            changed_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            self.len,
+            self.dev,
+            self.ino,
+            self.modified_sec,
+            self.modified_nsec,
+            self.changed_sec,
+            self.changed_nsec
+        )
+    }
+
+    fn parse(value: &str) -> Result<Option<Self>> {
+        if value == "-" {
+            return Ok(None);
+        }
+
+        let mut parts = value.split(':');
+        let mut next = |field| {
+            parts
+                .next()
+                .with_context(|| format!("Malformed incremental file identity `{field}`"))
+        };
+        let identity = Self {
+            len: next("len")?
+                .parse()
+                .context("Invalid incremental file identity length")?,
+            dev: next("dev")?
+                .parse()
+                .context("Invalid incremental file identity device")?,
+            ino: next("ino")?
+                .parse()
+                .context("Invalid incremental file identity inode")?,
+            modified_sec: next("mtime")?
+                .parse()
+                .context("Invalid incremental file identity mtime")?,
+            modified_nsec: next("mtime_nsec")?
+                .parse()
+                .context("Invalid incremental file identity mtime_nsec")?,
+            changed_sec: next("ctime")?
+                .parse()
+                .context("Invalid incremental file identity ctime")?,
+            changed_nsec: next("ctime_nsec")?
+                .parse()
+                .context("Invalid incremental file identity ctime_nsec")?,
+        };
+        if parts.next().is_some() {
+            return Err(crate::error!("Malformed incremental file identity"));
+        }
+        Ok(Some(identity))
+    }
+}
+
+fn fingerprint_loaded_files(
+    file_loader: &FileLoader<'_>,
+    previous: Option<&PersistedState>,
+) -> Vec<FileState> {
+    let previous_by_path = previous.map(|previous| {
+        previous
+            .input_files
+            .iter()
+            .map(|file| (file.path.as_str(), &file.content))
+            .collect::<HashMap<_, _>>()
+    });
+
     let mut files = file_loader
         .loaded_files
         .iter()
-        .map(|input_file| FileState {
-            path: encode_path(&input_file.filename),
-            content: FileContentState::from_bytes(input_file.data()),
+        .map(|input_file| {
+            let path = encode_path(&input_file.filename);
+            let previous = previous_by_path
+                .as_ref()
+                .and_then(|previous| previous.get(path.as_str()).copied());
+            FileState {
+                path,
+                content: FileContentState::from_input_file(input_file, previous),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -520,12 +733,19 @@ fn parse_prefixed_line<'a>(line: Option<&'a str>, expected_prefix: &str) -> Resu
 
 fn parse_content_line(line: Option<&str>, expected_prefix: &str) -> Result<FileContentState> {
     let rest = parse_prefixed_line(line, expected_prefix)?;
-    let (len, hash) = rest
-        .split_once('\t')
-        .context("Malformed incremental content record")?;
+    let mut parts = rest.split('\t');
+    let len = parts
+        .next()
+        .context("Malformed incremental content length")?;
+    let hash = parts.next().context("Malformed incremental content hash")?;
+    let identity = parts.next().map(FileIdentity::parse).transpose()?.flatten();
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental content record"));
+    }
     Ok(FileContentState {
         len: len.parse().context("Invalid incremental content length")?,
         hash: hash.to_owned(),
+        identity,
     })
 }
 
@@ -545,12 +765,17 @@ fn parse_input_line(line: &str) -> Result<FileState> {
         .next()
         .context("Malformed incremental input hash")?
         .to_owned();
+    let identity = parts.next().map(FileIdentity::parse).transpose()?.flatten();
     if parts.next().is_some() {
         return Err(crate::error!("Malformed incremental input record"));
     }
     Ok(FileState {
         path,
-        content: FileContentState { len, hash },
+        content: FileContentState {
+            len,
+            hash,
+            identity,
+        },
     })
 }
 
@@ -618,6 +843,18 @@ fn encode_path(path: &Path) -> String {
     hex::encode(path.as_os_str().as_encoded_bytes())
 }
 
+#[cfg(unix)]
+fn decode_path(path: &str) -> Result<PathBuf> {
+    let bytes = hex::decode(path).context("Malformed incremental path encoding")?;
+    Ok(std::ffi::OsString::from_vec(bytes).into())
+}
+
+#[cfg(not(unix))]
+fn decode_path(path: &str) -> Result<PathBuf> {
+    let bytes = hex::decode(path).context("Malformed incremental path encoding")?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned().into())
+}
+
 fn encode_input_ref(input: InputRef<'_>) -> String {
     let mut bytes = input.file.filename.as_os_str().as_encoded_bytes().to_vec();
     if let Some(entry) = input.entry {
@@ -638,6 +875,10 @@ fn display_hex_path(path: &str) -> String {
 
 fn hash_text(text: &str) -> String {
     hash_bytes(text.as_bytes())
+}
+
+fn args_hash(args: &impl platform::Args) -> String {
+    hash_text(&format!("{args:?}"))
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -702,13 +943,21 @@ mod tests {
         let state = state("args", b"output", &[("a.o", b"a")]);
         let rendered = state
             .render()
-            .replace(STATE_VERSION, PREVIOUS_STATE_VERSION)
+            .replace(STATE_VERSION, STATE_VERSION_V1)
             .split_once("\nsections")
             .unwrap()
             .0
             .to_owned();
         let parsed = PersistedState::parse(&format!("{rendered}\n")).unwrap();
         assert!(parsed.sections.is_empty());
+    }
+
+    #[test]
+    fn v2_state_version_is_accepted_with_sections() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = state.render().replace(STATE_VERSION, STATE_VERSION_V2);
+        assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
     }
 
     #[test]
@@ -725,12 +974,76 @@ mod tests {
     }
 
     #[test]
+    fn file_identity_does_not_affect_content_equality() {
+        let first = FileContentState {
+            identity: Some(FileIdentity {
+                len: 4,
+                dev: 1,
+                ino: 2,
+                modified_sec: 3,
+                modified_nsec: 4,
+                changed_sec: 5,
+                changed_nsec: 6,
+            }),
+            ..FileContentState::from_bytes(b"abcd")
+        };
+        let second = FileContentState {
+            identity: Some(FileIdentity {
+                len: 4,
+                dev: 10,
+                ino: 20,
+                modified_sec: 30,
+                modified_nsec: 40,
+                changed_sec: 50,
+                changed_nsec: 60,
+            }),
+            ..FileContentState::from_bytes(b"abcd")
+        };
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn file_identity_matches_current_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.o");
+        std::fs::write(&path, b"abcd").unwrap();
+        let content = FileContentState::from_path(&path).unwrap();
+
+        assert!(content.identity_matches_path(&path).unwrap());
+
+        std::fs::write(&path, b"abcde").unwrap();
+        assert!(!content.identity_matches_path(&path).unwrap());
+    }
+
+    #[test]
     fn classifies_reusable_state() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
         std::fs::write(&output, b"output").unwrap();
 
         let previous = state("args", b"output", &[("a.o", b"a")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert_eq!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Reuse
+        );
+    }
+
+    #[test]
+    fn classifies_reusable_state_from_output_identity_without_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let mut previous = state("args", b"stale", &[("a.o", b"a")]);
+        previous.output = FileContentState::from_path_identity_only(&output).unwrap();
+        assert!(previous.output.hash.is_empty());
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),

@@ -67,6 +67,10 @@ impl SaveDir {
         Ok(())
     }
 
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
     pub(crate) fn handle_file(&mut self, arg: &str) {
         if let Some(state) = self.0.as_mut() {
             state.files_to_copy.insert(Path::new(arg).to_path_buf());

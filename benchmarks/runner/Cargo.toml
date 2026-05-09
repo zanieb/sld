@@ -8,7 +8,11 @@ edition = "2024"
 anyhow.workspace = true
 clap.workspace = true
 indicatif.workspace = true
+object.workspace = true
 postcard.workspace = true
 serde.workspace = true
 toml.workspace = true
 wait4.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
