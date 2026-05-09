@@ -270,14 +270,7 @@ impl Bin {
 }
 
 impl Benchmark {
-    fn new(bench_dir: PathBuf, bench_config: BenchConfig) -> Result<Benchmark> {
-        let name = bench_dir
-            .file_name()
-            .context("Invalid filename")?
-            .to_str()
-            .with_context(|| format!("Filename isn't valid UTF-8: {}", bench_dir.display()))?
-            .to_owned();
-
+    fn new(name: String, bench_dir: PathBuf, bench_config: BenchConfig) -> Result<Benchmark> {
         let path = bench_dir.join("run-with");
         if !path.exists() {
             bail!("{} doesn't exist", path.display())

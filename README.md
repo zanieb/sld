@@ -2,8 +2,9 @@
 
 Wild is a linker with the goal of being very fast for iterative development.
 
-The plan is to eventually make it incremental, however that isn't yet implemented. It is however
-already pretty fast even without incremental linking.
+The plan is to eventually make it fully incremental. Initial incremental support can reuse an
+existing output for unchanged relinks and conservatively falls back to a full relink when inputs or
+arguments change. Wild is already pretty fast even without fine-grained incremental updates.
 
 ## Installation
 
@@ -119,8 +120,9 @@ If you'd like to use Wild as your linker for Rust code in CI, see
 ### Why another linker?
 
 Mold is already very fast, however it doesn't do incremental linking and the author has stated that
-they don't intend to. Wild doesn't do incremental linking yet, but that is the end-goal. By writing
-Wild in Rust, it's hoped that the complexity of incremental linking will be achievable.
+they don't intend to. Wild has initial incremental support, and fine-grained incremental updates are
+the end-goal. By writing Wild in Rust, it's hoped that the complexity of incremental linking will be
+achievable.
 
 ### What's working?
 
@@ -147,7 +149,7 @@ The following is working with the caveat that there may be bugs:
 
 Here are some of the larger things that aren't yet done, roughly sorted by current priority:
 
-* Incremental linking
+* Fine-grained incremental updates for changed inputs
 * More complex linker scripts
 * Mach-O support
 * Windows support
@@ -181,9 +183,9 @@ stands for "Wild", since recursive acronyms are popular in open-source projects.
 
 ## Benchmarks
 
-The goal of Wild is to eventually be very fast via incremental linking. However, we also want to be
-as fast as we can be for non-incremental linking and for the initial link when incremental linking
-is enabled.
+The goal of Wild is to eventually be very fast via fine-grained incremental linking. However, we
+also want to be as fast as we can be for non-incremental linking and for the initial link when
+incremental linking is enabled.
 
 All benchmarks are run with output to a tmpfs. See [BENCHMARKING.md](BENCHMARKING.md) for details on
 running benchmarks.

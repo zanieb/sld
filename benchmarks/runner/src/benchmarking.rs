@@ -105,20 +105,18 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
 
         // Ensure the benchmark inputs are in cache.
         let warmup_bin = bins.last().context("Need at least one binary")?;
-        run_once(warmup_bin, bench, args, &[])?;
+        let warmup_flags = extra_flags_for_run(warmup_bin, bench, false);
+        run_once(warmup_bin, bench, args, &warmup_flags)?;
 
         let mut bench_results = Vec::new();
         for batch_num in 0..args.num_batches {
             for bin in bins {
                 let mut bin_results = Vec::new();
                 for _ in 0..args.batch_size {
-                    let extra_flags = if !args.no_mem && batch_num == 0 {
-                        ["--no-fork"].as_slice()
-                    } else {
-                        &[]
-                    };
+                    let extra_flags =
+                        extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
 
-                    if let Some(run) = run_once(bin, bench, args, extra_flags)? {
+                    if let Some(run) = run_once(bin, bench, args, &extra_flags)? {
                         bin_results.push(run);
                     }
                     progress_bar.inc(1);
@@ -150,6 +148,17 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
     Ok(Benchmarks { benchmarks: out })
 }
 
+fn extra_flags_for_run(bin: &Bin, bench: &Benchmark, measure_memory: bool) -> Vec<String> {
+    let mut extra_flags = bench.config.extra_flags.clone();
+    if bin.identifier.kind == LinkerKind::Wild {
+        extra_flags.extend(bench.config.wild_extra_flags.clone());
+    }
+    if measure_memory {
+        extra_flags.push("--no-fork".to_owned());
+    }
+    extra_flags
+}
+
 /// Runs each benchmark once with each linker.
 fn verify(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result {
     let mut success = true;
@@ -174,7 +183,7 @@ fn run_once(
     bin: &Bin,
     bench: &Benchmark,
     args: &BenchArgs,
-    extra_flags: &[&str],
+    extra_flags: &[String],
 ) -> Result<Option<Run>> {
     if !bench.supports_bin(bin) {
         return Ok(None);
@@ -232,7 +241,7 @@ fn run_once(
 
     Ok(Some(Run {
         pid,
-        extra_flags: extra_flags.iter().map(|f| (*f).to_owned()).collect(),
+        extra_flags: extra_flags.to_vec(),
         elapsed,
         max_rss: res_use.rusage.maxrss,
         stime: res_use.rusage.stime,
@@ -252,9 +261,14 @@ fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> 
         .collect();
 
     for (name, config) in &config.benches {
-        available.remove(name);
+        let save_name = config.save.as_deref().unwrap_or(name);
+        available.remove(save_name);
         if !config.skip {
-            benchmarks.push(Benchmark::new(dir.join(name), config.clone())?);
+            benchmarks.push(Benchmark::new(
+                name.clone(),
+                dir.join(save_name),
+                config.clone(),
+            )?);
         }
     }
 

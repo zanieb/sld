@@ -18,11 +18,17 @@ pub(crate) struct Config {
 #[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BenchConfig {
+    /// Name of the save-dir to run. Defaults to the benchmark name.
+    pub(crate) save: Option<String>,
     #[serde(default)]
     pub(crate) skip: bool,
     pub(crate) min_wild_version: Option<String>,
     #[serde(default)]
     pub(crate) skip_linkers: Vec<LinkerKind>,
+    #[serde(default)]
+    pub(crate) extra_flags: Vec<String>,
+    #[serde(default)]
+    pub(crate) wild_extra_flags: Vec<String>,
 }
 
 impl Config {

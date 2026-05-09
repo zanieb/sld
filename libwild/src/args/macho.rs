@@ -152,6 +152,22 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             };
             Ok(())
         });
+    parser
+        .declare()
+        .long("incremental")
+        .help("Enable incremental linking")
+        .execute(|args, _modifier_stack| {
+            args.common.incremental = true;
+            Ok(())
+        });
+    parser
+        .declare()
+        .long("no-incremental")
+        .help("Disable incremental linking")
+        .execute(|args, _modifier_stack| {
+            args.common.incremental = false;
+            Ok(())
+        });
 
     parser
 }
