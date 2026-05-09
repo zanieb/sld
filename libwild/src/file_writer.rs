@@ -58,6 +58,7 @@ pub(crate) struct SizedOutput {
     pub(crate) out: OutputBuffer,
     path: Arc<Path>,
     pub(crate) trace: TraceOutput,
+    existing_data_available: bool,
 }
 
 pub(crate) enum OutputBuffer {
@@ -261,15 +262,21 @@ fn wait_for_sized_output(sized_output_recv: &Receiver<Result<SizedOutput>>) -> R
 }
 
 impl SizedOutput {
+    pub(crate) fn existing_data_available(&self) -> bool {
+        self.existing_data_available && matches!(self.out, OutputBuffer::Mmap(_))
+    }
+
     fn new(path: Arc<Path>, output_config: OutputConfig, file_size: u64) -> Result<SizedOutput> {
         let mut open_options = std::fs::OpenOptions::new();
 
+        let mut existing_data_available = false;
         match output_config.file_write_mode {
             FileWriteMode::UnlinkAndReplace => {
                 open_options.truncate(true);
             }
             FileWriteMode::UpdateInPlace | FileWriteMode::UpdateInPlaceWithFallback => {
                 open_options.truncate(false);
+                existing_data_available = path.exists();
             }
         }
 
@@ -286,6 +293,7 @@ impl SizedOutput {
                 {
                     // If the file is being executed, we can't modify it, but we can delete it.
                     std::fs::remove_file(&path)?;
+                    existing_data_available = false;
                     open_options.create(true).open(&path)?
                 } else {
                     return Err(error)
@@ -303,6 +311,7 @@ impl SizedOutput {
             out,
             path,
             trace,
+            existing_data_available,
         })
     }
 

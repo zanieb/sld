@@ -362,8 +362,11 @@ impl platform::Platform for Elf {
     fn write_output_file<'data, A: Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &layout::Layout<'data, Self>,
+        incremental: &crate::incremental::PreparedState,
     ) -> Result {
-        output.write(layout, elf_writer::write::<A>)
+        output.write(layout, |sized_output, layout| {
+            elf_writer::write::<A>(sized_output, layout, incremental)
+        })
     }
 
     fn maybe_compress_debug_sections<'data, A: Arch<Platform = Self>>(

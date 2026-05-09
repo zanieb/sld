@@ -40,6 +40,7 @@ use crate::file_writer::insufficient_allocation;
 use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
+use crate::incremental::PreparedState;
 use crate::layout::DynamicLayout;
 use crate::layout::EpilogueLayout;
 use crate::layout::FileLayout;
@@ -176,8 +177,9 @@ impl From<u16> for SymbolSection {
 pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
     sized_output: &mut SizedOutput,
     layout: &ElfLayout<'data>,
+    incremental: &PreparedState,
 ) -> Result {
-    write_file_contents::<A>(sized_output, layout)?;
+    write_file_contents::<A>(sized_output, layout, incremental)?;
     if layout.args().common().validate_output {
         crate::validation::validate_bytes(layout, &sized_output.out)?;
     }
@@ -241,8 +243,10 @@ fn compute_hash(sized_output: &SizedOutput) -> blake3::Hash {
 fn write_file_contents<'data, A: Arch<Platform = Elf>>(
     sized_output: &mut SizedOutput,
     layout: &ElfLayout<'data>,
+    incremental: &PreparedState,
 ) -> Result {
     timing_phase!("Write data to file");
+    let existing_output_bytes_available = sized_output.existing_data_available();
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
@@ -276,6 +280,8 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                     layout,
                     &sized_output.trace,
                     &sym_index_map,
+                    incremental,
+                    existing_output_bytes_available,
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
@@ -478,10 +484,21 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     trace: &TraceOutput,
     sym_index_map: &[Option<u32>],
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
 ) -> Result {
     match file {
         FileLayout::Object(s) => {
-            write_object::<A>(s, buffers, table_writer, layout, trace, sym_index_map)?;
+            write_object::<A>(
+                s,
+                buffers,
+                table_writer,
+                layout,
+                trace,
+                sym_index_map,
+                incremental,
+                existing_output_bytes_available,
+            )?;
         }
         FileLayout::Prelude(s) => write_prelude::<A>(s, buffers, table_writer, layout)?,
         FileLayout::Epilogue(s) => write_epilogue::<A>(s, buffers, table_writer, layout)?,
@@ -1452,6 +1469,8 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     trace: &TraceOutput,
     sym_index_map: &[Option<u32>],
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
 
@@ -1470,10 +1489,20 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
                     buffers,
                     table_writer,
                     trace,
+                    incremental,
+                    existing_output_bytes_available,
                 )?;
             }
             SectionSlot::LoadedDebugInfo(sec) => {
-                write_debug_section::<A>(object, layout, sec, section_index, buffers)?;
+                write_debug_section::<A>(
+                    object,
+                    layout,
+                    sec,
+                    section_index,
+                    buffers,
+                    incremental,
+                    existing_output_bytes_available,
+                )?;
             }
             SectionSlot::FrameData(section_index) => {
                 write_eh_frame_data::<A>(object, *section_index, layout, table_writer, trace)?;
@@ -1841,6 +1870,8 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
 ) -> Result {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     if layout.args().should_output_partial_object() {
@@ -1854,7 +1885,33 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
         }
     }
 
-    let out = write_section_raw(object, layout, section, section_index, buffers)?;
+    let relocations = object.relocations(section_index)?;
+    let can_reuse_existing_bytes = existing_output_bytes_available
+        && !layout.args().should_output_partial_object()
+        && relocations.num_relocations() == 0
+        && object.section_relax_deltas.get(section_index.0).is_none()
+        && !section.flags.needs_got()
+        && !section.flags.needs_plt()
+        && !should_reverse_contents(
+            section_index,
+            part_id,
+            object.object,
+            &layout.output_sections,
+        );
+
+    let written = write_section_raw(
+        object,
+        layout,
+        section,
+        section_index,
+        buffers,
+        incremental,
+        can_reuse_existing_bytes,
+    )?;
+    if written.reused {
+        return Ok(());
+    }
+    let out = written.bytes;
 
     // We need to reverse the contents and adjust relocations because .ctors/.dtors are executed in
     // reverse order while .init_array/.fini_array are executed in forward order.
@@ -1879,7 +1936,6 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
         return Ok(());
     }
 
-    let relocations = object.relocations(section_index)?;
     let result = match relocations {
         elf::RelocationList::Rela(rela) => apply_relocations::<A, Rela, _>(
             object,
@@ -1991,6 +2047,8 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     section: &Section,
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
 ) -> Result {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     let section_id = part_id.output_section_id();
@@ -2000,8 +2058,25 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
         return Ok(());
     }
 
-    let out = write_section_raw(object, layout, section, section_index, buffers)?;
     let relocations = object.relocations(section_index)?;
+    let written = write_section_raw(
+        object,
+        layout,
+        section,
+        section_index,
+        buffers,
+        incremental,
+        existing_output_bytes_available
+            && !layout.args().should_output_partial_object()
+            && relocations.num_relocations() == 0
+            && object.section_relax_deltas.get(section_index.0).is_none()
+            && !section.flags.needs_got()
+            && !section.flags.needs_plt(),
+    )?;
+    if written.reused {
+        return Ok(());
+    }
+    let out = written.bytes;
     let result = match relocations {
         elf::RelocationList::Rela(rela) => apply_debug_relocations::<A, Rela, _>(
             object,
@@ -2024,13 +2099,20 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     Ok(())
 }
 
+struct WrittenSection<'out> {
+    bytes: &'out mut [u8],
+    reused: bool,
+}
+
 fn write_section_raw<'out, 'data>(
     object: &ObjectLayout<'data, Elf>,
     layout: &ElfLayout,
     sec: &Section,
     section_index: object::SectionIndex,
     buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
-) -> Result<&'out mut [u8]> {
+    incremental: &PreparedState,
+    allow_reuse: bool,
+) -> Result<WrittenSection<'out>> {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     if layout
         .output_sections
@@ -2038,6 +2120,9 @@ fn write_section_raw<'out, 'data>(
     {
         let section_buffer = buffers.get_mut(part_id);
         let allocation_size = sec.capacity(part_id, &layout.output_sections) as usize;
+        let part_layout = layout.section_part_layouts.get(part_id);
+        let output_offset =
+            part_layout.file_offset + (part_layout.file_size - section_buffer.len());
         if section_buffer.len() < allocation_size {
             bail!(
                 "Insufficient space allocated to section `{}`. Tried to take {} bytes, but only {} remain",
@@ -2047,6 +2132,18 @@ fn write_section_raw<'out, 'data>(
             );
         }
         let out = section_buffer.split_off_mut(..allocation_size).unwrap();
+        if incremental.try_reuse_section(
+            object.input,
+            section_index,
+            output_offset as u64,
+            allocation_size as u64,
+            allow_reuse,
+        ) {
+            return Ok(WrittenSection {
+                bytes: &mut [],
+                reused: true,
+            });
+        }
         let object_section = object.object.section(section_index)?;
         let relax_deltas = object.section_relax_deltas.get(section_index.0);
 
@@ -2056,7 +2153,10 @@ fn write_section_raw<'out, 'data>(
                 let (out, padding) = out.split_at_mut(section_size as usize);
                 object.object.copy_section_data(object_section, out)?;
                 padding.fill(0);
-                Ok(out)
+                Ok(WrittenSection {
+                    bytes: out,
+                    reused: false,
+                })
             }
             Some(deltas) => {
                 let input_data = object.object.raw_section_data(object_section)?;
@@ -2087,11 +2187,17 @@ fn write_section_raw<'out, 'data>(
                 }
                 out[output_pos..].fill(0);
 
-                Ok(&mut out[..effective_size])
+                Ok(WrittenSection {
+                    bytes: &mut out[..effective_size],
+                    reused: false,
+                })
             }
         }
     } else {
-        Ok(&mut [])
+        Ok(WrittenSection {
+            bytes: &mut [],
+            reused: false,
+        })
     }
 }
 

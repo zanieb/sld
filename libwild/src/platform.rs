@@ -266,6 +266,7 @@ pub(crate) trait Platform:
     fn write_output_file<'data, A: Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &Layout<'data, Self>,
+        incremental: &crate::incremental::PreparedState,
     ) -> Result;
 
     fn maybe_compress_debug_sections<'data, A: Arch<Platform = Self>>(

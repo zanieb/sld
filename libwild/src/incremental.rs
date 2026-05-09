@@ -1,6 +1,7 @@
 use crate::error::Context as _;
 use crate::error::Result;
 use crate::input_data::FileLoader;
+use crate::input_data::InputRef;
 use crate::platform;
 use crate::timing_phase;
 use hashbrown::HashMap;
@@ -9,21 +10,32 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-const STATE_VERSION: &str = "wild-incremental-state-v1";
+const STATE_VERSION: &str = "wild-incremental-state-v2";
+const PREVIOUS_STATE_VERSION: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 
 pub(crate) struct PreparedState {
     mode: IncrementalMode,
     current: CurrentState,
+    reusable_inputs: HashSet<String>,
+    previous_sections: HashSet<SectionRecord>,
+    current_sections: Mutex<Vec<SectionRecord>>,
+    reused_sections: AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IncrementalMode {
     Disabled,
     Reuse,
-    Initial { reason: String },
+    Relink {
+        reason: String,
+        can_reuse_unchanged_sections: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +50,7 @@ struct PersistedState {
     args_hash: String,
     output: FileContentState,
     input_files: Vec<FileState>,
+    sections: Vec<SectionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +65,15 @@ struct FileContentState {
     hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct SectionRecord {
+    input_file: String,
+    input: String,
+    section_index: u32,
+    output_offset: u64,
+    size: u64,
+}
+
 pub(crate) fn maybe_prepare(
     args: &impl platform::Args,
     file_loader: &FileLoader<'_>,
@@ -64,6 +86,10 @@ pub(crate) fn maybe_prepare(
                 args_hash: String::new(),
                 input_files: Vec::new(),
             },
+            reusable_inputs: HashSet::new(),
+            previous_sections: HashSet::new(),
+            current_sections: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
         });
     }
 
@@ -71,24 +97,93 @@ pub(crate) fn maybe_prepare(
 
     let current = CurrentState::new(args, file_loader);
     let previous = PersistedState::read(&current.state_dir);
-    let mode = match previous {
-        Ok(Some(previous)) => classify_incremental_mode(args.output(), &current, &previous),
-        Ok(None) => IncrementalMode::Initial {
-            reason: "no previous incremental state".to_owned(),
-        },
-        Err(error) => IncrementalMode::Initial {
-            reason: format!("could not read previous incremental state: {error:?}"),
-        },
+    let (mode, previous) = match previous {
+        Ok(Some(previous)) => (
+            classify_incremental_mode(args.output(), &current, &previous),
+            Some(previous),
+        ),
+        Ok(None) => (
+            IncrementalMode::Relink {
+                reason: "no previous incremental state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            },
+            None,
+        ),
+        Err(error) => (
+            IncrementalMode::Relink {
+                reason: format!("could not read previous incremental state: {error:?}"),
+                can_reuse_unchanged_sections: false,
+            },
+            None,
+        ),
     };
 
     current.log_mode(&mode)?;
 
-    Ok(PreparedState { mode, current })
+    let reusable_inputs = previous
+        .as_ref()
+        .map(|previous| reusable_input_files(&current.input_files, &previous.input_files))
+        .unwrap_or_default();
+    let previous_sections = previous
+        .as_ref()
+        .map(|previous| previous.sections.iter().cloned().collect())
+        .unwrap_or_default();
+
+    Ok(PreparedState {
+        mode,
+        current,
+        reusable_inputs,
+        previous_sections,
+        current_sections: Mutex::new(Vec::new()),
+        reused_sections: AtomicUsize::new(0),
+    })
 }
 
 impl PreparedState {
     pub(crate) fn can_reuse_output(&self) -> bool {
         self.mode == IncrementalMode::Reuse
+    }
+
+    pub(crate) fn can_reuse_unchanged_sections(&self) -> bool {
+        matches!(
+            self.mode,
+            IncrementalMode::Relink {
+                can_reuse_unchanged_sections: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn try_reuse_section(
+        &self,
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        output_offset: u64,
+        size: u64,
+        allow_reuse: bool,
+    ) -> bool {
+        if self.mode == IncrementalMode::Disabled {
+            return false;
+        }
+
+        let record = SectionRecord::new(input, section_index, output_offset, size);
+        self.current_sections.lock().unwrap().push(record.clone());
+
+        if !allow_reuse {
+            return false;
+        }
+        if !self.can_reuse_unchanged_sections() {
+            return false;
+        }
+        if !self.reusable_inputs.contains(&record.input_file) {
+            return false;
+        }
+        if !self.previous_sections.contains(&record) {
+            return false;
+        }
+
+        self.reused_sections.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub(crate) fn finish(
@@ -109,14 +204,25 @@ impl PreparedState {
             )
         })?;
 
+        let mut sections = self.current_sections.lock().unwrap().clone();
+        sections.sort();
+
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
             output,
             input_files: self.current.input_files.clone(),
+            sections,
         };
 
         state.write(&self.current.state_dir)?;
         snapshot_input_files(&self.current.state_dir, file_loader);
+        let reused = self.reused_sections.load(Ordering::Relaxed);
+        if reused > 0 {
+            append_log(
+                &self.current.state_dir,
+                &format!("reused {reused} unchanged input sections"),
+            )?;
+        }
         Ok(())
     }
 }
@@ -127,28 +233,32 @@ fn classify_incremental_mode(
     previous: &PersistedState,
 ) -> IncrementalMode {
     if current.args_hash != previous.args_hash {
-        return IncrementalMode::Initial {
+        return IncrementalMode::Relink {
             reason: "linker arguments changed".to_owned(),
+            can_reuse_unchanged_sections: false,
         };
     }
 
     match FileContentState::from_path(output) {
         Ok(output_state) if output_state == previous.output => {}
         Ok(_) => {
-            return IncrementalMode::Initial {
+            return IncrementalMode::Relink {
                 reason: "output file changed since previous link".to_owned(),
+                can_reuse_unchanged_sections: false,
             };
         }
         Err(error) => {
-            return IncrementalMode::Initial {
+            return IncrementalMode::Relink {
                 reason: format!("output file could not be reused: {error:?}"),
+                can_reuse_unchanged_sections: false,
             };
         }
     }
 
     if current.input_files != previous.input_files {
-        return IncrementalMode::Initial {
+        return IncrementalMode::Relink {
             reason: describe_input_difference(&current.input_files, &previous.input_files),
+            can_reuse_unchanged_sections: true,
         };
     }
 
@@ -184,6 +294,19 @@ fn describe_input_difference(current: &[FileState], previous: &[FileState]) -> S
     "input file set changed".to_owned()
 }
 
+fn reusable_input_files(current: &[FileState], previous: &[FileState]) -> HashSet<String> {
+    let previous_by_path = previous
+        .iter()
+        .map(|file| (file.path.as_str(), &file.content))
+        .collect::<HashMap<_, _>>();
+
+    current
+        .iter()
+        .filter(|file| previous_by_path.get(file.path.as_str()) == Some(&&file.content))
+        .map(|file| file.path.clone())
+        .collect()
+}
+
 fn snapshot_input_files(state_dir: &Path, file_loader: &FileLoader<'_>) {
     let snapshots_dir = state_dir.join("inputs");
     let tmp_dir = state_dir.join("inputs.tmp");
@@ -214,7 +337,7 @@ impl CurrentState {
         match mode {
             IncrementalMode::Disabled => Ok(()),
             IncrementalMode::Reuse => append_log(&self.state_dir, "reused existing output"),
-            IncrementalMode::Initial { reason } => {
+            IncrementalMode::Relink { reason, .. } => {
                 append_log(&self.state_dir, &format!("full relink: {reason}"))
             }
         }
@@ -236,7 +359,7 @@ impl PersistedState {
     fn parse(contents: &str) -> Result<Self> {
         let mut lines = contents.lines();
         let version = lines.next().context("Missing incremental state header")?;
-        if version != STATE_VERSION {
+        if version != STATE_VERSION && version != PREVIOUS_STATE_VERSION {
             return Err(crate::error!(
                 "Unsupported incremental state version `{version}`"
             ));
@@ -255,6 +378,20 @@ impl PersistedState {
             input_files.push(parse_input_line(line)?);
         }
 
+        let sections = if version == STATE_VERSION {
+            let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
+                .parse()
+                .context("Invalid incremental section count")?;
+            let mut sections = Vec::with_capacity(section_count);
+            for _ in 0..section_count {
+                let line = lines.next().context("Missing incremental section record")?;
+                sections.push(parse_section_line(line)?);
+            }
+            sections
+        } else {
+            Vec::new()
+        };
+
         if lines.next().is_some() {
             return Err(crate::error!("Unexpected trailing incremental state data"));
         }
@@ -263,6 +400,7 @@ impl PersistedState {
             args_hash,
             output,
             input_files,
+            sections,
         })
     }
 
@@ -304,7 +442,37 @@ impl PersistedState {
             )
             .unwrap();
         }
+        writeln!(&mut out, "sections\t{}", self.sections.len()).unwrap();
+        for section in &self.sections {
+            writeln!(
+                &mut out,
+                "section\t{}\t{}\t{}\t{}\t{}",
+                section.input_file,
+                section.input,
+                section.section_index,
+                section.output_offset,
+                section.size
+            )
+            .unwrap();
+        }
         out
+    }
+}
+
+impl SectionRecord {
+    fn new(
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        output_offset: u64,
+        size: u64,
+    ) -> Self {
+        Self {
+            input_file: encode_path(&input.file.filename),
+            input: encode_input_ref(input),
+            section_index: section_index.0 as u32,
+            output_offset,
+            size,
+        }
     }
 }
 
@@ -386,6 +554,44 @@ fn parse_input_line(line: &str) -> Result<FileState> {
     })
 }
 
+fn parse_section_line(line: &str) -> Result<SectionRecord> {
+    let rest = parse_prefixed_line(Some(line), "section")?;
+    let mut parts = rest.split('\t');
+    let input_file = parts
+        .next()
+        .context("Malformed incremental section input file")?
+        .to_owned();
+    let input = parts
+        .next()
+        .context("Malformed incremental section input")?
+        .to_owned();
+    let section_index = parts
+        .next()
+        .context("Malformed incremental section index")?
+        .parse()
+        .context("Invalid incremental section index")?;
+    let output_offset = parts
+        .next()
+        .context("Malformed incremental section output offset")?
+        .parse()
+        .context("Invalid incremental section output offset")?;
+    let size = parts
+        .next()
+        .context("Malformed incremental section size")?
+        .parse()
+        .context("Invalid incremental section size")?;
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental section record"));
+    }
+    Ok(SectionRecord {
+        input_file,
+        input,
+        section_index,
+        output_offset,
+        size,
+    })
+}
+
 fn append_log(state_dir: &Path, message: &str) -> Result {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(LOG_FILE);
@@ -410,6 +616,19 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 fn encode_path(path: &Path) -> String {
     hex::encode(path.as_os_str().as_encoded_bytes())
+}
+
+fn encode_input_ref(input: InputRef<'_>) -> String {
+    let mut bytes = input.file.filename.as_os_str().as_encoded_bytes().to_vec();
+    if let Some(entry) = input.entry {
+        bytes.push(0);
+        bytes.extend_from_slice(entry.identifier.as_slice());
+        bytes.push(0);
+        bytes.extend_from_slice(entry.start_offset.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(entry.end_offset.to_string().as_bytes());
+    }
+    hex::encode(bytes)
 }
 
 fn display_hex_path(path: &str) -> String {
@@ -440,6 +659,22 @@ mod tests {
                     content: FileContentState::from_bytes(bytes),
                 })
                 .collect(),
+            sections: Vec::new(),
+        }
+    }
+
+    fn section_record(
+        input: &str,
+        section_index: u32,
+        output_offset: u64,
+        size: u64,
+    ) -> SectionRecord {
+        SectionRecord {
+            input_file: hex::encode(input),
+            input: hex::encode(input),
+            section_index,
+            output_offset,
+            size,
         }
     }
 
@@ -457,8 +692,23 @@ mod tests {
 
     #[test]
     fn persisted_state_round_trips() {
-        let state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
         assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
+    }
+
+    #[test]
+    fn previous_state_version_is_accepted_without_sections() {
+        let state = state("args", b"output", &[("a.o", b"a")]);
+        let rendered = state
+            .render()
+            .replace(STATE_VERSION, PREVIOUS_STATE_VERSION)
+            .split_once("\nsections")
+            .unwrap()
+            .0
+            .to_owned();
+        let parsed = PersistedState::parse(&format!("{rendered}\n")).unwrap();
+        assert!(parsed.sections.is_empty());
     }
 
     #[test]
@@ -508,7 +758,10 @@ mod tests {
 
         assert!(matches!(
             classify_incremental_mode(&output, &current, &previous),
-            IncrementalMode::Initial { reason } if reason == "linker arguments changed"
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "linker arguments changed"
         ));
     }
 
@@ -527,7 +780,10 @@ mod tests {
 
         assert!(matches!(
             classify_incremental_mode(&output, &current, &previous),
-            IncrementalMode::Initial { reason } if reason.contains("input file changed")
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: true,
+            } if reason.contains("input file changed")
         ));
     }
 
@@ -544,7 +800,52 @@ mod tests {
 
         assert!(matches!(
             classify_incremental_mode(&output, &current, &previous),
-            IncrementalMode::Initial { reason } if reason.contains("output file could not be reused")
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason.contains("output file could not be reused")
         ));
+    }
+
+    #[test]
+    fn reusable_inputs_only_include_unchanged_files() {
+        let previous = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        let current = state("args", b"output", &[("a.o", b"a"), ("b.o", b"changed")]);
+
+        let reusable = reusable_input_files(&current.input_files, &previous.input_files);
+
+        assert!(reusable.contains(&hex::encode("a.o")));
+        assert!(!reusable.contains(&hex::encode("b.o")));
+    }
+
+    #[test]
+    fn try_reuse_section_requires_unchanged_input_and_matching_record() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("a.o");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let record = SectionRecord::new(input, object::SectionIndex(3), 64, 16);
+        let state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "input file changed: b.o".to_owned(),
+                can_reuse_unchanged_sections: true,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                input_files: Vec::new(),
+            },
+            reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
+            previous_sections: [record].into_iter().collect(),
+            current_sections: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
+        };
+
+        assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true));
+        assert!(!state.try_reuse_section(input, object::SectionIndex(3), 80, 16, true));
+        assert_eq!(state.reused_sections.load(Ordering::Relaxed), 1);
+        assert_eq!(state.current_sections.lock().unwrap().len(), 2);
     }
 }
