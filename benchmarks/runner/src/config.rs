@@ -29,6 +29,9 @@ pub(crate) struct BenchConfig {
     pub(crate) extra_flags: Vec<String>,
     #[serde(default)]
     pub(crate) wild_extra_flags: Vec<String>,
+    /// Paths relative to the save-dir to mutate before each timed run.
+    #[serde(default)]
+    pub(crate) mutate_files: Vec<String>,
 }
 
 impl Config {
@@ -38,5 +41,28 @@ impl Config {
 
         toml::from_str(&contents)
             .with_context(|| format!("Failed to parse `{}`", config_path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn parses_incremental_mutation_files() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+mutate_files = ["changed.o"]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(bench.mutate_files, ["changed.o"]);
     }
 }
