@@ -8,4 +8,7 @@ int value(void) { return 42; }
 
 int unchanged(void);
 
-int main(void) { return value() + unchanged(); }
+void _start(void) {
+    (void)value();
+    (void)unchanged();
+}
