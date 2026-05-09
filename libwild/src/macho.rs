@@ -1039,6 +1039,7 @@ impl platform::Platform for MachO {
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &crate::layout::Layout<'data, Self>,
+        _incremental: &crate::incremental::PreparedState,
     ) -> crate::error::Result {
         output.write(layout, macho_writer::write::<A>)
     }

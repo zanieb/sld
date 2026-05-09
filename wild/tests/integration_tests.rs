@@ -154,6 +154,10 @@
 //! testing runs wild twice with incremental linking enabled and verifies that the second run reuses
 //! the existing output.
 //!
+//! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object
+//! without changing its loaded sections, then checking that sections from unchanged inputs are
+//! reused.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -254,6 +258,7 @@ use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -754,6 +759,7 @@ struct Config {
     requires_linker_plugin: bool,
     test_update_in_place: bool,
     test_incremental: bool,
+    test_incremental_changed: bool,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1323,6 +1329,7 @@ impl Config {
             requires_rust_musl: false,
             test_update_in_place: false,
             test_incremental: false,
+            test_incremental_changed: false,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1694,6 +1701,9 @@ fn process_directive(
         "TestIncremental" => {
             config.test_incremental = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChanged" => {
+            config.test_incremental_changed = arg.to_lowercase().parse()?;
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -1902,6 +1912,23 @@ impl ProgramInputs {
                 .args
                 .push(arg.to_owned());
         }
+        if config.test_incremental_changed {
+            let threads_arg = match config.linker_driver {
+                LinkerDriver::Compiler(_) => "-Wl,--threads=2",
+                LinkerDriver::Direct(_) => "--threads=2",
+            };
+            if !incremental_config
+                .wild_extra_linker_args
+                .args
+                .iter()
+                .any(|existing| existing == threads_arg)
+            {
+                incremental_config
+                    .wild_extra_linker_args
+                    .args
+                    .push(threads_arg.to_owned());
+            }
+        }
 
         let link_output_1 =
             Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -1938,6 +1965,65 @@ impl ProgramInputs {
                 self.name(),
                 log
             );
+        }
+
+        if config.test_incremental_changed {
+            let changed_input = inputs.first().with_context(|| {
+                format!(
+                    "Incremental changed-input test for {} needs at least one input",
+                    self.name()
+                )
+            })?;
+            if inputs.len() < 2 {
+                bail!(
+                    "Incremental changed-input test for {} needs an unchanged second input",
+                    self.name()
+                );
+            }
+
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&changed_input.path)
+                .with_context(|| {
+                    format!(
+                        "Failed to open input `{}` for incremental mutation",
+                        changed_input.path.display()
+                    )
+                })?;
+            file.write_all(b"\0").with_context(|| {
+                format!(
+                    "Failed to mutate input `{}` for incremental test",
+                    changed_input.path.display()
+                )
+            })?;
+            drop(file);
+
+            let link_output_3 =
+                Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+            let changed_content = std::fs::read(&link_output_3.binary).with_context(|| {
+                format!(
+                    "Failed to read changed incremental output: {}",
+                    link_output_3.binary.display()
+                )
+            })?;
+
+            if final_content != changed_content {
+                bail!(
+                    "Incremental test failed for {}: ignored input-object trailer changed output",
+                    self.name()
+                );
+            }
+
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if !log.contains("unchanged input sections") {
+                bail!(
+                    "Incremental test failed for {}: changed-input relink did not reuse unchanged input sections. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
         }
 
         Ok(())

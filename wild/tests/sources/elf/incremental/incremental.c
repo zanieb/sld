@@ -1,7 +1,11 @@
 //#Config:incremental
+//#Object:incremental-unchanged.c
 //#RunEnabled:false
 //#TestIncremental:true
+//#TestIncrementalChanged:true
 
 int value(void) { return 42; }
 
-int main(void) { return value(); }
+int unchanged(void);
+
+int main(void) { return value() + unchanged(); }

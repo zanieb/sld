@@ -348,7 +348,7 @@ impl Linker {
             &mut output,
         )?;
 
-        P::write_output_file::<A>(&output, &layout)?;
+        P::write_output_file::<A>(&output, &layout, &incremental_state)?;
         diff::maybe_diff()?;
         incremental_state.finish(args, file_loader)?;
 
