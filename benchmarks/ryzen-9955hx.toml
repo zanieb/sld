@@ -28,6 +28,11 @@ skip_linkers = ["bfd"]
 [bench.rust-analyzer]
 skip_linkers = ["bfd"]
 
+[bench.rust-analyzer-incremental]
+save = "rust-analyzer"
+skip_linkers = ["bfd", "lld", "mold"]
+wild_extra_flags = ["--incremental"]
+
 [bench.rust-analyzer-riscv]
 skip_linkers = ["bfd"]
 min_wild_version = "0.6.0"
@@ -49,6 +54,11 @@ skip = true
 [bench.wild]
 skip_linkers = ["bfd"]
 
+[bench.wild-incremental]
+save = "wild"
+skip_linkers = ["bfd", "lld", "mold"]
+wild_extra_flags = ["--incremental"]
+
 [bench.wild-lto]
 min_wild_version = "0.9.0"
 
@@ -64,4 +74,3 @@ skip_linkers = ["bfd"]
 
 [bench.clang-debug-strip]
 skip_linkers = ["bfd"]
-

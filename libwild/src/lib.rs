@@ -24,6 +24,7 @@ pub(crate) mod gc_stats;
 pub(crate) mod glob_match;
 pub(crate) mod grouping;
 pub(crate) mod hash;
+pub(crate) mod incremental;
 pub(crate) mod input_data;
 pub(crate) mod input_section_id;
 pub(crate) mod layout;
@@ -267,6 +268,11 @@ impl Linker {
 
         let loaded = loaded?;
 
+        let incremental_state = incremental::maybe_prepare(args, file_loader)?;
+        if incremental_state.can_reuse_output() {
+            return Ok(LinkerOutput { layout: None });
+        }
+
         let output_kind = OutputKind::new(args, file_loader);
 
         let mut output = file_writer::Output::new(args, output_kind);
@@ -344,6 +350,7 @@ impl Linker {
 
         P::write_output_file::<A>(&output, &layout)?;
         diff::maybe_diff()?;
+        incremental_state.finish(args, file_loader)?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
         let (g1, g2) = timing_guard!("Shutdown");

@@ -953,6 +953,24 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
         });
 
     parser
+        .declare()
+        .long("incremental")
+        .help("Enable incremental linking")
+        .execute(|args, _modifier_stack| {
+            args.common_mut().incremental = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("no-incremental")
+        .help("Disable incremental linking")
+        .execute(|args, _modifier_stack| {
+            args.common_mut().incremental = false;
+            Ok(())
+        });
+
+    parser
         .declare_with_param()
         .long("entry")
         .short("e")

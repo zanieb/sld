@@ -54,6 +54,21 @@ to edit the `run-with` script to change / delete these flags. This will make com
 linkers more fair, since some of these unsupported flags may involve other linkers doing significant
 amounts of extra work.
 
+### Benchmarking incremental mode
+
+The benchmark runner can pass extra flags for specific benchmark entries. To measure Wild's
+incremental no-change path for an existing save-dir, add another benchmark entry that points at the
+same save-dir and passes `--incremental` only to Wild:
+
+```toml
+[bench.ripgrep-incremental]
+save = "ripgrep"
+skip_linkers = ["bfd", "lld", "mold"]
+wild_extra_flags = ["--incremental"]
+```
+
+The runner performs a warmup run first, so the timed runs measure reuse of the incremental state.
+
 ### Run benchmark with hyperfine
 
 Let's benchmark the linking stage between `ld`, `mold` and `wild`, discarding the first two runs of

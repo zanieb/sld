@@ -41,6 +41,7 @@ use crate::timing_phase;
 use std::sync::atomic::AtomicI64;
 
 pub(crate) const FILES_PER_GROUP_ENV: &str = "WILD_FILES_PER_GROUP";
+pub const INCREMENTAL_ENV: &str = "WILD_INCREMENTAL";
 pub const REFERENCE_LINKER_ENV: &str = "WILD_REFERENCE_LINKER";
 pub const VALIDATE_ENV: &str = "WILD_VALIDATE_OUTPUT";
 pub const WILD_UNSUPPORTED_ENV: &str = "WILD_UNSUPPORTED";
@@ -73,6 +74,7 @@ pub struct CommonArgs {
     pub(crate) should_fork: bool,
     pub(crate) demangle: bool,
     pub(crate) mmap_output_file: bool,
+    pub(crate) incremental: bool,
     pub(crate) validate_output: bool,
     pub(crate) verify_allocation_consistency: bool,
     pub(crate) write_layout: bool,
@@ -280,6 +282,7 @@ impl Default for CommonArgs {
             unrecognized_options: Vec::new(),
             save_dir: SaveDir::default(),
             mmap_output_file: true,
+            incremental: std::env::var(INCREMENTAL_ENV).is_ok_and(|v| v == "1"),
             prepopulate_maps: false,
             debug_fuel: None,
             should_fork: true,

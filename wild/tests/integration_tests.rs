@@ -150,6 +150,10 @@
 //! having been pre-filled with random data. It then compares the output of the two runs to verify
 //! that they're the same.
 //!
+//! TestIncremental:{bool} Whether to perform additional testing of the --incremental flag. This
+//! testing runs wild twice with incremental linking enabled and verifies that the second run reuses
+//! the existing output.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -749,6 +753,7 @@ struct Config {
     requires_rust_musl: bool,
     requires_linker_plugin: bool,
     test_update_in_place: bool,
+    test_incremental: bool,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1317,6 +1322,7 @@ impl Config {
             rustc_channel: RustcChannel::Default,
             requires_rust_musl: false,
             test_update_in_place: false,
+            test_incremental: false,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1685,6 +1691,9 @@ fn process_directive(
         "TestUpdateInPlace" => {
             config.test_update_in_place = arg.to_lowercase().parse()?;
         }
+        "TestIncremental" => {
+            config.test_incremental = arg.to_lowercase().parse()?;
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -1748,6 +1757,10 @@ impl ProgramInputs {
 
         if config.test_update_in_place && matches!(linker, Linker::Wild) {
             self.run_update_in_place_test(&inputs, config, cross_arch)?;
+        }
+
+        if config.test_incremental && matches!(linker, Linker::Wild) {
+            self.run_incremental_test(&inputs, config, cross_arch)?;
         }
 
         let shared_objects = inputs
@@ -1861,6 +1874,69 @@ impl ProgramInputs {
                 original_len = original_content.len(),
                 final_len = final_content.len(),
                 cmd = link_output_2.command,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn run_incremental_test(
+        &self,
+        inputs: &[LinkerInput],
+        config: &Config,
+        cross_arch: Option<Architecture>,
+    ) -> Result<()> {
+        let mut incremental_config = config.clone();
+        let arg = match config.linker_driver {
+            LinkerDriver::Compiler(_) => "-Wl,--incremental",
+            LinkerDriver::Direct(_) => "--incremental",
+        };
+        if !incremental_config
+            .wild_extra_linker_args
+            .args
+            .iter()
+            .any(|existing| existing == arg)
+        {
+            incremental_config
+                .wild_extra_linker_args
+                .args
+                .push(arg.to_owned());
+        }
+
+        let link_output_1 =
+            Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+        let original_content = std::fs::read(&link_output_1.binary).with_context(|| {
+            format!(
+                "Failed to read first incremental output: {}",
+                link_output_1.binary.display()
+            )
+        })?;
+
+        let link_output_2 =
+            Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+        let final_content = std::fs::read(&link_output_2.binary).with_context(|| {
+            format!(
+                "Failed to read second incremental output: {}",
+                link_output_2.binary.display()
+            )
+        })?;
+
+        if original_content != final_content {
+            bail!(
+                "Incremental test failed for {}: output changed between identical incremental links",
+                self.name()
+            );
+        }
+
+        let log_path = append_to_path(&link_output_2.binary, ".incr").join("log");
+        let log = std::fs::read_to_string(&log_path)
+            .with_context(|| format!("Failed to read incremental log `{}`", log_path.display()))?;
+
+        if !log.contains("reused existing output") {
+            bail!(
+                "Incremental test failed for {}: second link did not reuse existing output. Log:\n{}",
+                self.name(),
+                log
             );
         }
 
@@ -3381,6 +3457,10 @@ impl LinkCommand {
 
 /// Returns `path` + `extra`.
 fn add_to_path(path: &Path, extra: &str) -> PathBuf {
+    append_to_path(path, extra)
+}
+
+fn append_to_path(path: &Path, extra: &str) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(extra);
     PathBuf::from(path)
