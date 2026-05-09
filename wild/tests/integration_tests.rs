@@ -258,7 +258,6 @@ use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::io::Read;
-use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -1981,22 +1980,7 @@ impl ProgramInputs {
                 );
             }
 
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&changed_input.path)
-                .with_context(|| {
-                    format!(
-                        "Failed to open input `{}` for incremental mutation",
-                        changed_input.path.display()
-                    )
-                })?;
-            file.write_all(b"\0").with_context(|| {
-                format!(
-                    "Failed to mutate input `{}` for incremental test",
-                    changed_input.path.display()
-                )
-            })?;
-            drop(file);
+            mutate_data_section_byte(&changed_input.path)?;
 
             let link_output_3 =
                 Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -2007,9 +1991,26 @@ impl ProgramInputs {
                 )
             })?;
 
-            if final_content != changed_content {
+            if final_content == changed_content {
                 bail!(
-                    "Incremental test failed for {}: ignored input-object trailer changed output",
+                    "Incremental test failed for {}: changed input section did not change output",
+                    self.name()
+                );
+            }
+
+            let link_output_4 = Linker::Wild.link(self.name(), inputs, config, cross_arch)?;
+            let full_content = std::fs::read(&link_output_4.binary).with_context(|| {
+                format!(
+                    "Failed to read full relink output: {}",
+                    link_output_4.binary.display()
+                )
+            })?;
+
+            if changed_content != full_content {
+                let diffs = sections_with_diffs(&changed_content, &full_content)?;
+                bail!(
+                    "Incremental test failed for {}: changed-input incremental output differs \
+                    from a full relink of the same mutated inputs. Diffs:\n{diffs:#?}",
                     self.name()
                 );
             }
@@ -2028,6 +2029,31 @@ impl ProgramInputs {
 
         Ok(())
     }
+}
+
+fn mutate_data_section_byte(path: &Path) -> Result {
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let (offset, len) = {
+        let file = object::File::parse(bytes.as_slice())
+            .with_context(|| format!("Failed to parse `{}` as an object file", path.display()))?;
+        let section = file
+            .section_by_name(".data")
+            .with_context(|| format!("Missing .data section in `{}`", path.display()))?;
+        section
+            .file_range()
+            .with_context(|| format!("Missing .data file range in `{}`", path.display()))?
+    };
+    ensure!(
+        len > 0,
+        "Cannot mutate empty .data section in `{}`",
+        path.display()
+    );
+    let index = usize::try_from(offset).context("Invalid .data offset")?;
+    bytes[index] = bytes[index].wrapping_add(1);
+    std::fs::write(path, bytes)
+        .with_context(|| format!("Failed to write mutated object `{}`", path.display()))?;
+    Ok(())
 }
 
 /// Removes the specified sections from the output file.

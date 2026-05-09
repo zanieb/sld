@@ -13,6 +13,8 @@ use anyhow::bail;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::io::Read as _;
+use std::io::Write as _;
+use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Instant;
@@ -115,6 +117,7 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
                 for _ in 0..args.batch_size {
                     let extra_flags =
                         extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
+                    mutate_inputs(bench)?;
 
                     if let Some(run) = run_once(bin, bench, args, &extra_flags)? {
                         bin_results.push(run);
@@ -157,6 +160,45 @@ fn extra_flags_for_run(bin: &Bin, bench: &Benchmark, measure_memory: bool) -> Ve
         extra_flags.push("--no-fork".to_owned());
     }
     extra_flags
+}
+
+fn mutate_inputs(bench: &Benchmark) -> Result {
+    if bench.config.mutate_files.is_empty() {
+        return Ok(());
+    }
+
+    let save_dir = bench
+        .path
+        .parent()
+        .with_context(|| format!("Benchmark path `{}` has no parent", bench.path.display()))?;
+
+    for relative_path in &bench.config.mutate_files {
+        let path = save_dir.join(relative_path);
+        ensure_relative_path(relative_path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("Failed to open mutation input `{}`", path.display()))?;
+        file.write_all(&[0])
+            .with_context(|| format!("Failed to mutate input `{}`", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn ensure_relative_path(path: &str) -> Result {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "Benchmark mutation paths must be relative to the save-dir: `{}`",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Runs each benchmark once with each linker.
@@ -310,4 +352,16 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_relative_path;
+
+    #[test]
+    fn mutation_paths_must_be_save_dir_relative() {
+        assert!(ensure_relative_path("objects/main.o").is_ok());
+        assert!(ensure_relative_path("../main.o").is_err());
+        assert!(ensure_relative_path("/tmp/main.o").is_err());
+    }
 }

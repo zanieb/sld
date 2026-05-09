@@ -1,10 +1,13 @@
 //#Config:incremental
 //#Object:incremental-unchanged.c
 //#RunEnabled:false
+//#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
 
-int value(void) { return 42; }
+volatile int incremental_value = 42;
+
+int value(void) { return incremental_value; }
 
 int unchanged(void);
 

@@ -314,7 +314,10 @@ impl LinkerIdentifier {
         let mut hash = None;
         let mut variant = None;
 
-        if let Some(mut rest) = version_line.strip_prefix("Wild version ") {
+        if let Some(mut rest) = version_line
+            .strip_prefix("Wild version ")
+            .or_else(|| version_line.strip_prefix("Wild "))
+        {
             version = take_word(&mut rest)?.to_owned();
             if !bin_path.to_string_lossy().contains(&version) {
                 // For wild, we only consider the version to be true if the path to the linker
@@ -469,5 +472,18 @@ mod tests {
         assert!(!version_less_than("0.5.0", "0.5.0"));
         assert!(!version_less_than("0.6.0", "0.5.0"));
         assert!(version_less_than("0.5.0", "0.10.0"));
+    }
+
+    #[test]
+    fn parses_current_wild_version_output() {
+        let identifier = LinkerIdentifier::parse(
+            "Wild 0.8.0 non-git-build (compatible with GNU linkers)",
+            Path::new("/tmp/wild"),
+        )
+        .unwrap();
+
+        assert_eq!(identifier.kind, LinkerKind::Wild);
+        assert_eq!(identifier.version, "0.8.0");
+        assert_eq!(identifier.hash.as_deref(), Some("non-git-build"));
     }
 }
