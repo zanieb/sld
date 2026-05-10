@@ -1886,8 +1886,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
     }
 
     let relocations = object.relocations(section_index)?;
-    let can_reuse_existing_bytes = existing_output_bytes_available
-        && !layout.args().should_output_partial_object()
+    let record_for_reuse = !layout.args().should_output_partial_object()
         && relocations.num_relocations() == 0
         && object.section_relax_deltas.get(section_index.0).is_none()
         && !section.flags.needs_got()
@@ -1898,6 +1897,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             object.object,
             &layout.output_sections,
         );
+    let can_reuse_existing_bytes = existing_output_bytes_available && record_for_reuse;
 
     let written = write_section_raw(
         object,
@@ -1906,6 +1906,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
         section_index,
         buffers,
         incremental,
+        record_for_reuse,
         can_reuse_existing_bytes,
     )?;
     if written.reused {
@@ -2059,6 +2060,11 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     }
 
     let relocations = object.relocations(section_index)?;
+    let record_for_reuse = !layout.args().should_output_partial_object()
+        && relocations.num_relocations() == 0
+        && object.section_relax_deltas.get(section_index.0).is_none()
+        && !section.flags.needs_got()
+        && !section.flags.needs_plt();
     let written = write_section_raw(
         object,
         layout,
@@ -2066,12 +2072,8 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
         section_index,
         buffers,
         incremental,
-        existing_output_bytes_available
-            && !layout.args().should_output_partial_object()
-            && relocations.num_relocations() == 0
-            && object.section_relax_deltas.get(section_index.0).is_none()
-            && !section.flags.needs_got()
-            && !section.flags.needs_plt(),
+        record_for_reuse,
+        existing_output_bytes_available && record_for_reuse,
     )?;
     if written.reused {
         return Ok(());
@@ -2111,6 +2113,7 @@ fn write_section_raw<'out, 'data>(
     section_index: object::SectionIndex,
     buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
     incremental: &PreparedState,
+    record_for_reuse: bool,
     allow_reuse: bool,
 ) -> Result<WrittenSection<'out>> {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
@@ -2137,6 +2140,7 @@ fn write_section_raw<'out, 'data>(
             section_index,
             output_offset as u64,
             allocation_size as u64,
+            record_for_reuse,
             allow_reuse,
         ) {
             return Ok(WrittenSection {
