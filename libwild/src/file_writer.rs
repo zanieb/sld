@@ -366,12 +366,30 @@ pub(crate) fn split_output_by_group<'layout, 'data, 'out, P: Platform>(
 ) -> Vec<(
     &'layout GroupLayout<'data, P>,
     OutputSectionPartMap<&'out mut [u8]>,
+    OutputSectionPartMap<usize>,
 )> {
     timing_phase!("Split output buffers by group");
+    let mut part_file_offsets = layout
+        .section_part_layouts
+        .map(|_part_id, part| part.file_offset);
     layout
         .group_layouts
         .iter()
-        .map(|group| (group, writable_buckets.take_mut(&group.file_sizes)))
+        .map(|group| {
+            let group_file_offsets = part_file_offsets.clone();
+            for (offset, size) in part_file_offsets
+                .parts
+                .iter_mut()
+                .zip(group.file_sizes.parts.iter())
+            {
+                *offset += *size;
+            }
+            (
+                group,
+                writable_buckets.take_mut(&group.file_sizes),
+                group_file_offsets,
+            )
+        })
         .collect()
 }
 

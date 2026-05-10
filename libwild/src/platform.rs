@@ -1292,6 +1292,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    fn has_incremental_fast_build_id(&self) -> bool {
+        false
+    }
+
     fn relocation_model(&self) -> crate::args::RelocationModel;
 
     fn should_output_executable(&self) -> bool;

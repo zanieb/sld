@@ -259,9 +259,8 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
 
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
-    groups_and_buffers
-        .into_par_iter()
-        .try_for_each(|(group, mut buffers)| -> Result {
+    groups_and_buffers.into_par_iter().try_for_each(
+        |(group, mut buffers, group_file_offsets)| -> Result {
             verbose_timing_phase!("Write group");
 
             let mut table_writer = TableWriter::from_layout(
@@ -282,6 +281,8 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                     &sym_index_map,
                     incremental,
                     existing_output_bytes_available,
+                    &group_file_offsets,
+                    &group.file_sizes,
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
@@ -289,7 +290,8 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                 .validate_empty(&group.mem_sizes)
                 .with_context(|| format!("validate_empty failed for {group}"))?;
             Ok(())
-        })?;
+        },
+    )?;
 
     for (output_section_id, _) in layout.output_sections.ids_with_info() {
         let relocations = layout
@@ -486,6 +488,8 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
     sym_index_map: &[Option<u32>],
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     match file {
         FileLayout::Object(s) => {
@@ -498,6 +502,8 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
                 sym_index_map,
                 incremental,
                 existing_output_bytes_available,
+                group_file_offsets,
+                group_file_sizes,
             )?;
         }
         FileLayout::Prelude(s) => write_prelude::<A>(s, buffers, table_writer, layout)?,
@@ -1471,6 +1477,8 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
     sym_index_map: &[Option<u32>],
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
 
@@ -1491,6 +1499,8 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
                     trace,
                     incremental,
                     existing_output_bytes_available,
+                    group_file_offsets,
+                    group_file_sizes,
                 )?;
             }
             SectionSlot::LoadedDebugInfo(sec) => {
@@ -1502,6 +1512,8 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
                     buffers,
                     incremental,
                     existing_output_bytes_available,
+                    group_file_offsets,
+                    group_file_sizes,
                 )?;
             }
             SectionSlot::FrameData(section_index) => {
@@ -1872,6 +1884,8 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
     trace: &TraceOutput,
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     if layout.args().should_output_partial_object() {
@@ -1908,6 +1922,8 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
         incremental,
         record_for_reuse,
         can_reuse_existing_bytes,
+        group_file_offsets,
+        group_file_sizes,
     )?;
     if written.reused {
         return Ok(());
@@ -2050,6 +2066,8 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     let section_id = part_id.output_section_id();
@@ -2074,6 +2092,8 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
         incremental,
         record_for_reuse,
         existing_output_bytes_available && record_for_reuse,
+        group_file_offsets,
+        group_file_sizes,
     )?;
     if written.reused {
         return Ok(());
@@ -2115,6 +2135,8 @@ fn write_section_raw<'out, 'data>(
     incremental: &PreparedState,
     record_for_reuse: bool,
     allow_reuse: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result<WrittenSection<'out>> {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     if layout
@@ -2123,9 +2145,14 @@ fn write_section_raw<'out, 'data>(
     {
         let section_buffer = buffers.get_mut(part_id);
         let allocation_size = sec.capacity(part_id, &layout.output_sections) as usize;
-        let part_layout = layout.section_part_layouts.get(part_id);
-        let output_offset =
-            part_layout.file_offset + (part_layout.file_size - section_buffer.len());
+        let consumed_in_group = group_file_sizes
+            .get(part_id)
+            .checked_sub(section_buffer.len())
+            .context("Incremental section buffer is larger than its group allocation")?;
+        let output_offset = group_file_offsets
+            .get(part_id)
+            .checked_add(consumed_in_group)
+            .context("Incremental section output offset overflow")?;
         if section_buffer.len() < allocation_size {
             bail!(
                 "Insufficient space allocated to section `{}`. Tried to take {} bytes, but only {} remain",
