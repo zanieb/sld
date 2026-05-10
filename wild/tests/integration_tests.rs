@@ -1978,7 +1978,7 @@ impl ProgramInputs {
         }
 
         if config.test_incremental_changed {
-            let changed_input = inputs.first().with_context(|| {
+            let changed_input = inputs.last().with_context(|| {
                 format!(
                     "Incremental changed-input test for {} needs at least one input",
                     self.name()
@@ -1986,7 +1986,7 @@ impl ProgramInputs {
             })?;
             if inputs.len() < 2 {
                 bail!(
-                    "Incremental changed-input test for {} needs an unchanged second input",
+                    "Incremental changed-input test for {} needs at least two inputs",
                     self.name()
                 );
             }
@@ -2029,16 +2029,10 @@ impl ProgramInputs {
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
-            if !log.contains("full relink: input file changed") {
+            if !log.contains("patched 1 changed input file before loading inputs") {
                 bail!(
-                    "Incremental test failed for {}: changed-input relink was not classified as an input change. Log:\n{}",
-                    self.name(),
-                    log
-                );
-            }
-            if !log.contains("unchanged input sections") {
-                bail!(
-                    "Incremental test failed for {}: changed-input relink did not reuse unchanged input sections. Log:\n{}",
+                    "Incremental test failed for {}: changed-input relink did not patch the \
+                    changed input before loading all inputs. Log:\n{}",
                     self.name(),
                     log
                 );

@@ -118,9 +118,8 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
-    groups_and_buffers
-        .into_par_iter()
-        .try_for_each(|(group, mut buffers)| -> Result {
+    groups_and_buffers.into_par_iter().try_for_each(
+        |(group, mut buffers, _group_file_offsets)| -> Result {
             verbose_timing_phase!("Write group");
 
             let mut symbol_writer = MachOSymbolTableWriter {
@@ -137,7 +136,8 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     write_code_signature(layout, sized_output)?;
 

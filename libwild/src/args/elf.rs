@@ -2052,6 +2052,10 @@ impl platform::Args for ElfArgs {
         self.trace
     }
 
+    fn has_incremental_fast_build_id(&self) -> bool {
+        matches!(self.build_id, BuildIdOption::Fast)
+    }
+
     fn relocation_model(&self) -> crate::args::RelocationModel {
         self.relocation_model
     }
