@@ -23,7 +23,10 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-const STATE_VERSION: &str = "wild-incremental-state-v7";
+const STATE_VERSION: &str = "wild-incremental-state-v10";
+const STATE_VERSION_V9: &str = "wild-incremental-state-v9";
+const STATE_VERSION_V8: &str = "wild-incremental-state-v8";
+const STATE_VERSION_V7: &str = "wild-incremental-state-v7";
 const STATE_VERSION_V6: &str = "wild-incremental-state-v6";
 const STATE_VERSION_V5: &str = "wild-incremental-state-v5";
 const STATE_VERSION_V4: &str = "wild-incremental-state-v4";
@@ -32,6 +35,10 @@ const STATE_VERSION_V2: &str = "wild-incremental-state-v2";
 const STATE_VERSION_V1: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
+const BUILD_ID_HASH_FILE: &str = "build-id-hash";
+const SECTIONS_FILE: &str = "sections";
+const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
+const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const ABSENT_FIELD: &str = "-";
 
 pub(crate) struct PreparedState {
@@ -64,8 +71,16 @@ struct CurrentState {
 struct PersistedState {
     args_hash: String,
     output: FileContentState,
+    build_id_hashes: Option<BuildIdHashState>,
     input_files: Vec<FileState>,
     sections: Vec<SectionRecord>,
+    sections_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildIdHashState {
+    output_len: u64,
+    nodes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +93,15 @@ struct FileState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilePatchState {
     fingerprint: String,
-    sections: Vec<u32>,
+    sections: Vec<FilePatchSectionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilePatchSectionState {
+    section_index: u32,
+    input_size: u64,
+    output_offset: u64,
+    output_size: u64,
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -195,7 +218,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     timing_phase!("Check incremental fast path");
 
     let state_dir = state_dir_for_output(args.output());
-    let Some(previous) = PersistedState::read(&state_dir).unwrap_or_default() else {
+    let Some(previous) = PersistedState::read_metadata(&state_dir).unwrap_or_default() else {
         return Ok(false);
     };
 
@@ -234,21 +257,6 @@ fn patch_changed_inputs(
 ) -> Result<bool> {
     timing_phase!("Patch changed incremental inputs");
 
-    let sections_by_file = previous
-        .sections
-        .iter()
-        .filter(|section| section.input == section.input_file)
-        .fold(
-            HashMap::<&str, Vec<&SectionRecord>>::new(),
-            |mut sections, section| {
-                sections
-                    .entry(section.input_file.as_str())
-                    .or_default()
-                    .push(section);
-                sections
-            },
-        );
-
     let mut patches = Vec::new();
     let mut input_files = previous.input_files.clone();
     for (input_index, path) in changed_inputs {
@@ -259,22 +267,24 @@ fn patch_changed_inputs(
         if previous_patch.sections.is_empty() {
             return Ok(false);
         }
-        let Some(all_sections) = sections_by_file.get(input.path.as_str()) else {
-            return Ok(false);
-        };
         let patch_section_indexes = previous_patch
             .sections
             .iter()
-            .copied()
+            .map(|section| section.section_index)
             .collect::<HashSet<_>>();
-        let sections = all_sections
-            .iter()
-            .copied()
-            .filter(|section| patch_section_indexes.contains(&section.section_index))
-            .collect::<Vec<_>>();
-        if sections.len() != previous_patch.sections.len() {
+        if patch_section_indexes.len() != previous_patch.sections.len() {
             return Ok(false);
         }
+        let sections = previous_patch
+            .sections
+            .iter()
+            .map(|section| PatchSection {
+                section_index: section.section_index,
+                input_size: section.input_size,
+                output_offset: section.output_offset,
+                output_size: section.output_size,
+            })
+            .collect::<Vec<_>>();
 
         let bytes = std::fs::read(path).with_context(|| {
             format!(
@@ -320,7 +330,20 @@ fn patch_changed_inputs(
     if build_id_range.is_some() && !args.has_incremental_fast_build_id() {
         return Ok(false);
     }
+    let mut build_id_tree = None;
+    let mut build_id_hashes = None;
+    if build_id_range.is_some() {
+        let Some(previous_hashes) = previous.build_id_hashes.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(tree) = read_build_id_hash_tree(state_dir, previous_hashes) else {
+            return Ok(false);
+        };
+        build_id_tree = Some(tree);
+        build_id_hashes = Some(previous_hashes.clone());
+    }
 
+    let mut patched_ranges = Vec::new();
     for patch in patches {
         let start = patch.output_offset as usize;
         let end = start
@@ -335,18 +358,22 @@ fn patch_changed_inputs(
         let (data_out, padding) = output_range.split_at_mut(patch.data.len());
         data_out.copy_from_slice(&patch.data);
         padding.fill(0);
+        patched_ranges.push(start..end);
     }
 
+    let mut flush_ranges = patched_ranges.clone();
     if let Some(range) = build_id_range {
-        write_fast_build_id(&mut output, range)?;
+        let previous_hashes = build_id_hashes
+            .as_mut()
+            .context("Missing incremental build ID hash state")?;
+        let tree = build_id_tree
+            .as_mut()
+            .context("Missing incremental build ID hash tree")?;
+        flush_ranges.push(range.clone());
+        write_fast_build_id_from_state(&mut output, range, previous_hashes, tree, &patched_ranges)?;
     }
 
-    output.flush().with_context(|| {
-        format!(
-            "Failed to flush incrementally patched output `{}`",
-            args.output().display()
-        )
-    })?;
+    flush_output_ranges(&output, &flush_ranges, args.output())?;
     drop(output);
     drop(file);
 
@@ -356,13 +383,16 @@ fn patch_changed_inputs(
             args.output().display()
         )
     })?;
+    write_build_id_hash_tree(state_dir, build_id_tree.as_deref())?;
     PersistedState {
         args_hash: previous.args_hash,
         output,
+        build_id_hashes,
         input_files,
         sections: previous.sections.clone(),
+        sections_file: previous.sections_file.clone(),
     }
-    .write(state_dir)?;
+    .write_index(state_dir)?;
 
     append_log(
         state_dir,
@@ -379,6 +409,50 @@ struct SectionPatch {
     output_offset: u64,
     size: u64,
     data: Vec<u8>,
+}
+
+fn flush_output_ranges(
+    output: &memmap2::MmapMut,
+    ranges: &[std::ops::Range<usize>],
+    output_path: &Path,
+) -> Result {
+    let mut ranges = ranges
+        .iter()
+        .filter(|range| !range.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+
+    let mut merged = Vec::<std::ops::Range<usize>>::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+
+    for range in merged {
+        output
+            .flush_range(range.start, range.end - range.start)
+            .with_context(|| {
+                format!(
+                    "Failed to flush incrementally patched output `{}`",
+                    output_path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PatchSection {
+    section_index: u32,
+    input_size: u64,
+    output_offset: u64,
+    output_size: u64,
 }
 
 impl PreparedState {
@@ -450,6 +524,17 @@ impl PreparedState {
                     args.output().display()
                 )
             })?;
+        let output_bytes = std::fs::read(args.output()).with_context(|| {
+            format!(
+                "Failed to read output `{}` for incremental state",
+                args.output().display()
+            )
+        })?;
+        let (build_id_hashes, build_id_tree) = if args.has_incremental_fast_build_id() {
+            build_id_hash_state_from_output(&output_bytes)?
+        } else {
+            (None, None)
+        };
 
         let mut sections = self.current_sections.lock().unwrap().clone();
         if sections.is_empty() && self.mode == IncrementalMode::Reuse {
@@ -458,15 +543,18 @@ impl PreparedState {
         sections.sort();
 
         let mut input_files = self.current.input_files.clone();
-        record_patch_fingerprints(&mut input_files, _file_loader, &sections, args.output())?;
+        record_patch_fingerprints(&mut input_files, _file_loader, &sections, &output_bytes)?;
 
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
             output,
+            build_id_hashes,
             input_files,
             sections,
+            sections_file: None,
         };
 
+        write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
         state.write(&self.current.state_dir)?;
         let reused = self.reused_sections.load(Ordering::Relaxed);
         if reused > 0 {
@@ -591,6 +679,14 @@ impl CurrentState {
 
 impl PersistedState {
     fn read(state_dir: &Path) -> Result<Option<Self>> {
+        Self::read_impl(state_dir, true)
+    }
+
+    fn read_metadata(state_dir: &Path) -> Result<Option<Self>> {
+        Self::read_impl(state_dir, false)
+    }
+
+    fn read_impl(state_dir: &Path, load_sections: bool) -> Result<Option<Self>> {
         let path = state_dir.join(INDEX_FILE);
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
@@ -598,13 +694,35 @@ impl PersistedState {
             Err(error) => return Err(error.into()),
         };
 
-        Ok(Some(Self::parse(&contents)?))
+        Ok(Some(Self::parse_with_section_loader(
+            &contents,
+            |sections_file| {
+                if !load_sections {
+                    return Ok(None);
+                }
+                let path = state_dir.join(sections_file);
+                std::fs::read_to_string(&path).map(Some).with_context(|| {
+                    format!("Failed to read incremental sections `{}`", path.display())
+                })
+            },
+        )?))
     }
 
+    #[cfg(test)]
     fn parse(contents: &str) -> Result<Self> {
-        let mut lines = contents.lines();
+        Self::parse_with_section_loader(contents, |_| Ok(None))
+    }
+
+    fn parse_with_section_loader(
+        contents: &str,
+        mut load_sections: impl FnMut(&str) -> Result<Option<String>>,
+    ) -> Result<Self> {
+        let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V9
+            && version != STATE_VERSION_V8
+            && version != STATE_VERSION_V7
             && version != STATE_VERSION_V6
             && version != STATE_VERSION_V5
             && version != STATE_VERSION_V4
@@ -619,6 +737,14 @@ impl PersistedState {
 
         let args_hash = parse_prefixed_line(lines.next(), "args")?.to_owned();
         let output = parse_content_line(lines.next(), "output")?;
+        let build_id_hashes = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("build-id-hash\t"))
+        {
+            parse_build_id_hash_line(lines.next())?
+        } else {
+            None
+        };
 
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
@@ -630,30 +756,28 @@ impl PersistedState {
             input_files.push(parse_input_line(line)?);
         }
 
+        let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V9
+            || version == STATE_VERSION_V8
+            || version == STATE_VERSION_V7
             || version == STATE_VERSION_V6
             || version == STATE_VERSION_V5
         {
-            let section_input_count: usize = parse_prefixed_line(lines.next(), "section-inputs")?
-                .parse()
-                .context("Invalid incremental section input count")?;
-            let mut section_inputs = Vec::with_capacity(section_input_count);
-            for _ in 0..section_input_count {
-                let line = lines
-                    .next()
-                    .context("Missing incremental section input record")?;
-                section_inputs.push(parse_section_input_line(line)?);
+            let first_line = lines
+                .next()
+                .context("Missing incremental section input count")?;
+            if first_line.starts_with("sections-file\t") {
+                let file = parse_prefixed_line(Some(first_line), "sections-file")?.to_owned();
+                let sections = load_sections(&file)?
+                    .map(|contents| parse_compact_sections_block(contents.lines()))
+                    .transpose()?
+                    .unwrap_or_default();
+                sections_file = Some(file);
+                sections
+            } else {
+                parse_compact_sections_block(std::iter::once(first_line).chain(&mut lines))?
             }
-
-            let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
-                .parse()
-                .context("Invalid incremental section count")?;
-            let mut sections = Vec::with_capacity(section_count);
-            for _ in 0..section_count {
-                let line = lines.next().context("Missing incremental section record")?;
-                sections.push(parse_compact_section_line(line, &section_inputs)?);
-            }
-            sections
         } else if version == STATE_VERSION_V4
             || version == STATE_VERSION_V3
             || version == STATE_VERSION_V2
@@ -678,12 +802,19 @@ impl PersistedState {
         Ok(Self {
             args_hash,
             output,
+            build_id_hashes,
             input_files,
             sections,
+            sections_file,
         })
     }
 
     fn write(&self, state_dir: &Path) -> Result {
+        self.write_sections(state_dir)?;
+        self.write_index(state_dir)
+    }
+
+    fn write_index(&self, state_dir: &Path) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "Failed to create incremental state directory `{}`",
@@ -693,7 +824,7 @@ impl PersistedState {
 
         let path = state_dir.join(INDEX_FILE);
         let tmp_path = state_dir.join(format!("{INDEX_FILE}.tmp"));
-        std::fs::write(&tmp_path, self.render()).with_context(|| {
+        std::fs::write(&tmp_path, self.render_index()).with_context(|| {
             format!("Failed to write incremental state `{}`", tmp_path.display())
         })?;
         let _ = std::fs::remove_file(&path);
@@ -702,7 +833,46 @@ impl PersistedState {
         Ok(())
     }
 
+    fn write_sections(&self, state_dir: &Path) -> Result {
+        std::fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "Failed to create incremental state directory `{}`",
+                state_dir.display()
+            )
+        })?;
+
+        let path = state_dir.join(SECTIONS_FILE);
+        let tmp_path = state_dir.join(format!("{SECTIONS_FILE}.tmp"));
+        std::fs::write(&tmp_path, self.render_sections()).with_context(|| {
+            format!(
+                "Failed to write incremental sections `{}`",
+                tmp_path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to install incremental sections `{}`",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn render_index(&self) -> String {
+        let mut out = self.render_header_and_inputs();
+        writeln!(&mut out, "sections-file\t{SECTIONS_FILE}").unwrap();
+        out
+    }
+
+    #[cfg(test)]
     fn render(&self) -> String {
+        let mut out = self.render_header_and_inputs();
+        out.push_str(&self.render_sections());
+        out
+    }
+
+    fn render_header_and_inputs(&self) -> String {
         let mut out = String::new();
         writeln!(&mut out, "{STATE_VERSION}").unwrap();
         writeln!(&mut out, "args\t{}", self.args_hash).unwrap();
@@ -712,6 +882,15 @@ impl PersistedState {
             self.output.len,
             self.output.hash,
             self.output.render_identity()
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "build-id-hash\t{}",
+            self.build_id_hashes
+                .as_ref()
+                .map(render_build_id_hash_state)
+                .unwrap_or_else(|| ABSENT_FIELD.to_owned())
         )
         .unwrap();
         writeln!(&mut out, "inputs\t{}", self.input_files.len()).unwrap();
@@ -735,6 +914,11 @@ impl PersistedState {
             )
             .unwrap();
         }
+        out
+    }
+
+    fn render_sections(&self) -> String {
+        let mut out = String::new();
 
         let mut section_inputs = Vec::new();
         let mut section_input_ids = HashMap::new();
@@ -952,7 +1136,7 @@ fn record_patch_fingerprints(
     input_files: &mut [FileState],
     file_loader: &FileLoader<'_>,
     sections: &[SectionRecord],
-    output_path: &Path,
+    output: &[u8],
 ) -> Result {
     let mut sections_by_file = HashMap::<&str, Vec<&SectionRecord>>::new();
     for section in sections {
@@ -967,13 +1151,6 @@ fn record_patch_fingerprints(
     if sections_by_file.is_empty() {
         return Ok(());
     }
-
-    let output = std::fs::read(output_path).with_context(|| {
-        format!(
-            "Failed to read output `{}` for incremental patch fingerprints",
-            output_path.display()
-        )
-    })?;
 
     let loaded_by_path = file_loader
         .loaded_files
@@ -990,13 +1167,18 @@ fn record_patch_fingerprints(
             input.patch = None;
             continue;
         };
-        let patch_sections = direct_copy_patch_sections(input_file.data(), &output, sections)?;
+        let patch_sections = direct_copy_patch_sections(input_file.data(), output, sections)?;
         input.patch = patch_fingerprint(input_file.data(), patch_sections.iter().copied())?.map(
             |fingerprint| FilePatchState {
                 fingerprint,
                 sections: patch_sections
                     .iter()
-                    .map(|section| section.section_index)
+                    .map(|section| FilePatchSectionState {
+                        section_index: section.section_index,
+                        input_size: section.input_size,
+                        output_offset: section.output_offset,
+                        output_size: section.output_size,
+                    })
                     .collect(),
             },
         );
@@ -1009,7 +1191,7 @@ fn direct_copy_patch_sections<'a>(
     bytes: &[u8],
     output: &[u8],
     sections: &[&'a SectionRecord],
-) -> Result<Vec<&'a SectionRecord>> {
+) -> Result<Vec<PatchSection>> {
     let file =
         object::File::parse(bytes).context("Failed to parse incremental patch candidate input")?;
     let mut patch_sections = Vec::new();
@@ -1035,7 +1217,12 @@ fn direct_copy_patch_sections<'a>(
         };
         let (data_out, padding) = output_range.split_at(data.len());
         if data_out == data && padding.iter().all(|byte| *byte == 0) {
-            patch_sections.push(*record);
+            patch_sections.push(PatchSection {
+                section_index: record.section_index,
+                input_size: data.len() as u64,
+                output_offset: record.output_offset,
+                output_size: record.size,
+            });
         }
     }
     Ok(patch_sections)
@@ -1045,15 +1232,14 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let object::SectionFlags::Elf { sh_flags } = flags else {
         return false;
     };
-    let patchable_kind =
-        sh_flags & u64::from(object::elf::SHF_WRITE | object::elf::SHF_EXECINSTR) != 0;
+    let allocated = sh_flags & u64::from(object::elf::SHF_ALLOC) != 0;
     let content_ordered = sh_flags & u64::from(object::elf::SHF_MERGE) != 0;
-    patchable_kind && !content_ordered
+    allocated && !content_ordered
 }
 
-fn patch_fingerprint<'a>(
+fn patch_fingerprint(
     bytes: &[u8],
-    sections: impl IntoIterator<Item = &'a SectionRecord>,
+    sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<String>> {
     let Some(ranges) = patch_ranges(bytes, sections)? else {
         return Ok(None);
@@ -1070,48 +1256,53 @@ fn patch_fingerprint<'a>(
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
-fn patch_sections<'a>(
+fn patch_sections(
     bytes: &[u8],
-    sections: impl IntoIterator<Item = &'a SectionRecord>,
+    sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Vec<SectionPatch>> {
     let file = object::File::parse(bytes).context("Failed to parse changed incremental input")?;
     sections
         .into_iter()
-        .map(|record| {
+        .map(|patch_section| {
             let section = file
-                .section_by_index(object::SectionIndex(record.section_index as usize))
+                .section_by_index(object::SectionIndex(patch_section.section_index as usize))
                 .context("Missing changed incremental input section")?;
             let data = section
                 .data()
                 .context("Failed to read changed incremental input section data")?;
-            if data.len() > record.size as usize {
+            if data.len() as u64 != patch_section.input_size {
+                return Err(crate::error!(
+                    "Changed incremental input section size changed since the previous link"
+                ));
+            }
+            if data.len() > patch_section.output_size as usize {
                 return Err(crate::error!(
                     "Changed incremental input section grew beyond previous output allocation"
                 ));
             }
             Ok(SectionPatch {
-                output_offset: record.output_offset,
-                size: record.size,
+                output_offset: patch_section.output_offset,
+                size: patch_section.output_size,
                 data: data.to_owned(),
             })
         })
         .collect()
 }
 
-fn patch_ranges<'a>(
+fn patch_ranges(
     bytes: &[u8],
-    sections: impl IntoIterator<Item = &'a SectionRecord>,
+    sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<Vec<std::ops::Range<usize>>>> {
     let file = object::File::parse(bytes).context("Failed to parse incremental patch input")?;
     let mut ranges = Vec::new();
-    for record in sections {
+    for patch_section in sections {
         let section = file
-            .section_by_index(object::SectionIndex(record.section_index as usize))
+            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
             .context("Missing incremental patch input section")?;
         let Some((offset, size)) = section.file_range() else {
             return Ok(None);
         };
-        if size > record.size {
+        if size != patch_section.input_size || size > patch_section.output_size {
             return Ok(None);
         }
         let start = offset as usize;
@@ -1171,7 +1362,29 @@ fn build_id_note_range(bytes: &[u8]) -> Result<Option<std::ops::Range<usize>>> {
     Ok(None)
 }
 
-fn write_fast_build_id(output: &mut [u8], range: std::ops::Range<usize>) -> Result {
+fn write_fast_build_id_from_state(
+    output: &mut [u8],
+    range: std::ops::Range<usize>,
+    state: &mut BuildIdHashState,
+    tree: &mut [[u8; blake3::OUT_LEN]],
+    changed_ranges: &[std::ops::Range<usize>],
+) -> Result {
+    validate_fast_build_id_range(&range)?;
+    output[range.clone()].fill(0);
+    let mut hash_ranges = changed_ranges.to_owned();
+    hash_ranges.push(range.clone());
+    let changed_chunks = touched_build_id_chunks(&hash_ranges, output.len())?;
+    if !update_build_id_hash_tree(state, tree, output, &range, &changed_chunks)? {
+        return Err(crate::error!(
+            "Incremental build ID hash state is incompatible with the output"
+        ));
+    }
+    let build_id = build_id_from_hash_tree(state, tree)?;
+    write_fast_build_id_note(output, range, &build_id);
+    Ok(())
+}
+
+fn validate_fast_build_id_range(range: &std::ops::Range<usize>) -> Result {
     const GNU_NOTE_NAME: &[u8] = b"GNU\0";
     let expected_len = 12 + GNU_NOTE_NAME.len() + blake3::OUT_LEN;
     if range.end - range.start != expected_len {
@@ -1179,15 +1392,313 @@ fn write_fast_build_id(output: &mut [u8], range: std::ops::Range<usize>) -> Resu
             "Incremental patching only supports fast 32-byte build IDs"
         ));
     }
+    Ok(())
+}
 
-    output[range.clone()].fill(0);
-    let build_id = blake3::Hasher::new().update_rayon(output).finalize();
+fn write_fast_build_id_note(
+    output: &mut [u8],
+    range: std::ops::Range<usize>,
+    build_id: &blake3::Hash,
+) {
+    const GNU_NOTE_NAME: &[u8] = b"GNU\0";
     let note = &mut output[range];
     note[0..4].copy_from_slice(&(GNU_NOTE_NAME.len() as u32).to_le_bytes());
     note[4..8].copy_from_slice(&(blake3::OUT_LEN as u32).to_le_bytes());
     note[8..12].copy_from_slice(&object::elf::NT_GNU_BUILD_ID.to_le_bytes());
     note[12..16].copy_from_slice(GNU_NOTE_NAME);
     note[16..].copy_from_slice(build_id.as_bytes());
+}
+
+fn build_id_hash_state_from_output(
+    bytes: &[u8],
+) -> Result<(Option<BuildIdHashState>, Option<Vec<[u8; blake3::OUT_LEN]>>)> {
+    let Some(range) = build_id_note_range(&bytes)? else {
+        return Ok((None, None));
+    };
+    validate_fast_build_id_range(&range)?;
+    let Some(nodes) = build_id_hash_node_count(bytes.len()) else {
+        return Ok((None, None));
+    };
+    let mut tree = Vec::with_capacity(nodes);
+    let left_len = blake3::hazmat::left_subtree_len(bytes.len() as u64) as usize;
+    build_id_subtree_hash(bytes, 0, left_len, &range, &mut tree);
+    build_id_subtree_hash(bytes, left_len, bytes.len() - left_len, &range, &mut tree);
+    debug_assert_eq!(tree.len(), nodes);
+    Ok((
+        Some(BuildIdHashState {
+            output_len: bytes.len() as u64,
+            nodes,
+        }),
+        Some(tree),
+    ))
+}
+
+fn build_id_hash_node_count(len: usize) -> Option<usize> {
+    if len <= BUILD_ID_HASH_GROUP_LEN {
+        return None;
+    }
+    let left_len = blake3::hazmat::left_subtree_len(len as u64) as usize;
+    Some(build_id_subtree_node_count(left_len) + build_id_subtree_node_count(len - left_len))
+}
+
+fn build_id_subtree_node_count(len: usize) -> usize {
+    2 * len.div_ceil(BUILD_ID_HASH_GROUP_LEN) - 1
+}
+
+fn build_id_subtree_hash(
+    bytes: &[u8],
+    start: usize,
+    len: usize,
+    zero_range: &std::ops::Range<usize>,
+    tree: &mut Vec<[u8; blake3::OUT_LEN]>,
+) -> [u8; blake3::OUT_LEN] {
+    let index = tree.len();
+    tree.push([0; blake3::OUT_LEN]);
+    let hash = if len <= BUILD_ID_HASH_GROUP_LEN {
+        build_id_leaf_hash(bytes, start, len, zero_range)
+    } else {
+        let left_len = blake3::hazmat::left_subtree_len(len as u64) as usize;
+        let left = build_id_subtree_hash(bytes, start, left_len, zero_range, tree);
+        let right =
+            build_id_subtree_hash(bytes, start + left_len, len - left_len, zero_range, tree);
+        blake3::hazmat::merge_subtrees_non_root(&left, &right, blake3::hazmat::Mode::Hash)
+    };
+    tree[index] = hash;
+    hash
+}
+
+fn update_build_id_hash_tree(
+    state: &mut BuildIdHashState,
+    tree: &mut [[u8; blake3::OUT_LEN]],
+    output: &[u8],
+    zero_range: &std::ops::Range<usize>,
+    changed_chunks: &[usize],
+) -> Result<bool> {
+    if state.output_len != output.len() as u64 {
+        return Ok(false);
+    }
+    if Some(state.nodes) != build_id_hash_node_count(output.len()) {
+        return Ok(false);
+    }
+    if tree.len() != state.nodes {
+        return Ok(false);
+    }
+    if output.len() <= BUILD_ID_HASH_GROUP_LEN {
+        return Ok(false);
+    }
+    let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
+    update_build_id_subtree_hash(tree, 0, output, 0, left_len, zero_range, changed_chunks);
+    let right_index = build_id_subtree_node_count(left_len);
+    update_build_id_subtree_hash(
+        tree,
+        right_index,
+        output,
+        left_len,
+        output.len() - left_len,
+        zero_range,
+        changed_chunks,
+    );
+    Ok(true)
+}
+
+fn update_build_id_subtree_hash(
+    tree: &mut [[u8; blake3::OUT_LEN]],
+    index: usize,
+    output: &[u8],
+    start: usize,
+    len: usize,
+    zero_range: &std::ops::Range<usize>,
+    changed_chunks: &[usize],
+) -> bool {
+    if !touched_chunks_overlap(changed_chunks, start, len) {
+        return false;
+    }
+    if len <= BUILD_ID_HASH_GROUP_LEN {
+        tree[index] = build_id_leaf_hash(output, start, len, zero_range);
+        return true;
+    }
+
+    let left_len = blake3::hazmat::left_subtree_len(len as u64) as usize;
+    let left_index = index + 1;
+    let right_index = left_index + build_id_subtree_node_count(left_len);
+    let left_changed = update_build_id_subtree_hash(
+        tree,
+        left_index,
+        output,
+        start,
+        left_len,
+        zero_range,
+        changed_chunks,
+    );
+    let right_changed = update_build_id_subtree_hash(
+        tree,
+        right_index,
+        output,
+        start + left_len,
+        len - left_len,
+        zero_range,
+        changed_chunks,
+    );
+    if left_changed || right_changed {
+        tree[index] = blake3::hazmat::merge_subtrees_non_root(
+            &tree[left_index],
+            &tree[right_index],
+            blake3::hazmat::Mode::Hash,
+        );
+    }
+    left_changed || right_changed
+}
+
+fn build_id_leaf_hash(
+    bytes: &[u8],
+    start: usize,
+    len: usize,
+    zero_range: &std::ops::Range<usize>,
+) -> [u8; blake3::OUT_LEN] {
+    let end = start + len;
+    let chunk = &bytes[start..end];
+    if let Some(overlap) = intersect_ranges(start..end, zero_range.clone()) {
+        let mut zeroed = chunk.to_vec();
+        zeroed[overlap.start - start..overlap.end - start].fill(0);
+        build_id_leaf_hash_bytes(&zeroed, start)
+    } else {
+        build_id_leaf_hash_bytes(chunk, start)
+    }
+}
+
+fn build_id_leaf_hash_bytes(bytes: &[u8], start: usize) -> [u8; blake3::OUT_LEN] {
+    use blake3::hazmat::HasherExt as _;
+    blake3::Hasher::new()
+        .set_input_offset(start as u64)
+        .update(bytes)
+        .finalize_non_root()
+}
+
+fn build_id_from_hash_tree(
+    state: &BuildIdHashState,
+    tree: &[[u8; blake3::OUT_LEN]],
+) -> Result<blake3::Hash> {
+    let len = usize::try_from(state.output_len)
+        .context("Incremental build ID hash output length is too large")?;
+    if Some(state.nodes) != build_id_hash_node_count(len) {
+        return Err(crate::error!(
+            "Incremental build ID hash state does not match output length"
+        ));
+    }
+    if tree.len() != state.nodes {
+        return Err(crate::error!(
+            "Incremental build ID hash tree size does not match state"
+        ));
+    }
+    let left_len = blake3::hazmat::left_subtree_len(len as u64);
+    let right_index = build_id_subtree_node_count(left_len as usize);
+    Ok(blake3::hazmat::merge_subtrees_root(
+        &tree[0],
+        &tree[right_index],
+        blake3::hazmat::Mode::Hash,
+    ))
+}
+
+fn touched_build_id_chunks(
+    ranges: &[std::ops::Range<usize>],
+    output_len: usize,
+) -> Result<Vec<usize>> {
+    let mut chunks = Vec::new();
+    for range in ranges {
+        if range.start > range.end || range.end > output_len {
+            return Err(crate::error!("Incremental build ID patch range is invalid"));
+        }
+        if range.is_empty() {
+            continue;
+        }
+        let first = range.start / BUILD_ID_HASH_GROUP_LEN;
+        let last = (range.end - 1) / BUILD_ID_HASH_GROUP_LEN;
+        chunks.extend(first..=last);
+    }
+    chunks.sort_unstable();
+    chunks.dedup();
+    Ok(chunks)
+}
+
+fn touched_chunks_overlap(chunks: &[usize], start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let first = start / BUILD_ID_HASH_GROUP_LEN;
+    let last = (start + len - 1) / BUILD_ID_HASH_GROUP_LEN;
+    chunks.iter().any(|chunk| (first..=last).contains(chunk))
+}
+
+fn intersect_ranges(
+    left: std::ops::Range<usize>,
+    right: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let start = left.start.max(right.start);
+    let end = left.end.min(right.end);
+    (start < end).then_some(start..end)
+}
+
+fn read_build_id_hash_tree(
+    state_dir: &Path,
+    state: &BuildIdHashState,
+) -> Result<Vec<[u8; blake3::OUT_LEN]>> {
+    let len = usize::try_from(state.output_len)
+        .context("Incremental build ID hash output length is too large")?;
+    if Some(state.nodes) != build_id_hash_node_count(len) {
+        return Err(crate::error!(
+            "Incremental build ID hash state does not match output length"
+        ));
+    }
+    let path = state_dir.join(BUILD_ID_HASH_FILE);
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "Failed to read incremental build ID hash `{}`",
+            path.display()
+        )
+    })?;
+    let expected_len = state.nodes * blake3::OUT_LEN;
+    if bytes.len() != expected_len {
+        return Err(crate::error!(
+            "Incremental build ID hash tree has {} bytes, expected {expected_len}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(blake3::OUT_LEN)
+        .map(|chunk| chunk.try_into().unwrap())
+        .collect())
+}
+
+fn write_build_id_hash_tree(state_dir: &Path, tree: Option<&[[u8; blake3::OUT_LEN]]>) -> Result {
+    let path = state_dir.join(BUILD_ID_HASH_FILE);
+    let Some(tree) = tree else {
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    };
+    std::fs::create_dir_all(state_dir).with_context(|| {
+        format!(
+            "Failed to create incremental state directory `{}`",
+            state_dir.display()
+        )
+    })?;
+    let tmp_path = state_dir.join(format!("{BUILD_ID_HASH_FILE}.tmp"));
+    let mut bytes = Vec::with_capacity(tree.len() * blake3::OUT_LEN);
+    for node in tree {
+        bytes.extend_from_slice(node);
+    }
+    std::fs::write(&tmp_path, bytes).with_context(|| {
+        format!(
+            "Failed to write incremental build ID hash `{}`",
+            tmp_path.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "Failed to install incremental build ID hash `{}`",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1259,6 +1770,61 @@ fn parse_content_line(line: Option<&str>, expected_prefix: &str) -> Result<FileC
     })
 }
 
+fn parse_build_id_hash_line(line: Option<&str>) -> Result<Option<BuildIdHashState>> {
+    let rest = parse_prefixed_line(line, "build-id-hash")?;
+    if rest == ABSENT_FIELD {
+        return Ok(None);
+    }
+    let mut parts = rest.split('\t');
+    let output_len = parts
+        .next()
+        .context("Malformed incremental build ID hash output length")?
+        .parse()
+        .context("Invalid incremental build ID hash output length")?;
+    let nodes = parts
+        .next()
+        .context("Malformed incremental build ID hash node count")?
+        .parse()
+        .context("Invalid incremental build ID hash node count")?;
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental build ID hash record"));
+    }
+    if nodes == 0 {
+        return Err(crate::error!("Missing incremental build ID hash nodes"));
+    }
+    Ok(Some(BuildIdHashState { output_len, nodes }))
+}
+
+fn parse_compact_sections_block<'a>(
+    mut lines: impl Iterator<Item = &'a str>,
+) -> Result<Vec<SectionRecord>> {
+    let section_input_count: usize = parse_prefixed_line(lines.next(), "section-inputs")?
+        .parse()
+        .context("Invalid incremental section input count")?;
+    let mut section_inputs = Vec::with_capacity(section_input_count);
+    for _ in 0..section_input_count {
+        let line = lines
+            .next()
+            .context("Missing incremental section input record")?;
+        section_inputs.push(parse_section_input_line(line)?);
+    }
+
+    let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
+        .parse()
+        .context("Invalid incremental section count")?;
+    let mut sections = Vec::with_capacity(section_count);
+    for _ in 0..section_count {
+        let line = lines.next().context("Missing incremental section record")?;
+        sections.push(parse_compact_section_line(line, &section_inputs)?);
+    }
+    if lines.next().is_some() {
+        return Err(crate::error!(
+            "Unexpected trailing incremental section data"
+        ));
+    }
+    Ok(sections)
+}
+
 fn parse_input_line(line: &str) -> Result<FileState> {
     let rest = parse_prefixed_line(Some(line), "input")?;
     let mut parts = rest.split('\t');
@@ -1307,23 +1873,49 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
     patch
         .sections
         .iter()
-        .map(u32::to_string)
+        .map(|section| {
+            format!(
+                "{}:{}:{}:{}",
+                section.section_index,
+                section.input_size,
+                section.output_offset,
+                section.output_size
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn parse_patch_sections(sections: &str) -> Result<Vec<u32>> {
+fn render_build_id_hash_state(state: &BuildIdHashState) -> String {
+    format!("{}\t{}", state.output_len, state.nodes)
+}
+
+fn parse_patch_sections(sections: &str) -> Result<Vec<FilePatchSectionState>> {
     if sections.is_empty() {
         return Ok(Vec::new());
     }
-    sections
-        .split(',')
-        .map(|section| {
-            section
+    let mut parsed = Vec::new();
+    for section in sections.split(',') {
+        let parts = section.split(':').collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Ok(Vec::new());
+        }
+        parsed.push(FilePatchSectionState {
+            section_index: parts[0]
                 .parse()
-                .context("Invalid incremental patch section index")
-        })
-        .collect()
+                .context("Invalid incremental patch section index")?,
+            input_size: parts[1]
+                .parse()
+                .context("Invalid incremental patch section input size")?,
+            output_offset: parts[2]
+                .parse()
+                .context("Invalid incremental patch section output offset")?,
+            output_size: parts[3]
+                .parse()
+                .context("Invalid incremental patch section output size")?,
+        });
+    }
+    Ok(parsed)
 }
 
 fn parse_section_line(line: &str) -> Result<SectionRecord> {
@@ -1498,6 +2090,7 @@ mod tests {
         PersistedState {
             args_hash: args_hash.to_owned(),
             output: FileContentState::from_bytes(output),
+            build_id_hashes: None,
             input_files: inputs
                 .iter()
                 .map(|(path, bytes)| FileState {
@@ -1507,6 +2100,7 @@ mod tests {
                 })
                 .collect(),
             sections: Vec::new(),
+            sections_file: None,
         }
     }
 
@@ -1565,6 +2159,18 @@ mod tests {
         out
     }
 
+    fn render_v8_state(state: &PersistedState) -> String {
+        state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V8, 1)
+            .lines()
+            .filter(|line| !line.starts_with("build-id-hash\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            })
+    }
+
     fn identity(len: u64, dev: u64, ino: u64, modified_sec: i64, changed_sec: i64) -> FileIdentity {
         FileIdentity {
             len,
@@ -1601,13 +2207,61 @@ mod tests {
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
-            sections: vec![1, 3, 5],
+            sections: vec![
+                FilePatchSectionState {
+                    section_index: 1,
+                    input_size: 4,
+                    output_offset: 100,
+                    output_size: 4,
+                },
+                FilePatchSectionState {
+                    section_index: 3,
+                    input_size: 8,
+                    output_offset: 112,
+                    output_size: 12,
+                },
+                FilePatchSectionState {
+                    section_index: 5,
+                    input_size: 16,
+                    output_offset: 128,
+                    output_size: 16,
+                },
+            ],
         });
         state.sections.push(section_record("a.o", 1, 100, 12));
 
         let rendered = state.render();
 
-        assert!(rendered.contains("\tpatch-hash\t1,3,5\n"));
+        assert!(rendered.contains("\tpatch-hash\t1:4:100:4,3:8:112:12,5:16:128:16\n"));
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn old_patch_section_metadata_cannot_patch_changed_inputs() {
+        let line = format!(
+            "input\t{}\t1\t{}\t-\told-patch-hash\t1:4,3:8",
+            hex::encode("a.o"),
+            hash_bytes(b"a")
+        );
+
+        let parsed = parse_input_line(&line).unwrap();
+
+        assert_eq!(parsed.patch.unwrap().sections, Vec::new());
+    }
+
+    #[test]
+    fn persisted_state_round_trips_build_id_hashes() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        let output_len = 5 * BUILD_ID_HASH_GROUP_LEN + 100;
+        let nodes = build_id_hash_node_count(output_len).unwrap();
+        state.build_id_hashes = Some(BuildIdHashState {
+            output_len: output_len as u64,
+            nodes,
+        });
+
+        let rendered = state.render();
+
+        assert!(rendered.contains(&format!("\nbuild-id-hash\t{output_len}\t{nodes}\n")));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
 
@@ -1678,7 +2332,15 @@ mod tests {
     fn v5_state_version_is_accepted_with_compact_sections() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
-        let rendered = state.render().replacen(STATE_VERSION, STATE_VERSION_V5, 1);
+        let rendered = render_v8_state(&state).replacen(STATE_VERSION_V8, STATE_VERSION_V5, 1);
+        assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
+    }
+
+    #[test]
+    fn v8_state_version_is_accepted_without_build_id_hashes() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = render_v8_state(&state);
         assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
     }
 
@@ -1876,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn patchable_sections_are_writable_or_executable_but_not_mergeable() {
+    fn patchable_sections_are_allocated_but_not_mergeable() {
         let data = object::SectionFlags::Elf {
             sh_flags: u64::from(object::elf::SHF_ALLOC | object::elf::SHF_WRITE),
         };
@@ -1891,12 +2553,94 @@ mod tests {
                 object::elf::SHF_ALLOC | object::elf::SHF_WRITE | object::elf::SHF_MERGE,
             ),
         };
+        let non_alloc = object::SectionFlags::Elf {
+            sh_flags: u64::from(object::elf::SHF_WRITE),
+        };
 
         assert!(section_flags_allow_patching(data));
         assert!(section_flags_allow_patching(text));
-        assert!(!section_flags_allow_patching(rodata));
+        assert!(section_flags_allow_patching(rodata));
         assert!(!section_flags_allow_patching(mergeable));
+        assert!(!section_flags_allow_patching(non_alloc));
         assert!(!section_flags_allow_patching(object::SectionFlags::None));
+    }
+
+    #[test]
+    fn build_id_hash_tree_matches_full_hash() {
+        for len in [
+            BUILD_ID_HASH_GROUP_LEN + 1,
+            2 * BUILD_ID_HASH_GROUP_LEN,
+            2 * BUILD_ID_HASH_GROUP_LEN + 17,
+            5 * BUILD_ID_HASH_GROUP_LEN + 100,
+        ] {
+            let output = (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let build_id_range = 100..148;
+            let nodes = build_id_hash_node_count(output.len()).unwrap();
+            let mut tree = Vec::with_capacity(nodes);
+            let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
+            build_id_subtree_hash(&output, 0, left_len, &build_id_range, &mut tree);
+            build_id_subtree_hash(
+                &output,
+                left_len,
+                output.len() - left_len,
+                &build_id_range,
+                &mut tree,
+            );
+            let state = BuildIdHashState {
+                output_len: output.len() as u64,
+                nodes,
+            };
+            let mut expected = output;
+            expected[build_id_range].fill(0);
+
+            assert_eq!(tree.len(), nodes);
+            assert_eq!(
+                build_id_from_hash_tree(&state, &tree).unwrap(),
+                blake3::hash(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn build_id_hash_tree_updates_changed_chunks() {
+        let mut output = (0..5 * BUILD_ID_HASH_GROUP_LEN + 100)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let build_id_range = 1500..1548;
+        let nodes = build_id_hash_node_count(output.len()).unwrap();
+        let mut tree = Vec::with_capacity(nodes);
+        let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
+        build_id_subtree_hash(&output, 0, left_len, &build_id_range, &mut tree);
+        build_id_subtree_hash(
+            &output,
+            left_len,
+            output.len() - left_len,
+            &build_id_range,
+            &mut tree,
+        );
+        let mut state = BuildIdHashState {
+            output_len: output.len() as u64,
+            nodes,
+        };
+
+        let changed_range = 2 * BUILD_ID_HASH_GROUP_LEN + 100..2 * BUILD_ID_HASH_GROUP_LEN + 110;
+        output[changed_range.clone()].copy_from_slice(b"0123456789");
+        let changed_chunks = touched_build_id_chunks(&[changed_range], output.len()).unwrap();
+        update_build_id_hash_tree(
+            &mut state,
+            &mut tree,
+            &output,
+            &build_id_range,
+            &changed_chunks,
+        )
+        .unwrap();
+        let mut expected = output;
+        expected[build_id_range].fill(0);
+
+        assert_eq!(
+            build_id_from_hash_tree(&state, &tree).unwrap(),
+            blake3::hash(&expected)
+        );
     }
 
     #[test]
