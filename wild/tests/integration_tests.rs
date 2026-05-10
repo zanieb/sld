@@ -158,6 +158,9 @@
 //! without changing its loaded sections, then checking that sections from unchanged inputs are
 //! reused.
 //!
+//! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
+//! to .data.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -759,6 +762,7 @@ struct Config {
     test_update_in_place: bool,
     test_incremental: bool,
     test_incremental_changed: bool,
+    test_incremental_changed_section: String,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1329,6 +1333,7 @@ impl Config {
             test_update_in_place: false,
             test_incremental: false,
             test_incremental_changed: false,
+            test_incremental_changed_section: ".data".to_owned(),
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1703,6 +1708,9 @@ fn process_directive(
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChangedSection" => {
+            arg.clone_into(&mut config.test_incremental_changed_section);
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -1991,7 +1999,10 @@ impl ProgramInputs {
                 );
             }
 
-            mutate_data_section_byte(&changed_input.path)?;
+            mutate_section_byte(
+                &changed_input.path,
+                &config.test_incremental_changed_section,
+            )?;
 
             let link_output_3 =
                 Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -2043,25 +2054,26 @@ impl ProgramInputs {
     }
 }
 
-fn mutate_data_section_byte(path: &Path) -> Result {
+fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
     let mut bytes =
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
     let (offset, len) = {
         let file = object::File::parse(bytes.as_slice())
             .with_context(|| format!("Failed to parse `{}` as an object file", path.display()))?;
         let section = file
-            .section_by_name(".data")
-            .with_context(|| format!("Missing .data section in `{}`", path.display()))?;
+            .section_by_name(section_name)
+            .with_context(|| format!("Missing {section_name} section in `{}`", path.display()))?;
         section
             .file_range()
-            .with_context(|| format!("Missing .data file range in `{}`", path.display()))?
+            .with_context(|| format!("Missing {section_name} file range in `{}`", path.display()))?
     };
     ensure!(
         len > 0,
-        "Cannot mutate empty .data section in `{}`",
+        "Cannot mutate empty {section_name} section in `{}`",
         path.display()
     );
-    let index = usize::try_from(offset).context("Invalid .data offset")?;
+    let index =
+        usize::try_from(offset).with_context(|| format!("Invalid {section_name} offset"))?;
     bytes[index] = bytes[index].wrapping_add(1);
     std::fs::write(path, bytes)
         .with_context(|| format!("Failed to write mutated object `{}`", path.display()))?;
