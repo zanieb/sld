@@ -19,7 +19,9 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-const STATE_VERSION: &str = "wild-incremental-state-v3";
+const STATE_VERSION: &str = "wild-incremental-state-v5";
+const STATE_VERSION_V4: &str = "wild-incremental-state-v4";
+const STATE_VERSION_V3: &str = "wild-incremental-state-v3";
 const STATE_VERSION_V2: &str = "wild-incremental-state-v2";
 const STATE_VERSION_V1: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
@@ -222,9 +224,13 @@ impl PreparedState {
         section_index: object::SectionIndex,
         output_offset: u64,
         size: u64,
+        record_for_reuse: bool,
         allow_reuse: bool,
     ) -> bool {
         if self.mode == IncrementalMode::Disabled {
+            return false;
+        }
+        if !record_for_reuse {
             return false;
         }
 
@@ -417,7 +423,12 @@ impl PersistedState {
     fn parse(contents: &str) -> Result<Self> {
         let mut lines = contents.lines();
         let version = lines.next().context("Missing incremental state header")?;
-        if version != STATE_VERSION && version != STATE_VERSION_V2 && version != STATE_VERSION_V1 {
+        if version != STATE_VERSION
+            && version != STATE_VERSION_V4
+            && version != STATE_VERSION_V3
+            && version != STATE_VERSION_V2
+            && version != STATE_VERSION_V1
+        {
             return Err(crate::error!(
                 "Unsupported incremental state version `{version}`"
             ));
@@ -436,7 +447,31 @@ impl PersistedState {
             input_files.push(parse_input_line(line)?);
         }
 
-        let sections = if version == STATE_VERSION || version == STATE_VERSION_V2 {
+        let sections = if version == STATE_VERSION {
+            let section_input_count: usize = parse_prefixed_line(lines.next(), "section-inputs")?
+                .parse()
+                .context("Invalid incremental section input count")?;
+            let mut section_inputs = Vec::with_capacity(section_input_count);
+            for _ in 0..section_input_count {
+                let line = lines
+                    .next()
+                    .context("Missing incremental section input record")?;
+                section_inputs.push(parse_section_input_line(line)?);
+            }
+
+            let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
+                .parse()
+                .context("Invalid incremental section count")?;
+            let mut sections = Vec::with_capacity(section_count);
+            for _ in 0..section_count {
+                let line = lines.next().context("Missing incremental section record")?;
+                sections.push(parse_compact_section_line(line, &section_inputs)?);
+            }
+            sections
+        } else if version == STATE_VERSION_V4
+            || version == STATE_VERSION_V3
+            || version == STATE_VERSION_V2
+        {
             let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
                 .parse()
                 .context("Invalid incremental section count")?;
@@ -505,16 +540,31 @@ impl PersistedState {
             )
             .unwrap();
         }
+
+        let mut section_inputs = Vec::new();
+        let mut section_input_ids = HashMap::new();
+        for section in &self.sections {
+            let key = (section.input_file.as_str(), section.input.as_str());
+            if !section_input_ids.contains_key(&key) {
+                let index = section_inputs.len();
+                section_input_ids.insert(key, index);
+                section_inputs.push(key);
+            }
+        }
+
+        writeln!(&mut out, "section-inputs\t{}", section_inputs.len()).unwrap();
+        for (input_file, input) in section_inputs {
+            writeln!(&mut out, "section-input\t{input_file}\t{input}").unwrap();
+        }
+
         writeln!(&mut out, "sections\t{}", self.sections.len()).unwrap();
         for section in &self.sections {
+            let section_input_id =
+                section_input_ids[&(section.input_file.as_str(), section.input.as_str())];
             writeln!(
                 &mut out,
-                "section\t{}\t{}\t{}\t{}\t{}",
-                section.input_file,
-                section.input,
-                section.section_index,
-                section.output_offset,
-                section.size
+                "section\t{}\t{}\t{}\t{}",
+                section_input_id, section.section_index, section.output_offset, section.size
             )
             .unwrap();
         }
@@ -524,7 +574,13 @@ impl PersistedState {
 
 impl PartialEq for FileContentState {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && self.hash == other.hash
+        if self.len != other.len {
+            return false;
+        }
+        if !self.hash.is_empty() && !other.hash.is_empty() {
+            return self.hash == other.hash;
+        }
+        self.identity.is_some() && self.identity == other.identity
     }
 }
 
@@ -584,6 +640,16 @@ impl FileContentState {
             let mut state = previous.clone();
             state.identity = Some(identity.clone());
             return state;
+        }
+
+        if let Some(identity) = identity.as_ref()
+            && previous.is_none_or(|previous| previous.hash.is_empty())
+        {
+            return Self {
+                len: identity.len,
+                hash: String::new(),
+                identity: Some(identity.clone()),
+            };
         }
 
         let mut state = Self::from_bytes(input_file.data());
@@ -817,6 +883,64 @@ fn parse_section_line(line: &str) -> Result<SectionRecord> {
     })
 }
 
+fn parse_section_input_line(line: &str) -> Result<(String, String)> {
+    let rest = parse_prefixed_line(Some(line), "section-input")?;
+    let mut parts = rest.split('\t');
+    let input_file = parts
+        .next()
+        .context("Malformed incremental section input file")?
+        .to_owned();
+    let input = parts
+        .next()
+        .context("Malformed incremental section input")?
+        .to_owned();
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental section input record"));
+    }
+    Ok((input_file, input))
+}
+
+fn parse_compact_section_line(
+    line: &str,
+    section_inputs: &[(String, String)],
+) -> Result<SectionRecord> {
+    let rest = parse_prefixed_line(Some(line), "section")?;
+    let mut parts = rest.split('\t');
+    let section_input_id: usize = parts
+        .next()
+        .context("Malformed incremental section input index")?
+        .parse()
+        .context("Invalid incremental section input index")?;
+    let section_index = parts
+        .next()
+        .context("Malformed incremental section index")?
+        .parse()
+        .context("Invalid incremental section index")?;
+    let output_offset = parts
+        .next()
+        .context("Malformed incremental section output offset")?
+        .parse()
+        .context("Invalid incremental section output offset")?;
+    let size = parts
+        .next()
+        .context("Malformed incremental section size")?
+        .parse()
+        .context("Invalid incremental section size")?;
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental section record"));
+    }
+    let (input_file, input) = section_inputs
+        .get(section_input_id)
+        .context("Incremental section input index out of bounds")?;
+    Ok(SectionRecord {
+        input_file: input_file.clone(),
+        input: input.clone(),
+        section_index,
+        output_offset,
+        size,
+    })
+}
+
 fn append_log(state_dir: &Path, message: &str) -> Result {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(LOG_FILE);
@@ -919,6 +1043,58 @@ mod tests {
         }
     }
 
+    fn render_legacy_state(state: &PersistedState, version: &str) -> String {
+        let mut out = String::new();
+        writeln!(&mut out, "{version}").unwrap();
+        writeln!(&mut out, "args\t{}", state.args_hash).unwrap();
+        writeln!(
+            &mut out,
+            "output\t{}\t{}\t{}",
+            state.output.len,
+            state.output.hash,
+            state.output.render_identity()
+        )
+        .unwrap();
+        writeln!(&mut out, "inputs\t{}", state.input_files.len()).unwrap();
+        for input in &state.input_files {
+            writeln!(
+                &mut out,
+                "input\t{}\t{}\t{}\t{}",
+                input.path,
+                input.content.len,
+                input.content.hash,
+                input.content.render_identity()
+            )
+            .unwrap();
+        }
+        writeln!(&mut out, "sections\t{}", state.sections.len()).unwrap();
+        for section in &state.sections {
+            writeln!(
+                &mut out,
+                "section\t{}\t{}\t{}\t{}\t{}",
+                section.input_file,
+                section.input,
+                section.section_index,
+                section.output_offset,
+                section.size
+            )
+            .unwrap();
+        }
+        out
+    }
+
+    fn identity(len: u64, dev: u64, ino: u64, modified_sec: i64, changed_sec: i64) -> FileIdentity {
+        FileIdentity {
+            len,
+            dev,
+            ino,
+            modified_sec,
+            modified_nsec: 0,
+            changed_sec,
+            changed_nsec: 0,
+        }
+    }
+
     #[test]
     fn state_dir_appends_suffix() {
         assert_eq!(
@@ -939,11 +1115,23 @@ mod tests {
     }
 
     #[test]
+    fn compact_state_interns_repeated_section_inputs() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state.sections.push(section_record("a.o", 2, 112, 8));
+
+        let rendered = state.render();
+
+        assert!(rendered.contains("\nsection-inputs\t1\n"));
+        assert!(rendered.contains("\nsection\t0\t1\t100\t12\n"));
+        assert!(rendered.contains("\nsection\t0\t2\t112\t8\n"));
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
     fn previous_state_version_is_accepted_without_sections() {
         let state = state("args", b"output", &[("a.o", b"a")]);
-        let rendered = state
-            .render()
-            .replace(STATE_VERSION, STATE_VERSION_V1)
+        let rendered = render_legacy_state(&state, STATE_VERSION_V1)
             .split_once("\nsections")
             .unwrap()
             .0
@@ -956,7 +1144,23 @@ mod tests {
     fn v2_state_version_is_accepted_with_sections() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
-        let rendered = state.render().replace(STATE_VERSION, STATE_VERSION_V2);
+        let rendered = render_legacy_state(&state, STATE_VERSION_V2);
+        assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
+    }
+
+    #[test]
+    fn v3_state_version_is_accepted_with_sections() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = render_legacy_state(&state, STATE_VERSION_V3);
+        assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
+    }
+
+    #[test]
+    fn v4_state_version_is_accepted_with_sections() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = render_legacy_state(&state, STATE_VERSION_V4);
         assert_eq!(PersistedState::parse(&rendered).unwrap().sections.len(), 1);
     }
 
@@ -976,31 +1180,53 @@ mod tests {
     #[test]
     fn file_identity_does_not_affect_content_equality() {
         let first = FileContentState {
-            identity: Some(FileIdentity {
-                len: 4,
-                dev: 1,
-                ino: 2,
-                modified_sec: 3,
-                modified_nsec: 4,
-                changed_sec: 5,
-                changed_nsec: 6,
-            }),
+            identity: Some(identity(4, 1, 2, 3, 5)),
             ..FileContentState::from_bytes(b"abcd")
         };
         let second = FileContentState {
-            identity: Some(FileIdentity {
-                len: 4,
-                dev: 10,
-                ino: 20,
-                modified_sec: 30,
-                modified_nsec: 40,
-                changed_sec: 50,
-                changed_nsec: 60,
-            }),
+            identity: Some(identity(4, 10, 20, 30, 50)),
             ..FileContentState::from_bytes(b"abcd")
         };
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn file_identity_compares_content_when_hash_is_absent() {
+        let first = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 3, 5)),
+        };
+        let same = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 3, 5)),
+        };
+        let changed = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 3, 6)),
+        };
+
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn missing_hash_does_not_match_missing_identity() {
+        let first = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: None,
+        };
+        let second = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: None,
+        };
+
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1156,9 +1382,37 @@ mod tests {
             reused_sections: AtomicUsize::new(0),
         };
 
-        assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true));
-        assert!(!state.try_reuse_section(input, object::SectionIndex(3), 80, 16, true));
+        assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true, true));
+        assert!(!state.try_reuse_section(input, object::SectionIndex(3), 80, 16, true, true));
         assert_eq!(state.reused_sections.load(Ordering::Relaxed), 1);
         assert_eq!(state.current_sections.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn try_reuse_section_skips_non_reusable_records() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("a.o");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "no previous incremental state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                input_files: Vec::new(),
+            },
+            reusable_inputs: HashSet::new(),
+            previous_sections: HashSet::new(),
+            current_sections: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
+        };
+
+        assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, false, true));
+        assert!(state.current_sections.lock().unwrap().is_empty());
     }
 }
