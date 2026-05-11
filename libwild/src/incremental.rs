@@ -448,10 +448,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             &state_dir,
             rewritten_inputs.iter().map(|(_, path)| path.as_path()),
         )?;
-        refresh_input_file_identities_at_indices(
-            &mut previous.input_files,
-            rewritten_inputs.iter().map(|(input_index, _)| *input_index),
-        );
+        refresh_rewritten_input_identities(&mut previous, &rewritten_inputs);
     }
 
     if !changed_inputs.is_empty() {
@@ -459,6 +456,8 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             .iter()
             .map(|(input_index, _)| *input_index)
             .collect::<HashSet<_>>();
+        let metadata_update_input_indices =
+            metadata_update_indices_for_inputs(&changed_inputs, &rewritten_inputs);
         if changed_input_indices.iter().any(|index| {
             previous.input_files[*index]
                 .patch
@@ -471,7 +470,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             .sections_file
             .as_deref()
             .is_some_and(|sections_file| should_filter_sections_sidecar(&state_dir, sections_file));
-        let should_retry_with_full_state = should_filter_records && rewritten_inputs.is_empty();
+        let should_retry_with_full_state = should_filter_records;
         let result = if should_filter_records {
             let result = patch_changed_inputs(
                 args,
@@ -480,6 +479,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 current_link_start.clone(),
                 false,
                 &changed_inputs,
+                &metadata_update_input_indices,
             )?;
             if let ChangedInputPatchResult::Unsupported(reason) = result {
                 append_log(
@@ -491,6 +491,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 let Some(mut previous) = PersistedState::read_metadata(&state_dir)? else {
                     return Ok(false);
                 };
+                refresh_rewritten_input_identities(&mut previous, &rewritten_inputs);
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
                 let changed_input_files = changed_inputs
@@ -505,6 +506,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     current_link_start.clone(),
                     false,
                     &changed_inputs,
+                    &metadata_update_input_indices,
                 )?
             } else {
                 result
@@ -525,12 +527,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 current_link_start.clone(),
                 records_complete,
                 &changed_inputs,
+                &metadata_update_input_indices,
             )?
         };
         let result = if let ChangedInputPatchResult::Unsupported(reason) = result {
             if should_retry_with_full_state
-                && let Some(full_previous) = PersistedState::read(&state_dir)?
+                && let Some(mut full_previous) = PersistedState::read(&state_dir)?
             {
+                refresh_rewritten_input_identities(&mut full_previous, &rewritten_inputs);
                 patch_changed_inputs(
                     args,
                     &state_dir,
@@ -538,6 +542,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     current_link_start,
                     true,
                     &changed_inputs,
+                    &metadata_update_input_indices,
                 )?
             } else {
                 ChangedInputPatchResult::Unsupported(reason)
@@ -575,10 +580,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
 
     if !rewritten_inputs.is_empty() || checked_ambiguous_inputs {
         if let Some(mut metadata) = PersistedState::read_metadata(&state_dir)? {
-            refresh_input_file_identities_at_indices(
-                &mut metadata.input_files,
-                rewritten_inputs.iter().map(|(input_index, _)| *input_index),
-            );
+            refresh_rewritten_input_identities(&mut metadata, &rewritten_inputs);
             metadata.link_start = current_link_start;
             metadata.write_metadata_update(&state_dir)?;
         }
@@ -595,6 +597,30 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
     append_log(&state_dir, "reused existing output before loading inputs")?;
     Ok(true)
+}
+
+fn metadata_update_indices_for_inputs(
+    changed_inputs: &[(usize, PathBuf)],
+    rewritten_inputs: &[(usize, PathBuf)],
+) -> Vec<usize> {
+    let mut indices = changed_inputs
+        .iter()
+        .chain(rewritten_inputs)
+        .map(|(input_index, _)| *input_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn refresh_rewritten_input_identities(
+    previous: &mut PersistedState,
+    rewritten_inputs: &[(usize, PathBuf)],
+) {
+    refresh_input_file_identities_at_indices(
+        &mut previous.input_files,
+        rewritten_inputs.iter().map(|(input_index, _)| *input_index),
+    );
 }
 
 enum ChangedInputPatchResult {
@@ -810,6 +836,7 @@ fn patch_changed_inputs(
     current_link_start: Option<FileIdentity>,
     records_complete: bool,
     changed_inputs: &[(usize, PathBuf)],
+    metadata_update_input_indices: &[usize],
 ) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
 
@@ -853,6 +880,7 @@ fn patch_changed_inputs(
             added_dynamic_relocations,
             removed_dynamic_relocations,
             removed_fdes,
+            updated_fdes,
         ) = {
             let input = &previous.input_files[*input_index];
             if !archive_members_match_snapshot(state_dir, input, &bytes)? {
@@ -1166,6 +1194,10 @@ fn patch_changed_inputs(
                     EhFrameHdrChange::Adjust(_) | EhFrameHdrChange::Add(_) => None,
                 })
                 .collect::<HashSet<_>>();
+            let updated_fdes = eh_frame_patches
+                .iter()
+                .filter_map(|patch| patch.record_update.clone())
+                .collect::<Vec<_>>();
 
             (
                 fingerprint,
@@ -1188,6 +1220,7 @@ fn patch_changed_inputs(
                 added_dynamic_relocations,
                 removed_dynamic_relocations,
                 removed_fdes,
+                updated_fdes,
             )
         };
 
@@ -1238,6 +1271,15 @@ fn patch_changed_inputs(
             previous
                 .fdes
                 .retain(|record| !removed_fdes.contains(record));
+            previous.sections_file = None;
+        }
+        if !updated_fdes.is_empty() {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete FDE records".to_owned(),
+                ));
+            }
+            update_fde_records(&mut previous.fdes, updated_fdes);
             previous.sections_file = None;
         }
         previous.input_files[*input_index].content = input_content;
@@ -1428,10 +1470,6 @@ fn patch_changed_inputs(
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
         return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
     }
-    let changed_input_indices = changed_inputs
-        .iter()
-        .map(|(input_index, _)| *input_index)
-        .collect::<Vec<_>>();
     PersistedState {
         args_hash: previous.args_hash,
         link_options_hash: previous.link_options_hash,
@@ -1447,7 +1485,7 @@ fn patch_changed_inputs(
         dynamic_relocations: previous.dynamic_relocations,
         sections_file: previous.sections_file,
     }
-    .write_metadata_update_for_inputs(state_dir, &changed_input_indices)?;
+    .write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
     clear_incremental_update_marker(state_dir)?;
 
     append_log(
@@ -1567,6 +1605,13 @@ struct FdeRelocationPatch {
     input_ranges: Vec<std::ops::Range<usize>>,
     patch: Option<SectionPatch>,
     eh_frame_hdr_change: Option<EhFrameHdrChange>,
+    record_update: Option<FdeRecordUpdate>,
+}
+
+#[derive(Clone)]
+struct FdeRecordUpdate {
+    previous: FdeRecord,
+    current: FdeRecord,
 }
 
 struct FdeAddCandidate {
@@ -6027,6 +6072,7 @@ fn fde_relocation_patches_for_input_bytes(
                 input_ranges: Vec::new(),
                 patch: None,
                 eh_frame_hdr_change: Some(EhFrameHdrChange::Remove(record.clone())),
+                record_update: None,
             });
             continue;
         };
@@ -6059,6 +6105,7 @@ fn fde_relocation_patches_for_input_bytes(
                 input_ranges: Vec::new(),
                 patch: None,
                 eh_frame_hdr_change: Some(EhFrameHdrChange::Remove(record.clone())),
+                record_update: None,
             });
             continue;
         };
@@ -6078,6 +6125,7 @@ fn fde_relocation_patches_for_input_bytes(
                 input_ranges: Vec::new(),
                 patch: None,
                 eh_frame_hdr_change: None,
+                record_update: None,
             });
             continue;
         }
@@ -6099,7 +6147,7 @@ fn fde_relocation_patches_for_input_bytes(
         };
         let current_entries = current_entries
             .into_iter()
-            .filter(|entry| fde_contains_relocation(record, entry.offset))
+            .filter(|entry| fde_contains_relocation(&current_record, entry.offset))
             .collect::<Vec<_>>();
         let previous_entries = previous_entries
             .into_iter()
@@ -6122,7 +6170,24 @@ fn fde_relocation_patches_for_input_bytes(
         let mut adjustments = Vec::new();
         let mut eh_frame_hdr_change = None;
         for (current, previous) in current_entries.iter().zip(&previous_entries) {
-            if current.offset != previous.offset || current.info != previous.info {
+            let Some(current_field_offset) =
+                current.offset.checked_sub(current_record.input_offset)
+            else {
+                input_ranges.clear();
+                preserve_ranges.clear();
+                adjustments.clear();
+                eh_frame_hdr_change = None;
+                break;
+            };
+            let Some(previous_field_offset) = previous.offset.checked_sub(record.input_offset)
+            else {
+                input_ranges.clear();
+                preserve_ranges.clear();
+                adjustments.clear();
+                eh_frame_hdr_change = None;
+                break;
+            };
+            if current_field_offset != previous_field_offset || current.info != previous.info {
                 input_ranges.clear();
                 preserve_ranges.clear();
                 adjustments.clear();
@@ -6140,7 +6205,7 @@ fn fde_relocation_patches_for_input_bytes(
                 current_file_offset + current.addend_range.start
                     ..current_file_offset + current.addend_range.end,
             );
-            let field_start = usize::try_from(current.offset - current_record.input_offset)
+            let field_start = usize::try_from(current_field_offset)
                 .context("Incremental .eh_frame relocation offset is too large")?;
             let field_end = field_start
                 .checked_add(usize::from(field_size))
@@ -6178,6 +6243,11 @@ fn fde_relocation_patches_for_input_bytes(
         preserve_ranges.dedup_by(|left, right| left.start == right.start && left.end == right.end);
         let needs_patch = !input_ranges.is_empty()
             && (current_fde_data != previous_fde_data || !adjustments.is_empty());
+        let record_update =
+            (!input_ranges.is_empty() && current_record != *record).then(|| FdeRecordUpdate {
+                previous: record.clone(),
+                current: current_record.clone(),
+            });
         patches.push(FdeRelocationPatch {
             input_ranges,
             patch: needs_patch.then(|| SectionPatch {
@@ -6188,9 +6258,22 @@ fn fde_relocation_patches_for_input_bytes(
                 adjustments,
             }),
             eh_frame_hdr_change,
+            record_update,
         });
     }
     Ok(patches)
+}
+
+fn update_fde_records(fdes: &mut Vec<FdeRecord>, updates: Vec<FdeRecordUpdate>) {
+    for update in updates {
+        if let Some(record) = fdes.iter_mut().find(|record| **record == update.previous) {
+            *record = update.current;
+        } else {
+            fdes.push(update.current);
+        }
+    }
+    fdes.sort();
+    fdes.dedup();
 }
 
 fn eh_frame_hdr_patches_for_fde_changes(
@@ -10295,6 +10378,7 @@ mod tests {
         assert_eq!(patch.adjustments.len(), 1);
         assert_eq!(patch.adjustments[0].range, 8..12);
         assert_eq!(patch.adjustments[0].addend_delta, 6);
+        assert!(current_patches[0].record_update.is_none());
         assert!(matches!(
             current_patches[0].eh_frame_hdr_change,
             Some(EhFrameHdrChange::Adjust(_))
@@ -10318,6 +10402,55 @@ mod tests {
         );
         assert!(current_patches[0].patch.is_none());
         assert!(current_patches[0].eh_frame_hdr_change.is_none());
+    }
+
+    #[test]
+    fn fde_relocation_patches_follow_current_fde_offset() {
+        let previous = eh_frame_two_fdes_same_section_elf();
+        let current = eh_frame_relocation_elf(8, 2);
+        let input_ref = encode_path(Path::new("input.o"));
+        let fde = fde_record("input.o", 1, 2, 16, 300, 16);
+
+        let current_patches =
+            fde_relocation_patches_for_input(&current, &previous, &input_ref, [&fde]).unwrap();
+
+        assert_eq!(current_patches.len(), 1);
+        assert_eq!(
+            current_patches[0].input_ranges,
+            vec![0x48..0x58, 0x58 + 16..0x58 + 24]
+        );
+        let patch = current_patches[0].patch.as_ref().unwrap();
+        assert_eq!(patch.output_offset, 300);
+        assert_eq!(patch.size, 16);
+        assert_eq!(patch.preserve_ranges, vec![4..8, 8..12]);
+        assert_eq!(patch.adjustments.len(), 1);
+        assert_eq!(patch.adjustments[0].range, 8..12);
+        assert_eq!(patch.adjustments[0].addend_delta, 6);
+        let update = current_patches[0].record_update.as_ref().unwrap();
+        assert_eq!(update.previous.input_offset, 16);
+        assert_eq!(update.current.input_offset, 0);
+        assert!(matches!(
+            current_patches[0].eh_frame_hdr_change,
+            Some(EhFrameHdrChange::Adjust(_))
+        ));
+    }
+
+    #[test]
+    fn updated_fde_records_replace_previous_offsets() {
+        let previous = fde_record("input.o", 1, 2, 16, 300, 16);
+        let mut current = previous.clone();
+        current.input_offset = 0;
+        let mut fdes = vec![previous.clone()];
+
+        update_fde_records(
+            &mut fdes,
+            vec![FdeRecordUpdate {
+                previous,
+                current: current.clone(),
+            }],
+        );
+
+        assert_eq!(fdes, vec![current]);
     }
 
     #[test]
@@ -12332,6 +12465,7 @@ mod tests {
             None,
             true,
             &[(0, missing_input)],
+            &[0],
         )
         .unwrap();
 
@@ -12529,6 +12663,52 @@ mod tests {
 
         metadata.write_index(dir.path()).unwrap();
         assert!(!metadata_update_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn metadata_update_indices_include_changed_and_rewritten_inputs() {
+        let changed_inputs = vec![
+            (2, PathBuf::from("changed-c.o")),
+            (0, PathBuf::from("changed-a.o")),
+        ];
+        let rewritten_inputs = vec![
+            (1, PathBuf::from("rewritten-b.o")),
+            (2, PathBuf::from("rewritten-c.o")),
+        ];
+
+        assert_eq!(
+            metadata_update_indices_for_inputs(&changed_inputs, &rewritten_inputs),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn reloaded_metadata_refreshes_rewritten_input_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("rewritten.o");
+        std::fs::write(&input, b"same").unwrap();
+        let input_path = input.to_str().unwrap();
+        let mut state = state("args", b"output", &[(input_path, b"same")]);
+        state.input_files[0].content = FileContentState {
+            len: 4,
+            hash: hash_bytes(b"same"),
+            identity: Some(identity(4, 1, 2, 3, 4)),
+        };
+        state.write(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+
+        assert!(
+            input_identity_mismatch_reason(&metadata.input_files)
+                .unwrap()
+                .is_some()
+        );
+
+        refresh_rewritten_input_identities(&mut metadata, &[(0, input.clone())]);
+
+        assert_eq!(
+            input_identity_mismatch_reason(&metadata.input_files).unwrap(),
+            None
+        );
     }
 
     #[test]
