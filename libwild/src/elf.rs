@@ -465,9 +465,13 @@ impl platform::Platform for Elf {
         Ok(())
     }
 
-    fn finalise_group_layout(memory_offsets: &OutputSectionPartMap<u64>) -> Self::GroupLayoutExt {
+    fn finalise_group_layout(
+        common: &CommonGroupState<Self>,
+        memory_offsets: &OutputSectionPartMap<u64>,
+    ) -> Self::GroupLayoutExt {
         GroupLayoutExt {
             eh_frame_start_address: *memory_offsets.get(part_id::EH_FRAME),
+            rela_dyn_general_padding: common.format_specific.rela_dyn_general_padding,
         }
     }
 
@@ -1288,6 +1292,26 @@ impl platform::Platform for Elf {
         if args.hash_style.includes_sysv() {
             allocate_sysv_hash(state, current_sizes, extra_sizes, dynamic_symbol_defs)?;
         }
+        Ok(())
+    }
+
+    fn apply_late_size_adjustments_prelude<'data>(
+        common: &mut CommonGroupState<'data, Self>,
+        current_sizes: &OutputSectionPartMap<u64>,
+        extra_sizes: &mut OutputSectionPartMap<u64>,
+        symbol_db: &SymbolDb<'data, Self>,
+    ) -> Result {
+        let padding = incremental_rela_dyn_general_padding(
+            *current_sizes.get(part_id::RELA_DYN_GENERAL),
+            symbol_db.args.common().incremental,
+            symbol_db.args.common().incremental_padding_percent,
+            symbol_db.output_kind,
+        );
+        if padding > 0 {
+            common.format_specific.rela_dyn_general_padding += padding;
+            extra_sizes.increment(part_id::RELA_DYN_GENERAL, padding);
+        }
+
         Ok(())
     }
 
@@ -4153,12 +4177,35 @@ impl<'data> ExceptionFrames<'data> {
 #[derive(Debug)]
 pub(crate) struct GroupLayoutExt {
     pub(crate) eh_frame_start_address: u64,
+    pub(crate) rela_dyn_general_padding: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct CommonGroupStateExt {
     pub(crate) exception_frame_relocations: usize,
     pub(crate) exception_frame_count: usize,
+    pub(crate) rela_dyn_general_padding: u64,
+}
+
+fn incremental_rela_dyn_general_padding(
+    current_size: u64,
+    incremental: bool,
+    incremental_padding_percent: u32,
+    output_kind: OutputKind,
+) -> u64 {
+    if !incremental
+        || incremental_padding_percent == 0
+        || current_size == 0
+        || !output_kind.needs_dynsym()
+    {
+        return 0;
+    }
+
+    let bytes = (u128::from(current_size) * u128::from(incremental_padding_percent)).div_ceil(100);
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    bytes
+        .div_ceil(crate::elf::RELA_ENTRY_SIZE)
+        .saturating_mul(crate::elf::RELA_ENTRY_SIZE)
 }
 
 /// Return whether all DT_NEEDED entries for this shared object correspond to input files that

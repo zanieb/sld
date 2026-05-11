@@ -2219,7 +2219,7 @@ impl<'data, P: Platform> GroupState<'data, P> {
         resolutions_out: &mut sharded_vec_writer::Shard<Option<Resolution<P>>>,
         resources: &FinaliseLayoutResources<'_, 'data, P>,
     ) -> Result<GroupLayout<'data, P>> {
-        let format_specific = P::finalise_group_layout(memory_offsets);
+        let format_specific = P::finalise_group_layout(&self.common, memory_offsets);
         let files = self
             .files
             .into_iter()
@@ -3035,6 +3035,13 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
             per_symbol_flags,
             resources.symbol_db,
             &mut extra_sizes,
+        )?;
+
+        P::apply_late_size_adjustments_prelude(
+            common,
+            total_sizes,
+            &mut extra_sizes,
+            resources.symbol_db,
         )?;
 
         let entry_size = size_of::<P::SymtabEntry>() as u64;

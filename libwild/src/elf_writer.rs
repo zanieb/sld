@@ -291,7 +291,10 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
             table_writer
-                .validate_empty(&group.mem_sizes)
+                .validate_empty(
+                    &group.mem_sizes,
+                    group.format_specific.rela_dyn_general_padding,
+                )
                 .with_context(|| format!("validate_empty failed for {group}"))?;
             Ok(())
         },
@@ -968,7 +971,11 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
     }
 
     /// Checks that we used all of the entries that we requested during layout.
-    fn validate_empty(&self, mem_sizes: &OutputSectionPartMap<u64>) -> Result {
+    fn validate_empty(
+        &mut self,
+        mem_sizes: &OutputSectionPartMap<u64>,
+        rela_dyn_general_padding: u64,
+    ) -> Result {
         if !self.got.is_empty() {
             return Err(excessive_allocation(
                 ".got",
@@ -983,12 +990,18 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
                 *mem_sizes.get(part_id::RELA_DYN_RELATIVE),
             ));
         }
-        if !self.rela_dyn_general.is_empty() {
+        let unused_rela_dyn_general = self.rela_dyn_general.len() as u64 * elf::RELA_ENTRY_SIZE;
+        if unused_rela_dyn_general > rela_dyn_general_padding {
             return Err(excessive_allocation(
                 ".rela.dyn (general)",
-                self.rela_dyn_general.len() as u64 * elf::RELA_ENTRY_SIZE,
+                unused_rela_dyn_general,
                 *mem_sizes.get(part_id::RELA_DYN_GENERAL),
             ));
+        }
+        for rela in self.rela_dyn_general.iter_mut() {
+            rela.r_offset.set(LittleEndian, 0);
+            rela.r_info.set(LittleEndian, 0);
+            rela.r_addend.set(LittleEndian, 0);
         }
         if let Some(relr_dyn) = &self.relr_dyn
             && !relr_dyn.is_empty()
@@ -6218,7 +6231,7 @@ pub(crate) fn verify_resolution_allocation(
         args.is_relr_enabled(),
     );
     table_writer.process_resolution::<crate::elf_x86_64::ElfX86_64>(None, args, resolution)?;
-    table_writer.validate_empty(mem_sizes)
+    table_writer.validate_empty(mem_sizes, 0)
 }
 
 impl<R> Default for RelocationCache<R> {
