@@ -782,6 +782,9 @@ struct ResolvedSectionPatch {
     patch: SectionPatch,
 }
 
+const GENERATED_SECTION_INPUT_FILE: &str = "generated";
+const GENERATED_SECTION_INDEX: u32 = 0;
+
 struct ExpectedInputContent {
     path: PathBuf,
     len: u64,
@@ -1065,6 +1068,16 @@ impl PreparedState {
 
         self.reused_sections.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    pub(crate) fn record_generated_section(&self, name: &str, output_offset: u64, size: u64) {
+        if self.mode == IncrementalMode::Disabled || size == 0 {
+            return;
+        }
+        self.current_sections
+            .lock()
+            .unwrap()
+            .push(generated_section_record(name, output_offset, size));
     }
 
     pub(crate) fn finish(
@@ -1691,6 +1704,16 @@ impl SectionRecord {
             output_offset,
             size,
         }
+    }
+}
+
+fn generated_section_record(name: &str, output_offset: u64, size: u64) -> SectionRecord {
+    SectionRecord {
+        input_file: GENERATED_SECTION_INPUT_FILE.to_owned(),
+        input: name.to_owned(),
+        section_index: GENERATED_SECTION_INDEX,
+        output_offset,
+        size,
     }
 }
 
@@ -5301,6 +5324,11 @@ mod tests {
     fn persisted_state_round_trips() {
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
+        state.sections.push(generated_section_record(
+            "generated:.rela.dyn.general",
+            256,
+            24,
+        ));
         assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
     }
 
@@ -6585,6 +6613,40 @@ mod tests {
 
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, false, true));
         assert!(state.current_sections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_generated_section_records_non_empty_ranges() {
+        let state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "no previous incremental state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
+                wild_version: "wild-test".to_owned(),
+                input_files: Vec::new(),
+            },
+            reusable_inputs: HashSet::new(),
+            previous_sections: HashSet::new(),
+            current_sections: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
+        };
+
+        state.record_generated_section("generated:.rela.dyn.general", 256, 24);
+        state.record_generated_section("generated:.relr.dyn", 512, 0);
+
+        assert_eq!(
+            *state.current_sections.lock().unwrap(),
+            vec![generated_section_record(
+                "generated:.rela.dyn.general",
+                256,
+                24
+            )]
+        );
     }
 
     #[test]

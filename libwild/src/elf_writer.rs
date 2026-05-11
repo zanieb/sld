@@ -506,7 +506,9 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
                 group_file_sizes,
             )?;
         }
-        FileLayout::Prelude(s) => write_prelude::<A>(s, buffers, table_writer, layout)?,
+        FileLayout::Prelude(s) => {
+            write_prelude::<A>(s, buffers, table_writer, layout, incremental)?
+        }
         FileLayout::Epilogue(s) => write_epilogue::<A>(s, buffers, table_writer, layout)?,
         FileLayout::SyntheticSymbols(s) => write_synthetic_symbols::<A>(s, table_writer, layout)?,
         FileLayout::LinkerScript(s) => write_linker_script_state::<A>(s, table_writer, layout)?,
@@ -3689,6 +3691,7 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     table_writer: &mut TableWriter,
     layout: &ElfLayout<'data>,
+    incremental: &PreparedState,
 ) -> Result {
     verbose_timing_phase!("Write prelude");
 
@@ -3719,6 +3722,7 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
     }
 
     write_merged_strings(prelude, buffers, layout);
+    record_generated_dynamic_relocation_sections(incremental, layout);
 
     write_interp(prelude, buffers);
 
@@ -3738,6 +3742,24 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
     }
 
     Ok(())
+}
+
+fn record_generated_dynamic_relocation_sections(
+    incremental: &PreparedState,
+    layout: &ElfLayout<'_>,
+) {
+    for (name, part_id) in [
+        ("generated:.rela.dyn.relative", part_id::RELA_DYN_RELATIVE),
+        ("generated:.rela.dyn.general", part_id::RELA_DYN_GENERAL),
+        ("generated:.relr.dyn", part_id::RELR_DYN),
+    ] {
+        let section = layout.section_part_layouts.get(part_id);
+        incremental.record_generated_section(
+            name,
+            section.file_offset as u64,
+            section.file_size as u64,
+        );
+    }
 }
 
 fn write_interp(prelude: &PreludeLayout<Elf>, buffers: &mut OutputSectionPartMap<&mut [u8]>) {
