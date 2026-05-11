@@ -65,6 +65,7 @@ same save-dir and passes `--incremental` only to Wild:
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
+expect_wild_log = ["reused existing output before loading inputs"]
 ```
 
 The runner performs a warmup run first, so the timed runs measure reuse of the incremental state.
@@ -93,6 +94,7 @@ save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
 mutate_files = [{ path = "path/to/input.o", section = ".data" }]
+expect_wild_log = ["patched ", "changed input file before loading inputs"]
 ```
 
 ```toml
@@ -101,7 +103,12 @@ save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental", "--incremental-padding-percent=25"]
 mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
+expect_wild_log = ["patched ", "changed input file before loading inputs"]
 ```
+
+`expect_wild_log` is optional, but useful when benchmarking incremental mode: it fails the benchmark
+if Wild's incremental log doesn't contain the expected fast-path message, so you don't accidentally
+measure a full fallback relink.
 
 ### Run benchmark with hyperfine
 
