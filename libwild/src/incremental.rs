@@ -476,6 +476,61 @@ enum ChangedInputPatchResult {
     Unsupported(String),
 }
 
+fn changed_relocation_target_reason(
+    relocations: &[RelocationRecord],
+    input: &FileState,
+    bytes: &[u8],
+) -> Result<Option<String>> {
+    for relocation in relocations {
+        let Some(target) = &relocation.target else {
+            continue;
+        };
+        if target.input_file != input.path {
+            continue;
+        }
+        let Some(target_name) = &relocation.target_name else {
+            continue;
+        };
+        let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &target.input)?
+        else {
+            continue;
+        };
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse changed relocation target input")?;
+        let Some((current_section, current_offset)) =
+            symbol_section_offset_by_name(&file, target_name)?
+        else {
+            continue;
+        };
+        if current_section.0 as u32 != target.section_index
+            || current_offset != target.section_offset
+        {
+            return Ok(Some(format!(
+                "relocation target moved in {}",
+                display_hex_path(&input.path)
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn symbol_section_offset_by_name(
+    file: &object::File<'_>,
+    encoded_name: &str,
+) -> Result<Option<(object::SectionIndex, u64)>> {
+    let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
+    for symbol in file.symbols() {
+        if symbol.name_bytes()? != name {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            return Ok(None);
+        };
+        return Ok(Some((section_index, symbol.address())));
+    }
+    Ok(None)
+}
+
 fn patch_changed_inputs(
     args: &impl platform::Args,
     state_dir: &Path,
@@ -525,6 +580,11 @@ fn patch_changed_inputs(
                     "archive members changed in `{}`",
                     path.display()
                 )));
+            }
+            if let Some(reason) =
+                changed_relocation_target_reason(&previous.relocations, input, &bytes)?
+            {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
             }
 
             let matched_patch_sections = if let Some(matched) =
