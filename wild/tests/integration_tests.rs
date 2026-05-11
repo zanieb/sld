@@ -4784,6 +4784,12 @@ impl LinkCommand {
             });
             parsed_args.parse(get_args)?;
 
+            // Respect Wild's normal fork policy. On macOS, bypassing it can exercise a different
+            // output-write path from production and leave stale unsigned Mach-O test binaries.
+            if libwild::should_fork(&parsed_args) {
+                return self.run_in_subprocess(config);
+            }
+
             // This call is expected to error for all but the first call.
             let _ = libwild::setup_tracing(&parsed_args);
             let thread_pool = libwild::activate_thread_pool(&mut parsed_args)?;
@@ -4798,6 +4804,10 @@ impl LinkCommand {
             return Ok(());
         }
 
+        self.run_in_subprocess(config)
+    }
+
+    fn run_in_subprocess(&mut self, config: &Config) -> Result {
         let output = self
             .command
             .output()

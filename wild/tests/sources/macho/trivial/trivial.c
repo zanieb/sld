@@ -8,6 +8,10 @@
 //#LinkArgs:-nostdlib
 //#TestUpdateInPlace:false
 
+//#Config:no-fork:default
+//#WildExtraLinkArgs:--no-fork
+//#TestUpdateInPlace:false
+
 #include "../common/runtime.h"
 
 void main(void) { exit_syscall(42); }
