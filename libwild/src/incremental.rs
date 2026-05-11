@@ -524,7 +524,7 @@ fn patch_changed_inputs(
     }
 
     let mut patched_ranges = Vec::new();
-    for patch in patches {
+    for mut patch in patches {
         let start = patch.output_offset as usize;
         let end = start
             .checked_add(patch.size as usize)
@@ -538,6 +538,19 @@ fn patch_changed_inputs(
             return Ok(ChangedInputPatchResult::Unsupported(
                 "changed patch data does not fit in the previous output range".to_owned(),
             ));
+        }
+        for preserve_range in &patch.preserve_ranges {
+            let Some(data_range) = patch.data.get_mut(preserve_range.clone()) else {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed patch preserve range is out of bounds".to_owned(),
+                ));
+            };
+            let Some(previous_range) = output_range.get(preserve_range.clone()) else {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed patch preserve range is out of bounds".to_owned(),
+                ));
+            };
+            data_range.copy_from_slice(previous_range);
         }
         let (data_out, padding) = output_range.split_at_mut(patch.data.len());
         data_out.copy_from_slice(&patch.data);
@@ -602,6 +615,7 @@ struct SectionPatch {
     output_offset: u64,
     size: u64,
     data: Vec<u8>,
+    preserve_ranges: Vec<std::ops::Range<usize>>,
 }
 
 struct ResolvedSectionPatch {
@@ -1477,12 +1491,13 @@ fn direct_copy_patch_sections<'a>(
             let section = file
                 .section_by_index(object::SectionIndex(record.section_index as usize))
                 .context("Missing incremental patch candidate section")?;
-            if !section_allows_direct_patching(&section) {
-                continue;
-            }
             let data = section
                 .data()
                 .context("Failed to read incremental patch candidate section data")?;
+            let Some(preserve_ranges) = section_direct_patch_preserve_ranges(&section, data.len())
+            else {
+                continue;
+            };
             if data.len() > record.size as usize {
                 continue;
             }
@@ -1494,7 +1509,9 @@ fn direct_copy_patch_sections<'a>(
                 continue;
             };
             let (data_out, padding) = output_range.split_at(data.len());
-            if data_out == data && padding.iter().all(|byte| *byte == 0) {
+            if patchable_bytes_match(data_out, data, &preserve_ranges)
+                && padding.iter().all(|byte| *byte == 0)
+            {
                 patch_sections.push(PatchSection {
                     input: record.input.clone(),
                     section_index: record.section_index,
@@ -1518,13 +1535,20 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     allocated && !content_ordered
 }
 
-fn section_allows_direct_patching<'data>(section: &impl object::ObjectSection<'data>) -> bool {
-    section_flags_allow_patching(section.flags())
-        && section
+fn section_direct_patch_preserve_ranges<'data>(
+    section: &impl object::ObjectSection<'data>,
+    section_data_len: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if !section_flags_allow_patching(section.flags())
+        || !section
             .name()
             .ok()
             .is_none_or(section_name_allows_direct_patching)
-        && section.relocations().next().is_none()
+    {
+        return None;
+    }
+
+    relocation_preserve_ranges(section, section_data_len)
 }
 
 fn section_name_allows_direct_patching(name: &str) -> bool {
@@ -1535,6 +1559,60 @@ fn section_name_allows_direct_patching(name: &str) -> bool {
         && !name.starts_with(".preinit_array")
         && !name.starts_with(".ctors")
         && !name.starts_with(".dtors")
+}
+
+fn relocation_preserve_ranges<'data>(
+    section: &impl object::ObjectSection<'data>,
+    section_data_len: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::<std::ops::Range<usize>>::new();
+    for (offset, relocation) in section.relocations() {
+        if relocation.kind() == object::RelocationKind::None {
+            continue;
+        }
+        if relocation.has_implicit_addend()
+            || relocation.kind() != object::RelocationKind::Absolute
+            || relocation.encoding() != object::RelocationEncoding::Generic
+            || relocation.size() == 0
+            || relocation.size() % 8 != 0
+        {
+            return None;
+        }
+        let start = usize::try_from(offset).ok()?;
+        let len = usize::from(relocation.size() / 8);
+        let end = start.checked_add(len)?;
+        if end > section_data_len {
+            return None;
+        }
+        ranges.push(start..end);
+    }
+    ranges.sort_by_key(|range| range.start);
+    let mut previous_end = 0;
+    for range in &ranges {
+        if range.start < previous_end {
+            return None;
+        }
+        previous_end = range.end;
+    }
+    Some(ranges)
+}
+
+fn patchable_bytes_match(
+    output: &[u8],
+    input: &[u8],
+    preserve_ranges: &[std::ops::Range<usize>],
+) -> bool {
+    if output.len() != input.len() {
+        return false;
+    }
+    let mut position = 0;
+    for range in preserve_ranges {
+        if output[position..range.start] != input[position..range.start] {
+            return false;
+        }
+        position = range.end;
+    }
+    output[position..] == input[position..]
 }
 
 fn patch_section_name_for_matching<'data>(
@@ -2027,6 +2105,10 @@ fn resolved_patch_sections_for_input(
             let data = section
                 .data()
                 .context("Failed to read changed incremental input section data")?;
+            let Some(preserve_ranges) = section_direct_patch_preserve_ranges(&section, data.len())
+            else {
+                return Ok(None);
+            };
             if data.len() > patch_section.output_size as usize {
                 return Ok(None);
             }
@@ -2039,6 +2121,7 @@ fn resolved_patch_sections_for_input(
                     output_offset: patch_section.output_offset,
                     size: patch_section.output_size,
                     data: data.to_owned(),
+                    preserve_ranges,
                 },
             });
         }
@@ -3823,7 +3906,11 @@ mod tests {
             let Some((_, size)) = section.file_range() else {
                 continue;
             };
+            let Ok(data) = section.data() else {
+                continue;
+            };
             if size == 0
+                || section_direct_patch_preserve_ranges(&section, data.len()).is_none()
                 || object
                     .sections()
                     .filter(|s| s.name().ok() == Some(name))
@@ -3958,6 +4045,20 @@ mod tests {
         assert!(!section_name_allows_direct_patching(".preinit_array"));
         assert!(!section_name_allows_direct_patching(".ctors"));
         assert!(!section_name_allows_direct_patching(".dtors"));
+    }
+
+    #[test]
+    fn patchable_bytes_match_ignores_preserved_relocation_ranges() {
+        let input = [1, 2, 3, 4, 5, 6];
+        let linked = [1, 9, 9, 4, 8, 6];
+
+        assert!(patchable_bytes_match(&linked, &input, &[1..3, 4..5]));
+        assert!(!patchable_bytes_match(&linked, &input, &[1..3]));
+        assert!(!patchable_bytes_match(
+            &[0, 9, 9, 4, 8, 6],
+            &input,
+            &[1..3, 4..5]
+        ));
     }
 
     #[test]

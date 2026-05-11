@@ -4,7 +4,7 @@
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
-//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedInput:incremental-relocated-data.c.o
 //#TestIncrementalChangedSection:.data.rel.local.incremental_relocated
 

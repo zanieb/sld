@@ -1900,8 +1900,8 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
     }
 
     let relocations = object.relocations(section_index)?;
+    let has_relocations = relocations.num_relocations() != 0;
     let record_for_reuse = !layout.args().should_output_partial_object()
-        && relocations.num_relocations() == 0
         && object.section_relax_deltas.get(section_index.0).is_none()
         && !section.flags.needs_got()
         && !section.flags.needs_plt()
@@ -1911,7 +1911,10 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             object.object,
             &layout.output_sections,
         );
-    let can_reuse_existing_bytes = existing_output_bytes_available && record_for_reuse;
+    // Relocated sections can still produce changed-input patch metadata, but a full relink must
+    // rewrite them because relocation targets may have moved.
+    let can_reuse_existing_bytes =
+        existing_output_bytes_available && record_for_reuse && !has_relocations;
 
     let written = write_section_raw(
         object,
