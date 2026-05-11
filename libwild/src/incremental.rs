@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v22";
+const STATE_VERSION: &str = "wild-incremental-state-v23";
+const STATE_VERSION_V22: &str = "wild-incremental-state-v22";
 const STATE_VERSION_V21: &str = "wild-incremental-state-v21";
 const STATE_VERSION_V20: &str = "wild-incremental-state-v20";
 const STATE_VERSION_V19: &str = "wild-incremental-state-v19";
@@ -69,9 +70,11 @@ pub(crate) struct PreparedState {
     current: CurrentState,
     reusable_inputs: HashSet<String>,
     previous_sections: HashSet<SectionRecord>,
+    previous_relocations: Vec<RelocationRecord>,
     previous_fdes: Vec<FdeRecord>,
     previous_dynamic_relocations: Vec<DynamicRelocationRecord>,
     current_sections: Mutex<Vec<SectionRecord>>,
+    current_relocations: Mutex<Vec<RelocationRecord>>,
     current_fdes: Mutex<Vec<FdeRecord>>,
     current_dynamic_relocations: Mutex<Vec<DynamicRelocationRecord>>,
     reused_sections: AtomicUsize,
@@ -107,6 +110,7 @@ struct PersistedState {
     build_id_hashes: Option<BuildIdHashState>,
     input_files: Vec<FileState>,
     sections: Vec<SectionRecord>,
+    relocations: Vec<RelocationRecord>,
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
     sections_file: Option<String>,
@@ -185,6 +189,19 @@ pub(crate) struct SectionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RelocationRecord {
+    target_symbol_id: u32,
+    input_file: String,
+    input: String,
+    section_index: u32,
+    relocation_offset: u64,
+    output_offset: u64,
+    size: u64,
+    kind: u32,
+    addend: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct FdeRecord {
     input_file: String,
     input: String,
@@ -222,9 +239,11 @@ pub(crate) fn maybe_prepare(
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
@@ -262,12 +281,14 @@ pub(crate) fn maybe_prepare(
     };
 
     let mut previous_sections = HashSet::new();
+    let mut previous_relocations = Vec::new();
     let mut previous_fdes = Vec::new();
     let mut previous_dynamic_relocations = Vec::new();
     if mode_needs_previous_sections(&mode) {
         match PersistedState::read(&state_dir) {
             Ok(Some(previous)) => {
                 previous_sections = previous.sections.iter().cloned().collect();
+                previous_relocations = previous.relocations;
                 previous_fdes = previous.fdes;
                 previous_dynamic_relocations = previous.dynamic_relocations;
             }
@@ -298,9 +319,11 @@ pub(crate) fn maybe_prepare(
         current,
         reusable_inputs,
         previous_sections,
+        previous_relocations,
         previous_fdes,
         previous_dynamic_relocations,
         current_sections: Mutex::new(Vec::new()),
+        current_relocations: Mutex::new(Vec::new()),
         current_fdes: Mutex::new(Vec::new()),
         current_dynamic_relocations: Mutex::new(Vec::new()),
         reused_sections: AtomicUsize::new(0),
@@ -837,6 +860,7 @@ fn patch_changed_inputs(
         build_id_hashes,
         input_files: previous.input_files,
         sections: previous.sections,
+        relocations: previous.relocations,
         fdes: previous.fdes,
         dynamic_relocations: previous.dynamic_relocations,
         sections_file: previous.sections_file,
@@ -1284,6 +1308,35 @@ impl PreparedState {
         ));
     }
 
+    pub(crate) fn record_relocation(
+        &self,
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        target_symbol_id: u32,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        kind: u32,
+        addend: i64,
+    ) {
+        if self.mode == IncrementalMode::Disabled || size == 0 {
+            return;
+        }
+        self.current_relocations
+            .lock()
+            .unwrap()
+            .push(RelocationRecord::new(
+                input,
+                section_index,
+                target_symbol_id,
+                relocation_offset,
+                output_offset,
+                size,
+                kind,
+                addend,
+            ));
+    }
+
     pub(crate) fn record_dynamic_relocation(
         &self,
         input: InputRef<'_>,
@@ -1339,6 +1392,12 @@ impl PreparedState {
         }
         sections.sort();
 
+        let mut relocations = self.current_relocations.lock().unwrap().clone();
+        if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
+            relocations.extend(self.previous_relocations.iter().cloned());
+        }
+        relocations.sort();
+
         let mut fdes = self.current_fdes.lock().unwrap().clone();
         if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
             fdes.extend(self.previous_fdes.iter().cloned());
@@ -1372,6 +1431,7 @@ impl PreparedState {
             build_id_hashes,
             input_files,
             sections,
+            relocations,
             fdes,
             dynamic_relocations,
             sections_file: None,
@@ -1580,6 +1640,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V22
             && version != STATE_VERSION_V21
             && version != STATE_VERSION_V20
             && version != STATE_VERSION_V19
@@ -1666,9 +1727,11 @@ impl PersistedState {
         }
 
         let mut sections_file = None;
+        let mut relocations = Vec::new();
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V22
             || version == STATE_VERSION_V21
             || version == STATE_VERSION_V20
             || version == STATE_VERSION_V19
@@ -1698,12 +1761,14 @@ impl PersistedState {
                     .transpose()?
                     .unwrap_or_default();
                 sections_file = Some(file);
+                relocations = records.relocations;
                 fdes = records.fdes;
                 dynamic_relocations = records.dynamic_relocations;
                 records.sections
             } else {
                 let records =
                     parse_compact_records_block(std::iter::once(first_line).chain(&mut lines))?;
+                relocations = records.relocations;
                 fdes = records.fdes;
                 dynamic_relocations = records.dynamic_relocations;
                 records.sections
@@ -1738,6 +1803,7 @@ impl PersistedState {
             build_id_hashes,
             input_files,
             sections,
+            relocations,
             fdes,
             dynamic_relocations,
             sections_file,
@@ -1892,6 +1958,14 @@ impl PersistedState {
                 section.input.as_str(),
             );
         }
+        for relocation in &self.relocations {
+            add_section_input(
+                &mut section_inputs,
+                &mut section_input_ids,
+                relocation.input_file.as_str(),
+                relocation.input.as_str(),
+            );
+        }
         for fde in &self.fdes {
             add_section_input(
                 &mut section_inputs,
@@ -1922,6 +1996,24 @@ impl PersistedState {
                 &mut out,
                 "section\t{}\t{}\t{}\t{}",
                 section_input_id, section.section_index, section.output_offset, section.size
+            )
+            .unwrap();
+        }
+        writeln!(&mut out, "relocs\t{}", self.relocations.len()).unwrap();
+        for relocation in &self.relocations {
+            let section_input_id =
+                section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
+            writeln!(
+                &mut out,
+                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                section_input_id,
+                relocation.section_index,
+                relocation.target_symbol_id,
+                relocation.relocation_offset,
+                relocation.output_offset,
+                relocation.size,
+                relocation.kind,
+                relocation.addend
             )
             .unwrap();
         }
@@ -2032,6 +2124,31 @@ impl SectionRecord {
             section_index: section_index.0 as u32,
             output_offset,
             size,
+        }
+    }
+}
+
+impl RelocationRecord {
+    fn new(
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        target_symbol_id: u32,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        kind: u32,
+        addend: i64,
+    ) -> Self {
+        Self {
+            target_symbol_id,
+            input_file: encode_path(&input.file.filename),
+            input: encode_input_ref(input),
+            section_index: section_index.0 as u32,
+            relocation_offset,
+            output_offset,
+            size,
+            kind,
+            addend,
         }
     }
 }
@@ -4538,6 +4655,7 @@ fn parse_build_id_hash_line(line: Option<&str>) -> Result<Option<BuildIdHashStat
 #[derive(Default)]
 struct CompactRecords {
     sections: Vec<SectionRecord>,
+    relocations: Vec<RelocationRecord>,
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
 }
@@ -4564,9 +4682,25 @@ fn parse_compact_records_block<'a>(
         let line = lines.next().context("Missing incremental section record")?;
         sections.push(parse_compact_section_line(line, &section_inputs)?);
     }
+    let mut relocations = Vec::new();
     let mut fdes = Vec::new();
     let mut dynamic_relocations = Vec::new();
     let mut next_line = lines.next();
+    if let Some(line) = next_line
+        && line.starts_with("relocs\t")
+    {
+        let relocation_count: usize = parse_prefixed_line(Some(line), "relocs")?
+            .parse()
+            .context("Invalid incremental relocation count")?;
+        relocations = Vec::with_capacity(relocation_count);
+        for _ in 0..relocation_count {
+            let line = lines
+                .next()
+                .context("Missing incremental relocation record")?;
+            relocations.push(parse_compact_relocation_line(line, &section_inputs)?);
+        }
+        next_line = lines.next();
+    }
     if let Some(line) = next_line
         && line.starts_with("fdes\t")
     {
@@ -4605,6 +4739,7 @@ fn parse_compact_records_block<'a>(
     }
     Ok(CompactRecords {
         sections,
+        relocations,
         fdes,
         dynamic_relocations,
     })
@@ -4831,6 +4966,71 @@ fn parse_compact_section_line(
         section_index,
         output_offset,
         size,
+    })
+}
+
+fn parse_compact_relocation_line(
+    line: &str,
+    section_inputs: &[(String, String)],
+) -> Result<RelocationRecord> {
+    let rest = parse_prefixed_line(Some(line), "reloc")?;
+    let mut parts = rest.split('\t');
+    let section_input_id: usize = parts
+        .next()
+        .context("Malformed incremental relocation input index")?
+        .parse()
+        .context("Invalid incremental relocation input index")?;
+    let section_index = parts
+        .next()
+        .context("Malformed incremental relocation section index")?
+        .parse()
+        .context("Invalid incremental relocation section index")?;
+    let target_symbol_id = parts
+        .next()
+        .context("Malformed incremental relocation target symbol")?
+        .parse()
+        .context("Invalid incremental relocation target symbol")?;
+    let relocation_offset = parts
+        .next()
+        .context("Malformed incremental relocation input offset")?
+        .parse()
+        .context("Invalid incremental relocation input offset")?;
+    let output_offset = parts
+        .next()
+        .context("Malformed incremental relocation output offset")?
+        .parse()
+        .context("Invalid incremental relocation output offset")?;
+    let size = parts
+        .next()
+        .context("Malformed incremental relocation size")?
+        .parse()
+        .context("Invalid incremental relocation size")?;
+    let kind = parts
+        .next()
+        .context("Malformed incremental relocation kind")?
+        .parse()
+        .context("Invalid incremental relocation kind")?;
+    let addend = parts
+        .next()
+        .context("Malformed incremental relocation addend")?
+        .parse()
+        .context("Invalid incremental relocation addend")?;
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental relocation record"));
+    }
+    let (input_file, input) = section_inputs
+        .get(section_input_id)
+        .context("Incremental relocation input index out of bounds")?;
+    Ok(RelocationRecord {
+        target_symbol_id,
+        input_file: input_file.clone(),
+        input: input.clone(),
+        section_index,
+        relocation_offset,
+        output_offset,
+        size,
+        kind,
+        addend,
     })
 }
 
@@ -5400,6 +5600,7 @@ mod tests {
                 })
                 .collect(),
             sections: Vec::new(),
+            relocations: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
@@ -5463,6 +5664,29 @@ mod tests {
             relocation_offset,
             output_offset,
             size,
+        }
+    }
+
+    fn relocation_record(
+        input: &str,
+        section_index: u32,
+        target_symbol_id: u32,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        kind: u32,
+        addend: i64,
+    ) -> RelocationRecord {
+        RelocationRecord {
+            target_symbol_id,
+            input_file: hex::encode(input),
+            input: hex::encode(input),
+            section_index,
+            relocation_offset,
+            output_offset,
+            size,
+            kind,
+            addend,
         }
     }
 
@@ -7242,6 +7466,21 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_round_trips_relocation_records() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state
+            .relocations
+            .push(relocation_record("a.o", 1, 42, 8, 300, 8, 1, -4));
+
+        let rendered = state.render();
+
+        assert!(rendered.contains("\nrelocs\t1\n"));
+        assert!(rendered.contains("\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\n"));
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
     fn persisted_state_round_trips_dynamic_relocation_records() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
@@ -7254,6 +7493,26 @@ mod tests {
         assert!(rendered.contains("\ndynrels\t1\n"));
         assert!(rendered.contains("\ndynrel\t0\t1\t8\t300\t24\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v22_state_version_is_accepted_without_relocation_records() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.fdes.push(fde_record("a.o", 1, 4, 32, 200, 24));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V22, 1)
+            .lines()
+            .filter(|line| !line.starts_with("relocs\t") && !line.starts_with("reloc\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.fdes.len(), 1);
+        assert!(parsed.relocations.is_empty());
     }
 
     #[test]
@@ -7646,6 +7905,7 @@ mod tests {
                 patch: None,
             }],
             sections: Vec::new(),
+            relocations: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
@@ -8552,9 +8812,11 @@ mod tests {
             },
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
             previous_sections: [record].into_iter().collect(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
@@ -8589,9 +8851,11 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
@@ -8618,9 +8882,11 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
@@ -8662,9 +8928,11 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
@@ -8701,6 +8969,57 @@ mod tests {
     }
 
     #[test]
+    fn record_relocation_records_non_empty_ranges() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("a.o");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "no previous incremental state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
+                wild_version: "wild-test".to_owned(),
+                input_files: Vec::new(),
+            },
+            reusable_inputs: HashSet::new(),
+            previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
+            previous_fdes: Vec::new(),
+            previous_dynamic_relocations: Vec::new(),
+            current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
+            current_dynamic_relocations: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
+        };
+
+        state.record_relocation(input, object::SectionIndex(3), 42, 8, 256, 4, 2, -16);
+        state.record_relocation(input, object::SectionIndex(3), 43, 16, 280, 0, 2, 0);
+
+        assert_eq!(
+            *state.current_relocations.lock().unwrap(),
+            vec![RelocationRecord::new(
+                input,
+                object::SectionIndex(3),
+                42,
+                8,
+                256,
+                4,
+                2,
+                -16
+            )]
+        );
+    }
+
+    #[test]
     fn record_dynamic_relocation_records_non_empty_ranges() {
         let mut input_file = crate::input_data::InputFile::for_testing();
         input_file.filename = PathBuf::from("a.o");
@@ -8723,9 +9042,11 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
