@@ -278,6 +278,10 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         crate::bail!("unrecognized option(s): {}", options_list);
     }
 
+    if !args.common.incremental && args.common.file_write_mode.is_none() {
+        args.common.file_write_mode = Some(FileWriteMode::UnlinkAndReplace);
+    }
+
     Ok(())
 }
 
@@ -820,6 +824,42 @@ mod tests {
         assert!(args.is_dynamiclib);
         assert!(!args.should_output_executable);
         assert!(!args.should_output_executable());
+    }
+
+    #[test]
+    fn non_incremental_links_unlink_existing_outputs_by_default() {
+        let mut args = MachOArgs::default();
+        args.common.incremental = false;
+
+        parse(&mut args, std::iter::empty::<&str>()).unwrap();
+
+        assert_eq!(
+            args.common.file_write_mode,
+            Some(FileWriteMode::UnlinkAndReplace)
+        );
+    }
+
+    #[test]
+    fn incremental_links_keep_update_in_place_fallback_default() {
+        let mut args = MachOArgs::default();
+        args.common.incremental = false;
+
+        parse(&mut args, ["--incremental"].into_iter()).unwrap();
+
+        assert_eq!(args.common.file_write_mode, None);
+    }
+
+    #[test]
+    fn explicit_update_in_place_overrides_macho_default() {
+        let mut args = MachOArgs::default();
+        args.common.incremental = false;
+
+        parse(&mut args, ["--update-in-place"].into_iter()).unwrap();
+
+        assert_eq!(
+            args.common.file_write_mode,
+            Some(FileWriteMode::UpdateInPlace)
+        );
     }
 
     #[test]
