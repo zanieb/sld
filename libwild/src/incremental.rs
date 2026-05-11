@@ -1085,14 +1085,10 @@ impl PreparedState {
                     args.output().display()
                 )
             })?;
-        let output_bytes = std::fs::read(args.output()).with_context(|| {
-            format!(
-                "Failed to read output `{}` for incremental state",
-                args.output().display()
-            )
-        })?;
+        let output_path = args.output().to_owned();
+        let mut output_bytes = LazyOutputBytes::new(|| read_output_bytes(&output_path));
         let (build_id_hashes, build_id_tree) = if args.has_incremental_fast_build_id() {
-            build_id_hash_state_from_output(&output_bytes)?
+            build_id_hash_state_from_output(output_bytes.get()?)?
         } else {
             (None, None)
         };
@@ -1104,7 +1100,7 @@ impl PreparedState {
         sections.sort();
 
         let mut input_files = self.current.input_files.clone();
-        record_patch_fingerprints(&mut input_files, file_loader, &sections, &output_bytes)?;
+        record_patch_fingerprints(&mut input_files, file_loader, &sections, &mut output_bytes)?;
         snapshot_loaded_files(&self.current.state_dir, file_loader)?;
         refresh_input_file_identities(&mut input_files);
 
@@ -1869,12 +1865,52 @@ impl FileIdentity {
     }
 }
 
-fn record_patch_fingerprints(
+struct LazyOutputBytes<F> {
+    bytes: Option<Vec<u8>>,
+    load: Option<F>,
+}
+
+impl<F> LazyOutputBytes<F>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
+    fn new(load: F) -> Self {
+        Self {
+            bytes: None,
+            load: Some(load),
+        }
+    }
+
+    fn get(&mut self) -> Result<&[u8]> {
+        if self.bytes.is_none() {
+            let load = self
+                .load
+                .take()
+                .context("Incremental output bytes were already consumed")?;
+            self.bytes = Some(load()?);
+        }
+        Ok(self.bytes.as_deref().unwrap_or_default())
+    }
+}
+
+fn read_output_bytes(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| {
+        format!(
+            "Failed to read output `{}` for incremental state",
+            path.display()
+        )
+    })
+}
+
+fn record_patch_fingerprints<F>(
     input_files: &mut [FileState],
     file_loader: &FileLoader<'_>,
     sections: &[SectionRecord],
-    output: &[u8],
-) -> Result {
+    output: &mut LazyOutputBytes<F>,
+) -> Result
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
     let mut sections_by_file = HashMap::<&str, Vec<&SectionRecord>>::new();
     for section in sections {
         sections_by_file
@@ -1909,8 +1945,12 @@ fn record_patch_fingerprints(
             input.patch = None;
             continue;
         };
-        let patch_sections =
-            direct_copy_patch_sections(input_file.data(), input.path.as_str(), output, sections)?;
+        let patch_sections = direct_copy_patch_sections(
+            input_file.data(),
+            input.path.as_str(),
+            output.get()?,
+            sections,
+        )?;
         input.patch = patch_fingerprint(
             input_file.data(),
             input.path.as_str(),
@@ -5357,6 +5397,8 @@ mod tests {
     fn record_patch_fingerprints_preserves_matching_existing_patch() {
         let arena = colosseum::sync::Arena::new();
         let file_loader = FileLoader::new(&arena);
+        let mut output =
+            LazyOutputBytes::new(|| panic!("matching patch metadata should not read output bytes"));
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
@@ -5375,7 +5417,7 @@ mod tests {
         }];
         let sections = vec![section_record("a.o", 1, 100, 4)];
 
-        record_patch_fingerprints(&mut input_files, &file_loader, &sections, b"").unwrap();
+        record_patch_fingerprints(&mut input_files, &file_loader, &sections, &mut output).unwrap();
 
         assert_eq!(
             input_files[0].patch.as_ref().unwrap().fingerprint,
@@ -5387,6 +5429,8 @@ mod tests {
     fn record_patch_fingerprints_clears_stale_patch_without_loaded_input() {
         let arena = colosseum::sync::Arena::new();
         let file_loader = FileLoader::new(&arena);
+        let mut output =
+            LazyOutputBytes::new(|| panic!("missing loaded input should not read output bytes"));
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
@@ -5405,7 +5449,7 @@ mod tests {
         }];
         let sections = vec![section_record("a.o", 1, 108, 4)];
 
-        record_patch_fingerprints(&mut input_files, &file_loader, &sections, b"").unwrap();
+        record_patch_fingerprints(&mut input_files, &file_loader, &sections, &mut output).unwrap();
 
         assert!(input_files[0].patch.is_none());
     }
