@@ -6,7 +6,7 @@
 //#TestIncremental:true
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing patch metadata
+//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
 //#TestIncrementalChangedInput:incremental-merge-string-shared-b.s.o
 //#TestIncrementalChangedSection:.rodata.str1.1
 

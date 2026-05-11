@@ -6,8 +6,7 @@
 //#TestIncrementalInterrupted:true
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental.c.o
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
+//#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedSymbolBytes:incremental_value=0x2b000000
 
 volatile int incremental_value = 42;

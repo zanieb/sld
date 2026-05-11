@@ -10,6 +10,8 @@
 //#TestIncrementalChangedInput:incremental-strict.c.o
 //#TestIncrementalChangedSection:.init
 //#Config:init-array:incremental-strict
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedExpectReuse:false
 //#TestIncrementalChangedSection:.rela.init_array
 //#TestIncrementalChangedSectionOffset:16
 
