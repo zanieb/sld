@@ -81,6 +81,10 @@ pub(crate) mod version_script;
 pub(crate) mod wasm;
 pub(crate) mod wasm_wasm32;
 
+pub fn print_incremental_log(writer: impl std::io::Write) -> error::Result {
+    incremental::print_global_log(writer)
+}
+
 use crate::elf::Elf;
 use crate::error::Context;
 use crate::error::Result;

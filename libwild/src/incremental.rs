@@ -9,6 +9,7 @@ use hashbrown::HashSet;
 use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::Metadata;
 use std::fs::OpenOptions;
@@ -22,6 +23,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const STATE_VERSION: &str = "wild-incremental-state-v10";
 const STATE_VERSION_V9: &str = "wild-incremental-state-v9";
@@ -35,6 +38,8 @@ const STATE_VERSION_V2: &str = "wild-incremental-state-v2";
 const STATE_VERSION_V1: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
+const GLOBAL_LOG_FILE: &str = "incremental.log";
+const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const SECTIONS_FILE: &str = "sections";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
@@ -2023,7 +2028,91 @@ fn append_log(state_dir: &Path, message: &str) -> Result {
         .open(&path)
         .with_context(|| format!("Failed to open incremental log `{}`", path.display()))?;
     writeln!(file, "{message}")?;
+    let _ = append_global_log(state_dir, message);
     Ok(())
+}
+
+fn append_global_log(state_dir: &Path, message: &str) -> Result {
+    let Some(log_dir) = user_state_dir() else {
+        return Ok(());
+    };
+    append_global_log_to(&log_dir, state_dir, message)
+}
+
+fn append_global_log_to(log_dir: &Path, state_dir: &Path, message: &str) -> Result {
+    std::fs::create_dir_all(log_dir)?;
+    let path = global_log_path_in(log_dir);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open incremental global log `{}`", path.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    writeln!(file, "{timestamp}\t{}\t{message}", state_dir.display())?;
+    Ok(())
+}
+
+pub(crate) fn print_global_log(mut writer: impl std::io::Write) -> Result {
+    let Some(log_dir) = user_state_dir() else {
+        return Ok(());
+    };
+    print_global_log_from(&log_dir, &mut writer)
+}
+
+fn print_global_log_from(log_dir: &Path, writer: &mut impl std::io::Write) -> Result {
+    let path = global_log_path_in(log_dir);
+    let contents = match std::fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read incremental log `{}`", path.display()));
+        }
+    };
+    writer
+        .write_all(&contents)
+        .with_context(|| format!("Failed to write incremental log `{}`", path.display()))?;
+    Ok(())
+}
+
+fn global_log_path_in(log_dir: &Path) -> PathBuf {
+    log_dir.join(GLOBAL_LOG_FILE)
+}
+
+fn user_state_dir() -> Option<PathBuf> {
+    user_state_dir_from_env(|name| std::env::var_os(name))
+}
+
+fn user_state_dir_from_env(mut env: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(path) = env(USER_STATE_DIR_ENV) {
+        return Some(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        env("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("wild")
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(path) = env("XDG_STATE_HOME") {
+            return Some(PathBuf::from(path).join("wild"));
+        }
+        env("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("wild")
+        })
+    }
 }
 
 fn state_dir_for_output(output: &Path) -> PathBuf {
@@ -2192,6 +2281,81 @@ mod tests {
         assert_eq!(
             state_dir_for_output(Path::new("target/debug/app.so")),
             Path::new("target/debug/app.so.incr")
+        );
+    }
+
+    #[test]
+    fn user_state_dir_uses_override() {
+        let dir = user_state_dir_from_env(|name| {
+            (name == USER_STATE_DIR_ENV).then(|| OsString::from("/tmp/wild-state"))
+        });
+
+        assert_eq!(dir, Some(PathBuf::from("/tmp/wild-state")));
+    }
+
+    #[test]
+    fn user_state_dir_uses_platform_default() {
+        let dir = user_state_dir_from_env(|name| match name {
+            "HOME" => Some(OsString::from("/home/wild")),
+            _ => None,
+        })
+        .unwrap();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/wild")
+                .join("Library")
+                .join("Application Support")
+                .join("wild")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/wild")
+                .join(".local")
+                .join("state")
+                .join("wild")
+        );
+    }
+
+    #[test]
+    fn user_state_dir_prefers_xdg_state_home_on_non_macos() {
+        let dir = user_state_dir_from_env(|name| match name {
+            "HOME" => Some(OsString::from("/home/wild")),
+            "XDG_STATE_HOME" => Some(OsString::from("/state")),
+            _ => None,
+        })
+        .unwrap();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/wild")
+                .join("Library")
+                .join("Application Support")
+                .join("wild")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(dir, PathBuf::from("/state").join("wild"));
+    }
+
+    #[test]
+    fn global_log_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        append_global_log_to(
+            dir.path(),
+            Path::new("target/debug/app.incr"),
+            "full relink: no previous incremental state",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        print_global_log_from(dir.path(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("\ttarget/debug/app.incr\tfull relink: no previous incremental state\n")
         );
     }
 
