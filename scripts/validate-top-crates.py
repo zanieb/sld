@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         help="cargo executable to run",
     )
     parser.add_argument(
+        "--rustup-toolchain",
+        default=os.environ.get("RUSTUP_TOOLCHAIN", "stable"),
+        help="RUSTUP_TOOLCHAIN value for cargo runs; use empty string to avoid setting it",
+    )
+    parser.add_argument(
         "--target",
         help="optional Rust target triple to pass to cargo",
     )
@@ -409,6 +414,8 @@ def env_for_run(args: argparse.Namespace, target_dir_name: str, use_wild: bool) 
     env = os.environ.copy()
     env.setdefault("CARGO_TERM_COLOR", "always")
     env.setdefault("CARGO_NET_RETRY", "3")
+    if args.rustup_toolchain:
+        env["RUSTUP_TOOLCHAIN"] = args.rustup_toolchain
     env["CARGO_HOME"] = str((args.work_dir / "cargo-home").resolve())
     env["CARGO_TARGET_DIR"] = str((args.work_dir / target_dir_name).resolve())
     if use_wild:
