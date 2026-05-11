@@ -32,6 +32,7 @@ skip_linkers = ["bfd"]
 save = "rust-analyzer"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
+expect_wild_log = ["reused existing output before loading inputs"]
 
 [bench.rust-analyzer-riscv]
 skip_linkers = ["bfd"]
@@ -58,6 +59,7 @@ skip_linkers = ["bfd"]
 save = "wild"
 skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
+expect_wild_log = ["reused existing output before loading inputs"]
 
 [bench.wild-lto]
 min_wild_version = "0.9.0"
