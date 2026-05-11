@@ -1314,7 +1314,7 @@ fn direct_copy_patch_sections<'a>(
         let section = file
             .section_by_index(object::SectionIndex(record.section_index as usize))
             .context("Missing incremental patch candidate section")?;
-        if !section_flags_allow_patching(section.flags()) {
+        if !section_allows_direct_patching(&section) {
             continue;
         }
         let data = section
@@ -1351,6 +1351,23 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let allocated = sh_flags & u64::from(object::elf::SHF_ALLOC) != 0;
     let content_ordered = sh_flags & u64::from(object::elf::SHF_MERGE) != 0;
     allocated && !content_ordered
+}
+
+fn section_allows_direct_patching<'data>(section: &impl object::ObjectSection<'data>) -> bool {
+    section_flags_allow_patching(section.flags())
+        && section
+            .name()
+            .ok()
+            .is_none_or(section_name_allows_direct_patching)
+}
+
+fn section_name_allows_direct_patching(name: &str) -> bool {
+    !matches!(name, ".init" | ".fini")
+        && !name.starts_with(".init_array")
+        && !name.starts_with(".fini_array")
+        && !name.starts_with(".preinit_array")
+        && !name.starts_with(".ctors")
+        && !name.starts_with(".dtors")
 }
 
 fn patch_section_name_for_matching<'data>(
@@ -2961,6 +2978,20 @@ mod tests {
         assert!(!section_name_is_stable_for_patch_matching(
             ".data.rel.ro..L__unnamed_12"
         ));
+    }
+
+    #[test]
+    fn strictly_ordered_or_no_gap_sections_are_not_directly_patchable() {
+        assert!(section_name_allows_direct_patching(".text.foo"));
+        assert!(section_name_allows_direct_patching(".data.foo"));
+        assert!(!section_name_allows_direct_patching(".init"));
+        assert!(!section_name_allows_direct_patching(".fini"));
+        assert!(!section_name_allows_direct_patching(".init_array"));
+        assert!(!section_name_allows_direct_patching(".init_array.100"));
+        assert!(!section_name_allows_direct_patching(".fini_array"));
+        assert!(!section_name_allows_direct_patching(".preinit_array"));
+        assert!(!section_name_allows_direct_patching(".ctors"));
+        assert!(!section_name_allows_direct_patching(".dtors"));
     }
 
     #[test]
