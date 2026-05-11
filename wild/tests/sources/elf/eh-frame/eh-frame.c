@@ -3,6 +3,8 @@
 //#DiffIgnore: segment.LOAD.RW.alignment
 //#ExpectSym:_start section=".text"
 //#TestUpdateInPlace:true
+//#TestIncremental:true
+//#TestIncrementalStateContains:fde\t
 
 #include <stdint.h>
 
