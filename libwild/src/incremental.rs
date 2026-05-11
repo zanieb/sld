@@ -66,6 +66,7 @@ const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
+const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const ABSENT_FIELD: &str = "-";
@@ -725,6 +726,7 @@ fn patch_changed_inputs(
             current_sections,
             resolved_patches,
             fde_eh_frame_hdr_changes,
+            added_dynamic_relocations,
             removed_dynamic_relocations,
             removed_fdes,
         ) = {
@@ -806,7 +808,7 @@ fn patch_changed_inputs(
                 .map(|section| section.current.clone())
                 .collect::<Vec<_>>();
 
-            let dynamic_relocation_patches = dynamic_relocation_patches_for_input(
+            let mut dynamic_relocation_patches = dynamic_relocation_patches_for_input(
                 &bytes,
                 input.path.as_str(),
                 previous
@@ -814,6 +816,16 @@ fn patch_changed_inputs(
                     .iter()
                     .filter(|record| record.input_file == input.path),
             )?;
+            if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                dynamic_relocation_patches.extend(added_dynamic_relocation_patches_for_input(
+                    &bytes,
+                    previous_bytes,
+                    input.path.as_str(),
+                    &matched_sections,
+                    &previous.dynamic_relocations,
+                    &previous.sections,
+                )?);
+            }
             let eh_frame_patches = if let Some(previous_bytes) = previous_snapshot_bytes.as_deref()
             {
                 fde_relocation_patches_for_input(
@@ -973,6 +985,12 @@ fn patch_changed_inputs(
                 .iter()
                 .filter_map(|patch| patch.input_range.is_none().then_some(patch.record.clone()))
                 .collect::<HashSet<_>>();
+            let added_dynamic_relocations = dynamic_relocation_patches
+                .iter()
+                .filter_map(|patch| {
+                    (patch.input_range.is_some() && patch.is_new).then_some(patch.record.clone())
+                })
+                .collect::<HashSet<_>>();
             let removed_fdes = eh_frame_hdr_changes
                 .iter()
                 .filter_map(|change| match change {
@@ -998,6 +1016,7 @@ fn patch_changed_inputs(
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
+                added_dynamic_relocations,
                 removed_dynamic_relocations,
                 removed_fdes,
             )
@@ -1009,6 +1028,14 @@ fn patch_changed_inputs(
             &mut previous.sections,
         );
         if sections_changed {
+            previous.sections_file = None;
+        }
+        if !added_dynamic_relocations.is_empty() {
+            previous
+                .dynamic_relocations
+                .extend(added_dynamic_relocations);
+            previous.dynamic_relocations.sort();
+            previous.dynamic_relocations.dedup();
             previous.sections_file = None;
         }
         if !removed_dynamic_relocations.is_empty() {
@@ -1292,6 +1319,7 @@ struct DynamicRelocationPatch {
     record: DynamicRelocationRecord,
     input_range: Option<std::ops::Range<usize>>,
     patch: SectionPatch,
+    is_new: bool,
 }
 
 struct RelocationAddendPatches {
@@ -3947,6 +3975,160 @@ fn dynamic_relocation_patches_for_input<'a>(
     Ok(patches)
 }
 
+fn added_dynamic_relocation_patches_for_input(
+    current_bytes: &[u8],
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    previous_dynamic_relocations: &[DynamicRelocationRecord],
+    previous_sections: &[SectionRecord],
+) -> Result<Vec<DynamicRelocationPatch>> {
+    if matched_sections.iter().any(|section| {
+        section.previous.input != input_file_path || section.current.input != input_file_path
+    }) {
+        return Ok(Vec::new());
+    }
+
+    let Some(current_section_headers) = elf_section_headers(current_bytes) else {
+        return Ok(Vec::new());
+    };
+    let Some(previous_section_headers) = elf_section_headers(previous_bytes) else {
+        return Ok(Vec::new());
+    };
+    let free_slots = free_dynamic_relocation_output_slots(
+        previous_sections,
+        previous_dynamic_relocations
+            .iter()
+            .filter(|record| record.size == crate::elf::RELA_ENTRY_SIZE),
+    );
+    if free_slots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let previous_records = previous_dynamic_relocations
+        .iter()
+        .filter(|record| {
+            record.input_file == input_file_path
+                && record.input == input_file_path
+                && record.has_restorable_rela_output_info()
+        })
+        .collect::<Vec<_>>();
+    if previous_records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut patches = Vec::new();
+    let mut next_free_slot = 0;
+    for matched in matched_sections {
+        let previous_entries = rela_entries_for_section(
+            previous_bytes,
+            &previous_section_headers,
+            matched.previous.section_index,
+        )
+        .unwrap_or_default();
+        let current_entries = rela_entries_for_section(
+            current_bytes,
+            &current_section_headers,
+            matched.current.section_index,
+        )
+        .unwrap_or_default();
+        let previous_offsets = previous_entries
+            .iter()
+            .map(|entry| entry.offset)
+            .collect::<HashSet<_>>();
+        for entry in current_entries
+            .iter()
+            .filter(|entry| !previous_offsets.contains(&entry.offset))
+        {
+            let Some(reference) = previous_records.iter().find_map(|record| {
+                (record.section_index == matched.previous.section_index).then(|| {
+                    previous_entries
+                        .iter()
+                        .find(|previous| {
+                            previous.offset == record.relocation_offset
+                                && previous.info == entry.info
+                        })
+                        .map(|_| *record)
+                })?
+            }) else {
+                continue;
+            };
+            let Some(output_offset) = free_slots.get(next_free_slot).copied() else {
+                return Ok(patches);
+            };
+            next_free_slot += 1;
+
+            let delta = i128::from(entry.offset) - i128::from(reference.relocation_offset);
+            let Some(output_r_offset) =
+                add_signed_delta_u64(reference.output_r_offset.unwrap(), delta)
+            else {
+                continue;
+            };
+            let output_r_info = reference.output_r_info.unwrap();
+            let mut data = vec![0; crate::elf::RELA_ENTRY_SIZE as usize];
+            data[0..8].copy_from_slice(&output_r_offset.to_le_bytes());
+            data[8..16].copy_from_slice(&output_r_info.to_le_bytes());
+            data[16..24].copy_from_slice(&entry.addend.to_le_bytes());
+            patches.push(DynamicRelocationPatch {
+                record: DynamicRelocationRecord {
+                    input_file: input_file_path.to_owned(),
+                    input: input_file_path.to_owned(),
+                    section_index: matched.current.section_index,
+                    relocation_offset: entry.offset,
+                    output_offset,
+                    size: crate::elf::RELA_ENTRY_SIZE,
+                    output_r_offset: Some(output_r_offset),
+                    output_r_info: Some(output_r_info),
+                },
+                input_range: Some(entry.addend_range.clone()),
+                patch: SectionPatch {
+                    output_offset,
+                    size: crate::elf::RELA_ENTRY_SIZE,
+                    data,
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                },
+                is_new: true,
+            });
+        }
+    }
+
+    Ok(patches)
+}
+
+fn free_dynamic_relocation_output_slots<'a>(
+    sections: &[SectionRecord],
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+) -> Vec<u64> {
+    let used = dynamic_relocations
+        .into_iter()
+        .map(|record| record.output_offset)
+        .collect::<HashSet<_>>();
+    let mut slots = Vec::new();
+    for section in sections {
+        if section.input_file != GENERATED_SECTION_INPUT_FILE
+            || section.input != GENERATED_RELA_DYN_GENERAL
+        {
+            continue;
+        }
+        let mut output_offset = section.output_offset;
+        let Some(end) = section.output_offset.checked_add(section.size) else {
+            continue;
+        };
+        while output_offset
+            .checked_add(crate::elf::RELA_ENTRY_SIZE)
+            .is_some_and(|slot_end| slot_end <= end)
+        {
+            if !used.contains(&output_offset) {
+                slots.push(output_offset);
+            }
+            output_offset += crate::elf::RELA_ENTRY_SIZE;
+        }
+    }
+    slots.sort_unstable();
+    slots
+}
+
 fn relocation_addend_patches_for_input(
     relocations: &mut [RelocationRecord],
     input: &FileState,
@@ -4188,6 +4370,7 @@ fn dynamic_relocation_patches_for_input_bytes(
                     preserve_ranges: Vec::new(),
                     adjustments: Vec::new(),
                 },
+                is_new: false,
             });
             continue;
         };
@@ -4217,6 +4400,7 @@ fn dynamic_relocation_patches_for_input_bytes(
                 preserve_ranges,
                 adjustments: Vec::new(),
             },
+            is_new: false,
         });
     }
     Ok(patches)
@@ -4237,7 +4421,9 @@ fn object_diff_allows_dynamic_relocation_removal(
             patch.record.input_file != input_file_path || patch.record.input != input_file_path
         })
         || matched_sections.iter().any(|section| {
-            section.previous.input != input_file_path || section.current.input != input_file_path
+            section.previous.input != input_file_path
+                || section.current.input != input_file_path
+                || section.previous.section_index != section.current.section_index
         })
     {
         return Ok(false);
@@ -4336,6 +4522,9 @@ fn object_diff_allows_dynamic_relocation_addition(
         || dynamic_relocation_patches
             .iter()
             .all(|patch| patch.input_range.is_none())
+        || dynamic_relocation_patches
+            .iter()
+            .any(|patch| patch.input_range.is_none())
         || dynamic_relocation_patches.iter().any(|patch| {
             patch.record.input_file != input_file_path
                 || patch.record.input != input_file_path
@@ -4354,37 +4543,47 @@ fn object_diff_allows_dynamic_relocation_addition(
     let Some(current_section_headers) = elf_section_headers(current_bytes) else {
         return Ok(false);
     };
-    let mut added_offsets_by_section = HashMap::<u32, HashSet<u64>>::new();
-    for patch in dynamic_relocation_patches
+    let mut any_added = false;
+    let section_indices = dynamic_relocation_patches
         .iter()
-        .filter(|patch| patch.input_range.is_some())
-    {
-        added_offsets_by_section
-            .entry(patch.record.section_index)
-            .or_default()
-            .insert(patch.record.relocation_offset);
-    }
-    if added_offsets_by_section.is_empty() {
-        return Ok(false);
-    }
-
-    for (section_index, added_offsets) in &added_offsets_by_section {
+        .map(|patch| patch.record.section_index)
+        .collect::<HashSet<_>>();
+    for section_index in section_indices {
         let previous_entries =
-            rela_entries_for_section(previous_bytes, &previous_section_headers, *section_index)
+            rela_entries_for_section(previous_bytes, &previous_section_headers, section_index)
                 .unwrap_or_default();
-        if !previous_entries.is_empty() {
+        let current_entries =
+            rela_entries_for_section(current_bytes, &current_section_headers, section_index)
+                .unwrap_or_default();
+        let previous_offsets = previous_entries
+            .iter()
+            .map(|entry| entry.offset)
+            .collect::<HashSet<_>>();
+        let current_offsets = current_entries
+            .iter()
+            .map(|entry| entry.offset)
+            .collect::<HashSet<_>>();
+        if !previous_offsets.is_subset(&current_offsets) {
             return Ok(false);
         }
-        let current_entries =
-            rela_entries_for_section(current_bytes, &current_section_headers, *section_index)
-                .unwrap_or_default();
-        if current_entries.is_empty()
-            || current_entries
-                .iter()
-                .any(|entry| !added_offsets.contains(&entry.offset))
+        let added_offsets = dynamic_relocation_patches
+            .iter()
+            .filter(|patch| {
+                patch.record.section_index == section_index
+                    && !previous_offsets.contains(&patch.record.relocation_offset)
+            })
+            .map(|patch| patch.record.relocation_offset)
+            .collect::<HashSet<_>>();
+        any_added |= !added_offsets.is_empty();
+        if current_offsets
+            .difference(&previous_offsets)
+            .any(|offset| !added_offsets.contains(offset))
         {
             return Ok(false);
         }
+    }
+    if !any_added {
+        return Ok(false);
     }
 
     let previous_file = object::File::parse(previous_bytes)
@@ -8204,6 +8403,74 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_relocation_patch_uses_free_slot_for_added_relocation() {
+        let previous = relocated_data_elf();
+        let current = relocated_data_elf_with_added_relocation();
+        let input_ref = encode_path(Path::new("input.o"));
+        let relocation = dynamic_relocation_record_with_output_info(
+            "input.o",
+            1,
+            4,
+            300,
+            24,
+            0x400040,
+            0x100000006,
+        );
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+        let sections = vec![generated_section_record(
+            "generated:.rela.dyn.general",
+            300,
+            48,
+        )];
+
+        let patches = added_dynamic_relocation_patches_for_input(
+            &current,
+            &previous,
+            &input_ref,
+            &[MatchedPatchSection::same(patch_section.clone())],
+            std::slice::from_ref(&relocation),
+            &sections,
+        )
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].record.relocation_offset, 6);
+        assert_eq!(patches[0].record.output_offset, 324);
+        assert_eq!(patches[0].record.output_r_offset, Some(0x400042));
+        assert_eq!(patches[0].record.output_r_info, Some(0x100000006));
+        assert_eq!(patches[0].input_range, Some(0xa8..0xb0));
+        assert_eq!(patches[0].patch.output_offset, 324);
+        assert_eq!(&patches[0].patch.data[0..8], &0x400042_u64.to_le_bytes());
+        assert_eq!(
+            &patches[0].patch.data[8..16],
+            &0x100000006_u64.to_le_bytes()
+        );
+        assert_eq!(&patches[0].patch.data[16..24], &9_i64.to_le_bytes());
+
+        let mut all_patches =
+            dynamic_relocation_patches_for_input(&current, &input_ref, [&relocation]).unwrap();
+        all_patches.extend(patches);
+        assert!(
+            object_diff_allows_dynamic_relocation_addition(
+                &previous,
+                &current,
+                &input_ref,
+                &[MatchedPatchSection::same(patch_section)],
+                &all_patches,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn object_diff_allows_dynamic_relocation_addition_from_metadata_only_change() {
         let current = relocated_data_elf();
         let mut previous = current.clone();
@@ -8828,6 +9095,25 @@ mod tests {
         bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0xa0_u64.to_le_bytes());
         bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&28_u64.to_le_bytes());
         bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
+    }
+
+    fn relocated_data_elf_with_added_relocation() -> Vec<u8> {
+        let mut bytes = relocated_data_elf();
+        let shstrtab = bytes[0xa0..0xbc].to_vec();
+        bytes[0xa0..0xc0].fill(0);
+        bytes[0xc0..0xdc].copy_from_slice(&shstrtab);
+
+        bytes[0x98..0xa0].copy_from_slice(&6_u64.to_le_bytes());
+        bytes[0xa0..0xa8].copy_from_slice(&1_u64.to_le_bytes());
+        bytes[0xa8..0xb0].copy_from_slice(&9_i64.to_le_bytes());
+
+        let rela_header = 0x100 + 128;
+        bytes[rela_header + 32..rela_header + 40].copy_from_slice(&48_u64.to_le_bytes());
+
+        let shstrtab_header = 0x100 + 192;
+        bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0xc0_u64.to_le_bytes());
 
         bytes
     }

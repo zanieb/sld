@@ -328,7 +328,10 @@ pub(crate) trait Platform:
 
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails];
 
-    fn finalise_group_layout(memory_offsets: &OutputSectionPartMap<u64>) -> Self::GroupLayoutExt;
+    fn finalise_group_layout(
+        common: &CommonGroupState<Self>,
+        memory_offsets: &OutputSectionPartMap<u64>,
+    ) -> Self::GroupLayoutExt;
 
     /// Resolves a reference to the frame data section.
     fn frame_data_base_address(memory_offsets: &OutputSectionPartMap<u64>) -> u64;
@@ -542,6 +545,15 @@ pub(crate) trait Platform:
         _last_part_id: PartId,
     ) -> Result<usize> {
         Ok(0)
+    }
+
+    fn apply_late_size_adjustments_prelude<'data>(
+        _common: &mut CommonGroupState<'data, Self>,
+        _current_sizes: &OutputSectionPartMap<u64>,
+        _extra_sizes: &mut OutputSectionPartMap<u64>,
+        _symbol_db: &SymbolDb<'data, Self>,
+    ) -> Result {
+        Ok(())
     }
 
     fn finalise_layout_epilogue<'data>(
