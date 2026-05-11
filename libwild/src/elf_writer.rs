@@ -270,6 +270,9 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                 &mut buffers,
                 group.format_specific.eh_frame_start_address,
                 *group_file_offsets.get(part_id::EH_FRAME) as u64,
+                *group_file_offsets.get(part_id::RELA_DYN_RELATIVE) as u64,
+                *group_file_offsets.get(part_id::RELA_DYN_GENERAL) as u64,
+                *group_file_offsets.get(part_id::RELR_DYN) as u64,
             );
 
             for file in &group.files {
@@ -631,6 +634,9 @@ struct TableWriter<'layout, 'out> {
     rela_dyn_relative: &'out mut [crate::elf::Rela],
     rela_dyn_general: &'out mut [crate::elf::Rela],
     relr_dyn: Option<&'out mut [elf::Relr]>,
+    rela_dyn_relative_next_file_offset: u64,
+    rela_dyn_general_next_file_offset: u64,
+    relr_dyn_next_file_offset: u64,
     dynsym_writer: SymbolTableWriter<'layout, 'out>,
     debug_symbol_writer: SymbolTableWriter<'layout, 'out>,
     eh_frame_start_address: u64,
@@ -645,6 +651,12 @@ struct TableWriter<'layout, 'out> {
     version_writer: VersionWriter<'out>,
 }
 
+struct DynamicRelocationWrite {
+    value: u64,
+    output_offset: u64,
+    size: u64,
+}
+
 impl<'layout, 'out> TableWriter<'layout, 'out> {
     fn from_layout(
         layout: &'layout ElfLayout,
@@ -653,6 +665,9 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         buffers: &mut OutputSectionPartMap<&'out mut [u8]>,
         eh_frame_start_address: u64,
         eh_frame_start_file_offset: u64,
+        rela_dyn_relative_start_file_offset: u64,
+        rela_dyn_general_start_file_offset: u64,
+        relr_dyn_start_file_offset: u64,
     ) -> TableWriter<'layout, 'out> {
         let dynsym_writer =
             SymbolTableWriter::new_dynamic(dynstr_start_offset, buffers, &layout.output_sections);
@@ -667,6 +682,9 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
             debug_symbol_writer,
             eh_frame_start_address,
             eh_frame_start_file_offset,
+            rela_dyn_relative_start_file_offset,
+            rela_dyn_general_start_file_offset,
+            relr_dyn_start_file_offset,
             layout.symbol_db.args.is_relr_enabled(),
         )
     }
@@ -679,6 +697,9 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         debug_symbol_writer: SymbolTableWriter<'layout, 'out>,
         eh_frame_start_address: u64,
         eh_frame_start_file_offset: u64,
+        rela_dyn_relative_start_file_offset: u64,
+        rela_dyn_general_start_file_offset: u64,
+        relr_dyn_start_file_offset: u64,
         pack_relative_relocs: bool,
     ) -> TableWriter<'layout, 'out> {
         let eh_frame = buffers.take(part_id::EH_FRAME);
@@ -702,6 +723,9 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
             relr_dyn: pack_relative_relocs
                 .then(|| slice_from_all_bytes_mut(buffers.take(part_id::RELR_DYN)))
                 .filter(|b| !b.is_empty()),
+            rela_dyn_relative_next_file_offset: rela_dyn_relative_start_file_offset,
+            rela_dyn_general_next_file_offset: rela_dyn_general_start_file_offset,
+            relr_dyn_next_file_offset: relr_dyn_start_file_offset,
             dynsym_writer,
             debug_symbol_writer,
             eh_frame_start_address,
@@ -1082,6 +1106,15 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         place: u64,
         relative_address: u64,
     ) -> Result<u64> {
+        self.write_address_relocation_with_offset::<A>(place, relative_address)
+            .map(|written| written.value)
+    }
+
+    fn write_address_relocation_with_offset<A: Arch<Platform = Elf>>(
+        &mut self,
+        place: u64,
+        relative_address: u64,
+    ) -> Result<DynamicRelocationWrite> {
         debug_assert_bail!(
             self.output_kind.is_relocatable(),
             "write_address_relocation called when output is not relocatable"
@@ -1091,34 +1124,41 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         if let Some(relr_writer) = &mut self.relr_dyn
             && place.is_multiple_of(2)
         {
+            let output_offset = self.relr_dyn_next_file_offset;
             let relr = relr_writer
                 .split_off_first_mut()
                 .ok_or_else(|| insufficient_allocation(".relr.dyn"))?;
+            self.relr_dyn_next_file_offset += elf::RELR_ENTRY_SIZE;
             relr.0.set(LittleEndian, place);
-            Ok(relative_address)
+            Ok(DynamicRelocationWrite {
+                value: relative_address,
+                output_offset,
+                size: elf::RELR_ENTRY_SIZE,
+            })
         } else {
-            let rela = self
-                .rela_dyn_relative
-                .split_off_first_mut()
-                .ok_or_else(|| insufficient_allocation(".rela.dyn (relative)"))?;
+            let (rela, output_offset) = self.take_rela_dyn_relative_with_file_offset()?;
             rela.r_offset.set(e, place);
             rela.r_addend.set(e, relative_address as i64);
             rela.r_info.set(
                 e,
                 A::get_dynamic_relocation_type(DynamicRelocationKind::Relative).into(),
             );
-            Ok(0)
+            Ok(DynamicRelocationWrite {
+                value: 0,
+                output_offset,
+                size: elf::RELA_ENTRY_SIZE,
+            })
         }
     }
 
-    fn write_ifunc_relocation_for_data<A: Arch<Platform = Elf>>(
+    fn write_ifunc_relocation_for_data_with_offset<A: Arch<Platform = Elf>>(
         &mut self,
         place: u64,
         resolver_address: i64,
-    ) -> Result {
+    ) -> Result<u64> {
         // IRELATIVE relocations go in .rela.dyn general section, not the relative section,
         // because the dynamic linker expects only R_X86_64_RELATIVE in the relative section.
-        self.write_rela_dyn_general(
+        self.write_rela_dyn_general_with_offset(
             place,
             0, // No dynamic symbol for IRELATIVE
             A::get_dynamic_relocation_type(DynamicRelocationKind::Irelative),
@@ -1133,13 +1173,24 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         symbol_index: u32,
         kind: DynamicRelocationKind,
     ) -> Result {
+        self.write_dynamic_symbol_relocation_with_offset::<A>(place, addend, symbol_index, kind)
+            .map(|_| ())
+    }
+
+    fn write_dynamic_symbol_relocation_with_offset<A: Arch<Platform = Elf>>(
+        &mut self,
+        place: u64,
+        addend: i64,
+        symbol_index: u32,
+        kind: DynamicRelocationKind,
+    ) -> Result<u64> {
         let _span = tracing::trace_span!("write_dynamic_symbol_relocation").entered();
         debug_assert_bail!(
             self.output_kind.needs_dynsym(),
             "Tried to write dynamic relocation with non-relocatable output"
         );
         let e = LittleEndian;
-        let rela = self.take_rela_dyn()?;
+        let (rela, output_offset) = self.take_rela_dyn_with_file_offset()?;
         rela.r_offset.set(e, place);
         rela.r_addend.set(e, addend);
         rela.set_r_info(
@@ -1148,7 +1199,7 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
             symbol_index,
             A::get_dynamic_relocation_type(kind),
         );
-        Ok(())
+        Ok(output_offset)
     }
 
     fn write_rela_dyn_general(
@@ -1158,22 +1209,52 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         r_type: u32,
         addend: i64,
     ) -> Result {
+        self.write_rela_dyn_general_with_offset(place, dynamic_symbol_index, r_type, addend)
+            .map(|_| ())
+    }
+
+    fn write_rela_dyn_general_with_offset(
+        &mut self,
+        place: u64,
+        dynamic_symbol_index: u32,
+        r_type: u32,
+        addend: i64,
+    ) -> Result<u64> {
         debug_assert_bail!(
             self.output_kind.needs_dynsym(),
             "write_rela_dyn_general called when output is not dynamic"
         );
-        let rela = self.take_rela_dyn()?;
+        let (rela, output_offset) = self.take_rela_dyn_with_file_offset()?;
         rela.r_offset.set(LittleEndian, place);
         rela.r_addend.set(LittleEndian, addend);
         rela.set_r_info(LittleEndian, false, dynamic_symbol_index, r_type);
-        Ok(())
+        Ok(output_offset)
     }
 
-    fn take_rela_dyn(&mut self) -> Result<&mut object::elf::Rela64<LittleEndian>> {
+    fn take_rela_dyn_with_file_offset(
+        &mut self,
+    ) -> Result<(&mut object::elf::Rela64<LittleEndian>, u64)> {
         tracing::trace!("Consume .rela.dyn general");
-        self.rela_dyn_general
+        let output_offset = self.rela_dyn_general_next_file_offset;
+        let rela = self
+            .rela_dyn_general
             .split_off_first_mut()
-            .ok_or_else(|| insufficient_allocation(".rela.dyn (non-relative)"))
+            .ok_or_else(|| insufficient_allocation(".rela.dyn (non-relative)"))?;
+        self.rela_dyn_general_next_file_offset += elf::RELA_ENTRY_SIZE;
+        Ok((rela, output_offset))
+    }
+
+    fn take_rela_dyn_relative_with_file_offset(
+        &mut self,
+    ) -> Result<(&mut object::elf::Rela64<LittleEndian>, u64)> {
+        tracing::trace!("Consume .rela.dyn relative");
+        let output_offset = self.rela_dyn_relative_next_file_offset;
+        let rela = self
+            .rela_dyn_relative
+            .split_off_first_mut()
+            .ok_or_else(|| insufficient_allocation(".rela.dyn (relative)"))?;
+        self.rela_dyn_relative_next_file_offset += elf::RELA_ENTRY_SIZE;
+        Ok((rela, output_offset))
     }
 
     fn take_eh_frame_hdr(&mut self) -> &'out mut EhFrameHdr {
@@ -1963,6 +2044,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             section_index,
             table_writer,
             trace,
+            incremental,
             out,
         );
     }
@@ -1980,6 +2062,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             layout,
             table_writer,
             trace,
+            incremental,
         ),
         elf::RelocationList::Crel(crel_iter) => apply_relocations::<A, Crel, _>(
             object,
@@ -1989,6 +2072,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             layout,
             table_writer,
             trace,
+            incremental,
         ),
     };
     result.with_context(|| {
@@ -2011,6 +2095,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
     section_index: object::SectionIndex,
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
+    incremental: &PreparedState,
     out: &mut [u8],
 ) -> Result {
     const WORD_SIZE: usize = core::mem::size_of::<u64>();
@@ -2044,6 +2129,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
             layout,
             table_writer,
             trace,
+            incremental,
         ),
         elf::RelocationList::Crel(crel_iter) => apply_relocations::<A, Crel, _>(
             object,
@@ -2058,6 +2144,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
             layout,
             table_writer,
             trace,
+            incremental,
         ),
     };
 
@@ -2385,6 +2472,7 @@ fn apply_relocations<
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
+    incremental: &PreparedState,
 ) -> Result {
     let section_address = object.section_resolutions[section_index.0]
         .address()
@@ -2429,11 +2517,13 @@ fn apply_relocations<
                 is_writable: object_section.is_writable(),
                 section_flags,
                 part_id: object.section_part_id(section_index, &layout.symbol_db.section_part_ids),
+                source_section_index: Some(section_index),
             },
             layout,
             out,
             table_writer,
             trace,
+            incremental,
             &relocation_cache,
             &relocations,
             relax_deltas,
@@ -2696,11 +2786,13 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
                         // .eh_frame relocations never need thunks; use the eh_frame section's
                         // base part as a placeholder so the thunk lookup always misses.
                         part_id: output_section_id::EH_FRAME.base_part_id(),
+                        source_section_index: None,
                     },
                     layout,
                     entry_out,
                     table_writer,
                     trace,
+                    incremental,
                     &RelocationCache::default(),
                     &iter::empty(),
                     None,
@@ -2796,6 +2888,7 @@ struct SectionInfo<S: platform::SectionFlags> {
     is_writable: bool,
     section_flags: S,
     part_id: crate::part_id::PartId,
+    source_section_index: Option<object::SectionIndex>,
 }
 
 fn get_resolution<'data, R: Relocation>(
@@ -2997,6 +3090,7 @@ fn apply_relocation<
     out: &mut [u8],
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
+    incremental: &PreparedState,
     relocation_cache: &RelocationCache<R>,
     relocation_iterator: &I,
     relax_deltas: Option<&SectionRelaxDeltas>,
@@ -3069,6 +3163,7 @@ fn apply_relocation<
             symbol_index,
             object_layout,
             layout,
+            incremental,
         )?,
         RelocationKind::AbsoluteSet
         | RelocationKind::AbsoluteSetWord6
@@ -3666,6 +3761,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
     symbol_index: object::SymbolIndex,
     object_layout: &ObjectLayout<'data, Elf>,
     layout: &ElfLayout,
+    incremental: &PreparedState,
 ) -> Result<u64> {
     if !section_info.section_flags.is_alloc() {
         resolution.value_with_addend(
@@ -3683,20 +3779,36 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
         // Weak undefined symbol referenced from a read-only section. Fill in as zero.
         Ok(0)
     } else if resolution.flags.is_interposable() && section_info.is_writable {
-        table_writer.write_dynamic_symbol_relocation::<A>(
+        let output_offset = table_writer.write_dynamic_symbol_relocation_with_offset::<A>(
             place,
             addend,
             resolution.dynamic_symbol_index()?,
             DynamicRelocationKind::Absolute,
         )?;
+        record_dynamic_relocation_for_section(
+            incremental,
+            object_layout,
+            section_info,
+            output_offset,
+            elf::RELA_ENTRY_SIZE,
+        );
 
         Ok(0)
     } else if resolution.flags.is_ifunc()
         && section_info.is_writable
         && table_writer.output_kind.is_relocatable()
     {
-        table_writer
-            .write_ifunc_relocation_for_data::<A>(place, resolution.raw_value as i64 + addend)?;
+        let output_offset = table_writer.write_ifunc_relocation_for_data_with_offset::<A>(
+            place,
+            resolution.raw_value as i64 + addend,
+        )?;
+        record_dynamic_relocation_for_section(
+            incremental,
+            object_layout,
+            section_info,
+            output_offset,
+            elf::RELA_ENTRY_SIZE,
+        );
         Ok(0)
     } else if table_writer.output_kind.is_relocatable() && !resolution.is_absolute() {
         let address = resolution.value_with_addend(
@@ -3707,7 +3819,15 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             &layout.merged_strings,
             &layout.merged_string_start_addresses,
         )?;
-        table_writer.write_address_relocation::<A>(place, address)
+        let written = table_writer.write_address_relocation_with_offset::<A>(place, address)?;
+        record_dynamic_relocation_for_section(
+            incremental,
+            object_layout,
+            section_info,
+            written.output_offset,
+            written.size,
+        );
+        Ok(written.value)
     } else {
         resolution.value_with_addend(
             addend,
@@ -3717,6 +3837,23 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             &layout.merged_strings,
             &layout.merged_string_start_addresses,
         )
+    }
+}
+
+fn record_dynamic_relocation_for_section(
+    incremental: &PreparedState,
+    object_layout: &ObjectLayout<'_, Elf>,
+    section_info: SectionInfo<impl platform::SectionFlags>,
+    output_offset: u64,
+    size: u64,
+) {
+    if let Some(section_index) = section_info.source_section_index {
+        incremental.record_dynamic_relocation(
+            object_layout.input,
+            section_index,
+            output_offset,
+            size,
+        );
     }
 }
 
@@ -5967,6 +6104,9 @@ pub(crate) fn verify_resolution_allocation(
         &mut buffers,
         dynsym_writer,
         debug_symbol_writer,
+        0,
+        0,
+        0,
         0,
         0,
         args.is_relr_enabled(),

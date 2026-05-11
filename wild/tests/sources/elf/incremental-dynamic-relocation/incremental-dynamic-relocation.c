@@ -11,6 +11,7 @@
 //#TestIncrementalChangedInput:incremental-dynamic-relocation.c.o
 //#TestIncrementalChangedSection:.rela.data.rel.incremental_dynamic
 //#TestIncrementalChangedSectionOffset:16
+//#TestIncrementalStateContains:dynrel\t
 
 extern int dynamic_relocation_target;
 
