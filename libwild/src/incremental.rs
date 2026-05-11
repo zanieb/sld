@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v13";
+const STATE_VERSION: &str = "wild-incremental-state-v14";
+const STATE_VERSION_V13: &str = "wild-incremental-state-v13";
 const STATE_VERSION_V12: &str = "wild-incremental-state-v12";
 const STATE_VERSION_V11: &str = "wild-incremental-state-v11";
 const STATE_VERSION_V10: &str = "wild-incremental-state-v10";
@@ -119,6 +120,7 @@ struct FilePatchSectionState {
     input_size: u64,
     output_offset: u64,
     output_size: u64,
+    data_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -411,32 +413,42 @@ fn patch_changed_inputs(
                 )));
             }
 
-            let (mut matched_sections, matched_changed_sections) =
-                match match_patch_sections(state_dir, input, &bytes, &previous_patch.sections)? {
-                    Some(matched_sections) => (
-                        matched_sections.sections,
-                        Some(matched_sections.changed_sections),
-                    ),
-                    None if previous_patch
+            let matched_patch_sections = if let Some(matched) =
+                match_patch_sections_from_current_hashes(
+                    &bytes,
+                    input.path.as_str(),
+                    &previous_patch.sections,
+                )? {
+                Some(matched)
+            } else {
+                match_patch_sections(state_dir, input, &bytes, &previous_patch.sections)?
+            };
+
+            let (mut matched_sections, matched_changed_sections) = match matched_patch_sections {
+                Some(matched_sections) => (
+                    matched_sections.sections,
+                    Some(matched_sections.changed_sections),
+                ),
+                None if previous_patch
+                    .sections
+                    .iter()
+                    .any(|section| section.section_name.is_none()) =>
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "could not match anonymous patch sections in `{}`",
+                        path.display()
+                    )));
+                }
+                None => (
+                    previous_patch
                         .sections
                         .iter()
-                        .any(|section| section.section_name.is_none()) =>
-                    {
-                        return Ok(ChangedInputPatchResult::Unsupported(format!(
-                            "could not match anonymous patch sections in `{}`",
-                            path.display()
-                        )));
-                    }
-                    None => (
-                        previous_patch
-                            .sections
-                            .iter()
-                            .cloned()
-                            .map(MatchedPatchSection::same)
-                            .collect(),
-                        None,
-                    ),
-                };
+                        .cloned()
+                        .map(MatchedPatchSection::same)
+                        .collect(),
+                    None,
+                ),
+            };
             let matched_from_snapshot = matched_changed_sections.is_some();
             let mut current_sections = matched_sections
                 .iter()
@@ -528,6 +540,7 @@ fn patch_changed_inputs(
                     input_size: section.input_size,
                     output_offset: section.output_offset,
                     output_size: section.output_size,
+                    data_hash: section.data_hash.clone(),
                 })
                 .collect(),
         });
@@ -718,6 +731,7 @@ fn patch_sections_from_previous_state(
                 input_size: section.input_size,
                 output_offset: section.output_offset,
                 output_size: section.output_size,
+                data_hash: section.data_hash.clone(),
             })
             .collect(),
     })
@@ -802,6 +816,7 @@ struct PatchSection {
     input_size: u64,
     output_offset: u64,
     output_size: u64,
+    data_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1222,6 +1237,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V13
             && version != STATE_VERSION_V12
             && version != STATE_VERSION_V11
             && version != STATE_VERSION_V10
@@ -1274,6 +1290,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V13
             || version == STATE_VERSION_V12
             || version == STATE_VERSION_V11
             || version == STATE_VERSION_V10
@@ -1750,6 +1767,7 @@ fn record_patch_fingerprints(
                     input_size: section.input_size,
                     output_offset: section.output_offset,
                     output_size: section.output_size,
+                    data_hash: section.data_hash.clone(),
                 })
                 .collect(),
         });
@@ -1850,6 +1868,7 @@ fn direct_copy_patch_sections<'a>(
                     input_size: data.len() as u64,
                     output_offset: record.output_offset,
                     output_size: record.size,
+                    data_hash: Some(hash_bytes(data)),
                 });
             }
         }
@@ -2154,6 +2173,40 @@ fn patch_fingerprint(
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
+fn match_patch_sections_from_current_hashes(
+    current_bytes: &[u8],
+    input_file_path: &str,
+    sections: &[PatchSection],
+) -> Result<Option<MatchedPatchSections>> {
+    if sections.is_empty()
+        || sections
+            .iter()
+            .any(|section| section.section_name.is_none() || section.data_hash.is_none())
+    {
+        return Ok(None);
+    }
+
+    let Some(current_sections) =
+        resolve_current_patch_sections(current_bytes, input_file_path, sections.iter().cloned())?
+    else {
+        return Ok(None);
+    };
+
+    let mut matched_sections = Vec::with_capacity(sections.len());
+    let mut changed_sections = Vec::new();
+    for (previous, current) in sections.iter().cloned().zip(current_sections) {
+        if previous.data_hash != current.data_hash {
+            changed_sections.push(current.clone());
+        }
+        matched_sections.push(MatchedPatchSection { previous, current });
+    }
+
+    Ok(Some(MatchedPatchSections {
+        sections: matched_sections,
+        changed_sections,
+    }))
+}
+
 fn match_patch_sections(
     state_dir: &Path,
     previous_input: &FileState,
@@ -2237,6 +2290,7 @@ fn match_patch_sections(
                 .context("Failed to read current incremental patch section data")?;
             previous.input_size = previous_data.len() as u64;
             current.input_size = current_data.len() as u64;
+            current.data_hash = Some(hash_bytes(current_data));
             if previous_data != current_data {
                 changed_sections.push(current.clone());
             }
@@ -2500,6 +2554,7 @@ fn resolved_patch_sections_for_input(
             let mut resolved_section = patch_section.clone();
             resolved_section.section_index = section_index.0 as u32;
             resolved_section.input_size = data.len() as u64;
+            resolved_section.data_hash = Some(hash_bytes(data));
             patches[stored_section_index] = Some(ResolvedSectionPatch {
                 section: resolved_section,
                 patch: SectionPatch {
@@ -3210,7 +3265,7 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
         .iter()
         .map(|section| {
             format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 section.input,
                 section.section_index,
                 section.input_size,
@@ -3220,7 +3275,8 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
                     .section_name
                     .as_ref()
                     .map(|name| hex::encode(name.as_bytes()))
-                    .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+                    .unwrap_or_else(|| ABSENT_FIELD.to_owned()),
+                section.data_hash.as_deref().unwrap_or(ABSENT_FIELD)
             )
         })
         .collect::<Vec<_>>()
@@ -3238,9 +3294,14 @@ fn parse_patch_sections(default_input: &str, sections: &str) -> Result<Vec<FileP
     let mut parsed = Vec::new();
     for section in sections.split(',') {
         let parts = section.split(':').collect::<Vec<_>>();
-        let (input, parts) = match parts.len() {
-            4 | 5 => (default_input.to_owned(), parts.as_slice()),
-            6 => (parts[0].to_owned(), &parts[1..]),
+        let (input, parts, data_hash) = match parts.len() {
+            4 | 5 => (default_input.to_owned(), parts.as_slice(), None),
+            6 => (parts[0].to_owned(), &parts[1..], None),
+            7 => (
+                parts[0].to_owned(),
+                &parts[1..6],
+                (parts[6] != ABSENT_FIELD).then(|| parts[6].to_owned()),
+            ),
             _ => return Ok(Vec::new()),
         };
         if parts.len() != 4 && parts.len() != 5 {
@@ -3271,6 +3332,7 @@ fn parse_patch_sections(default_input: &str, sections: &str) -> Result<Vec<FileP
             output_size: parts[3]
                 .parse()
                 .context("Invalid incremental patch section output size")?,
+            data_hash,
         });
     }
     Ok(parsed)
@@ -4117,6 +4179,7 @@ mod tests {
             input_size: size,
             output_offset: 64,
             output_size: size,
+            data_hash: None,
         };
 
         assert_eq!(
@@ -4175,6 +4238,7 @@ mod tests {
             input_size: size,
             output_offset: 64,
             output_size: size,
+            data_hash: None,
         };
 
         let matched = match_patch_sections(&state_dir, &previous, &current, &[patch_section])
@@ -4212,6 +4276,7 @@ mod tests {
             input_size: 4,
             output_offset: 64,
             output_size: 8,
+            data_hash: None,
         };
         let mut current = bytes.clone();
         current[0x44] = 5;
@@ -4225,6 +4290,73 @@ mod tests {
         assert_eq!(matched.changed_sections.len(), 1);
         assert_eq!(matched.sections[0].current.input_size, 5);
         assert_eq!(matched.changed_sections[0].input_size, 5);
+    }
+
+    #[test]
+    fn match_patch_sections_uses_current_hashes_for_stable_names() {
+        let bytes = growable_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: Some(hash_bytes(&[1, 2, 3, 4])),
+        };
+        let mut current = bytes.clone();
+        current[0x40] = 9;
+
+        let matched =
+            match_patch_sections_from_current_hashes(&current, &input_ref, &[patch_section])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(matched.sections.len(), 1);
+        assert_eq!(matched.sections[0].current.section_index, 1);
+        assert_eq!(
+            matched.sections[0].current.data_hash.as_deref(),
+            Some(hash_bytes(&[9, 2, 3, 4]).as_str())
+        );
+        assert_eq!(matched.changed_sections.len(), 1);
+        assert_eq!(
+            matched.changed_sections[0].data_hash.as_deref(),
+            Some(hash_bytes(&[9, 2, 3, 4]).as_str())
+        );
+    }
+
+    #[test]
+    fn current_hash_matching_requires_stable_names_and_hashes() {
+        let bytes = growable_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let mut patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+
+        assert!(
+            match_patch_sections_from_current_hashes(
+                &bytes,
+                &input_ref,
+                std::slice::from_ref(&patch_section),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        patch_section.data_hash = Some(hash_bytes(&[1, 2, 3, 4]));
+        patch_section.section_name = None;
+        assert!(
+            match_patch_sections_from_current_hashes(&bytes, &input_ref, &[patch_section])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4286,6 +4418,7 @@ mod tests {
             input_size: 8,
             output_offset: 64,
             output_size: 16,
+            data_hash: None,
         };
         let current = PatchSection {
             input: input_ref.clone(),
@@ -4294,6 +4427,7 @@ mod tests {
             input_size: 9,
             output_offset: 64,
             output_size: 16,
+            data_hash: None,
         };
 
         assert!(update_section_records_for_matched_patches(
@@ -4317,6 +4451,7 @@ mod tests {
             input_size: 8,
             output_offset: 64,
             output_size: 16,
+            data_hash: None,
         };
         let current = PatchSection {
             input: input_ref,
@@ -4325,6 +4460,7 @@ mod tests {
             input_size: 9,
             output_offset: 64,
             output_size: 16,
+            data_hash: None,
         };
         let mut matched_sections = vec![MatchedPatchSection::same(previous.clone())];
 
@@ -4369,6 +4505,7 @@ mod tests {
             input_size: size,
             output_offset: 64,
             output_size: size - 1,
+            data_hash: None,
         };
 
         assert!(
@@ -4389,6 +4526,7 @@ mod tests {
             input_size: 4,
             output_offset: 64,
             output_size: 8,
+            data_hash: None,
         };
         let previous_fingerprint = patch_fingerprint(&bytes, &input_ref, [patch_section.clone()])
             .unwrap()
@@ -4424,6 +4562,7 @@ mod tests {
             input_size: 8,
             output_offset: 64,
             output_size: 8,
+            data_hash: None,
         };
         let previous_fingerprint = patch_fingerprint(&bytes, &input_ref, [patch_section.clone()])
             .unwrap()
@@ -4461,6 +4600,7 @@ mod tests {
             input_size: 4,
             output_offset: 64,
             output_size: 8,
+            data_hash: None,
         };
 
         let resolved = resolve_current_patch_sections(&bytes, &input_ref, [patch_section])
@@ -4606,6 +4746,7 @@ mod tests {
             input_size: size,
             output_offset: 64,
             output_size: size,
+            data_hash: None,
         };
 
         assert!(
@@ -4765,6 +4906,7 @@ mod tests {
                     input_size: 0,
                     output_offset: 0,
                     output_size: 0,
+                    data_hash: None,
                 }],
             }),
         };
@@ -4849,6 +4991,7 @@ mod tests {
                     input_size: 4,
                     output_offset: 100,
                     output_size: 4,
+                    data_hash: Some("text-hash".to_owned()),
                 },
                 FilePatchSectionState {
                     input: hex::encode("a.o"),
@@ -4857,6 +5000,7 @@ mod tests {
                     input_size: 8,
                     output_offset: 112,
                     output_size: 12,
+                    data_hash: Some("data-hash".to_owned()),
                 },
                 FilePatchSectionState {
                     input: hex::encode("a.o"),
@@ -4865,6 +5009,7 @@ mod tests {
                     input_size: 16,
                     output_offset: 128,
                     output_size: 16,
+                    data_hash: None,
                 },
             ],
         });
@@ -4873,7 +5018,7 @@ mod tests {
         let rendered = state.render();
 
         assert!(rendered.contains(&format!(
-            "\tpatch-hash\t{}:1:4:100:4:{},{}:3:8:112:12:{},{}:5:16:128:16:-\n",
+            "\tpatch-hash\t{}:1:4:100:4:{}:text-hash,{}:3:8:112:12:{}:data-hash,{}:5:16:128:16:-:-\n",
             hex::encode("a.o"),
             hex::encode(".text.foo"),
             hex::encode("a.o"),
@@ -4895,6 +5040,7 @@ mod tests {
                     input_size: 4,
                     output_offset: 200,
                     output_size: 8,
+                    data_hash: Some("text-hash".to_owned()),
                 },
                 FilePatchSectionState {
                     input: hex::encode("a.o"),
@@ -4903,6 +5049,7 @@ mod tests {
                     input_size: 4,
                     output_offset: 100,
                     output_size: 4,
+                    data_hash: Some("data-hash".to_owned()),
                 },
             ],
         };
@@ -4936,6 +5083,7 @@ mod tests {
                     input_size: 4,
                     output_offset: 100,
                     output_size: 4,
+                    data_hash: Some("patch-section-hash".to_owned()),
                 }],
             }),
         }];
@@ -4965,6 +5113,7 @@ mod tests {
                     input_size: 4,
                     output_offset: 100,
                     output_size: 4,
+                    data_hash: Some("patch-section-hash".to_owned()),
                 }],
             }),
         }];
@@ -5011,6 +5160,34 @@ mod tests {
 
         assert_eq!(parsed.sections.len(), 1);
         assert!(parsed.wild_version.is_none());
+    }
+
+    #[test]
+    fn v13_patch_metadata_is_accepted_without_section_hashes() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "patch-hash".to_owned(),
+            sections: vec![FilePatchSectionState {
+                input: hex::encode("a.o"),
+                section_index: 1,
+                section_name: Some(".data".to_owned()),
+                input_size: 4,
+                output_offset: 100,
+                output_size: 8,
+                data_hash: Some("section-hash".to_owned()),
+            }],
+        });
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V13, 1)
+            .replace(":section-hash", "");
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+        let patch = parsed.input_files[0].patch.as_ref().unwrap();
+
+        assert_eq!(patch.sections.len(), 1);
+        assert_eq!(patch.sections[0].section_name.as_deref(), Some(".data"));
+        assert_eq!(patch.sections[0].data_hash, None);
     }
 
     #[test]
