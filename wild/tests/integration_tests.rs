@@ -170,6 +170,9 @@
 //! TestIncrementalRemovedInput:{filename} Whether to extend TestIncremental by removing the named
 //! linker input, then checking that the relink reuses unchanged sections.
 //!
+//! TestIncrementalReorderedInputs:{bool} Whether to extend TestIncremental by reversing the input
+//! list, then checking that the relink does not reuse stale output from the old input order.
+//!
 //! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
@@ -810,6 +813,7 @@ struct Config {
     test_incremental_interrupted: bool,
     test_incremental_added_input: Option<String>,
     test_incremental_removed_input: Option<String>,
+    test_incremental_reordered_inputs: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
@@ -1413,6 +1417,7 @@ impl Config {
             test_incremental_interrupted: false,
             test_incremental_added_input: None,
             test_incremental_removed_input: None,
+            test_incremental_reordered_inputs: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
@@ -1822,6 +1827,9 @@ fn process_directive(
         }
         "TestIncrementalRemovedInput" => {
             config.test_incremental_removed_input = Some(arg.to_owned());
+        }
+        "TestIncrementalReorderedInputs" => {
+            config.test_incremental_reordered_inputs = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedExpectPatch" => {
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
@@ -2603,6 +2611,60 @@ impl ProgramInputs {
                 bail!(
                     "Incremental test failed for {}: removed-input relink did not reuse unchanged \
                     sections. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+        }
+
+        if config.test_incremental_reordered_inputs {
+            if inputs.len() < 2 {
+                bail!(
+                    "Incremental reordered-input test for {} needs at least two inputs",
+                    self.name()
+                );
+            }
+            let mut reordered_inputs = inputs.to_vec();
+            reordered_inputs.reverse();
+
+            let link_output_reordered = Linker::Wild.link(
+                self.name(),
+                &reordered_inputs,
+                &incremental_config,
+                cross_arch,
+            )?;
+            let reordered_content =
+                std::fs::read(&link_output_reordered.binary).with_context(|| {
+                    format!(
+                        "Failed to read reordered-input incremental output: {}",
+                        link_output_reordered.binary.display()
+                    )
+                })?;
+            let link_output_reordered_full =
+                Linker::Wild.link(self.name(), &reordered_inputs, config, cross_arch)?;
+            let reordered_full_content = std::fs::read(&link_output_reordered_full.binary)
+                .with_context(|| {
+                    format!(
+                        "Failed to read reordered-input full output: {}",
+                        link_output_reordered_full.binary.display()
+                    )
+                })?;
+            if reordered_content != reordered_full_content {
+                let diffs = sections_with_diffs(&reordered_content, &reordered_full_content)?;
+                bail!(
+                    "Incremental test failed for {}: reordered-input incremental output differs \
+                    from a full relink of the same inputs. Diffs:\n{diffs:#?}",
+                    self.name()
+                );
+            }
+
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if !log.contains("full relink: input file order changed") {
+                bail!(
+                    "Incremental test failed for {}: reordered-input relink did not record the \
+                    input-order change. Log:\n{}",
                     self.name(),
                     log
                 );

@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v16";
+const STATE_VERSION: &str = "wild-incremental-state-v17";
+const STATE_VERSION_V16: &str = "wild-incremental-state-v16";
 const STATE_VERSION_V15: &str = "wild-incremental-state-v15";
 const STATE_VERSION_V14: &str = "wild-incremental-state-v14";
 const STATE_VERSION_V13: &str = "wild-incremental-state-v13";
@@ -82,6 +83,7 @@ struct CurrentState {
     state_dir: PathBuf,
     args_hash: String,
     link_options_hash: String,
+    input_order_hash: String,
     wild_version: String,
     input_files: Vec<FileState>,
 }
@@ -90,6 +92,7 @@ struct CurrentState {
 struct PersistedState {
     args_hash: String,
     link_options_hash: Option<String>,
+    input_order_hash: Option<String>,
     wild_version: Option<String>,
     output: FileContentState,
     build_id_hashes: Option<BuildIdHashState>,
@@ -181,6 +184,7 @@ pub(crate) fn maybe_prepare(
                 state_dir: state_dir_for_output(args.output()),
                 args_hash: String::new(),
                 link_options_hash: String::new(),
+                input_order_hash: String::new(),
                 wild_version: String::new(),
                 input_files: Vec::new(),
             },
@@ -684,6 +688,7 @@ fn patch_changed_inputs(
     PersistedState {
         args_hash: previous.args_hash,
         link_options_hash: previous.link_options_hash,
+        input_order_hash: previous.input_order_hash,
         wild_version: previous.wild_version,
         output,
         build_id_hashes,
@@ -1080,6 +1085,7 @@ impl PreparedState {
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
             link_options_hash: Some(self.current.link_options_hash.clone()),
+            input_order_hash: Some(self.current.input_order_hash.clone()),
             wild_version: Some(self.current.wild_version.clone()),
             output,
             build_id_hashes,
@@ -1163,6 +1169,22 @@ fn classify_incremental_mode(
         };
     }
 
+    match previous.input_order_hash.as_deref() {
+        Some(previous_order) if current.input_order_hash == previous_order => {}
+        Some(_) => {
+            return IncrementalMode::Relink {
+                reason: "input file order changed".to_owned(),
+                can_reuse_unchanged_sections: true,
+            };
+        }
+        None => {
+            return IncrementalMode::Relink {
+                reason: "input file order missing from previous state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            };
+        }
+    }
+
     IncrementalMode::Reuse
 }
 
@@ -1218,6 +1240,7 @@ impl CurrentState {
             state_dir: state_dir_for_output(args.output()),
             args_hash: args_hash(args),
             link_options_hash: link_options_hash(args),
+            input_order_hash: input_order_hash(file_loader),
             wild_version: wild_version(args),
             input_files: fingerprint_loaded_files(file_loader, previous),
         }
@@ -1274,6 +1297,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V16
             && version != STATE_VERSION_V15
             && version != STATE_VERSION_V14
             && version != STATE_VERSION_V13
@@ -1309,6 +1333,19 @@ impl PersistedState {
                 "Missing incremental link-options hash in incremental state"
             ));
         }
+        let input_order_hash = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("input-order\t"))
+        {
+            Some(parse_prefixed_line(lines.next(), "input-order")?.to_owned())
+        } else {
+            None
+        };
+        if version == STATE_VERSION && input_order_hash.is_none() {
+            return Err(crate::error!(
+                "Missing incremental input-order hash in incremental state"
+            ));
+        }
         let wild_version = if lines
             .peek()
             .is_some_and(|line| line.starts_with("wild-version\t"))
@@ -1342,6 +1379,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V16
             || version == STATE_VERSION_V15
             || version == STATE_VERSION_V14
             || version == STATE_VERSION_V13
@@ -1393,6 +1431,7 @@ impl PersistedState {
         Ok(Self {
             args_hash,
             link_options_hash,
+            input_order_hash,
             wild_version,
             output,
             build_id_hashes,
@@ -1489,6 +1528,9 @@ impl PersistedState {
         writeln!(&mut out, "args\t{}", self.args_hash).unwrap();
         if let Some(hash) = &self.link_options_hash {
             writeln!(&mut out, "link-options\t{hash}").unwrap();
+        }
+        if let Some(hash) = &self.input_order_hash {
+            writeln!(&mut out, "input-order\t{hash}").unwrap();
         }
         if let Some(version) = &self.wild_version {
             writeln!(&mut out, "wild-version\t{version}").unwrap();
@@ -3944,6 +3986,16 @@ fn link_options_hash(args: &impl platform::Args) -> String {
     hash_text(&args.incremental_link_options())
 }
 
+fn input_order_hash(file_loader: &FileLoader<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for file in &file_loader.loaded_files {
+        let path = encode_path(&file.filename);
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn wild_version(args: &impl platform::Args) -> String {
     args.common().version.to_string()
 }
@@ -3968,6 +4020,9 @@ mod tests {
         PersistedState {
             args_hash: args_hash.to_owned(),
             link_options_hash: Some(args_hash.to_owned()),
+            input_order_hash: Some(input_order_hash_for_paths(
+                inputs.iter().map(|(path, _)| *path),
+            )),
             wild_version: Some("wild-test".to_owned()),
             output: FileContentState::from_bytes(output),
             build_id_hashes: None,
@@ -3982,6 +4037,15 @@ mod tests {
             sections: Vec::new(),
             sections_file: None,
         }
+    }
+
+    fn input_order_hash_for_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for path in paths {
+            hasher.update(hex::encode(path).as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.finalize().to_hex().to_string()
     }
 
     fn section_record(
@@ -5394,6 +5458,43 @@ mod tests {
     }
 
     #[test]
+    fn current_state_version_requires_input_order_hash() {
+        let rendered = state("args", b"output", &[("a.o", b"a")])
+            .render()
+            .lines()
+            .filter(|line| !line.starts_with("input-order\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let error = PersistedState::parse(&rendered).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Missing incremental input-order")
+        );
+    }
+
+    #[test]
+    fn v16_state_version_is_accepted_without_input_order_hash() {
+        let rendered = state("args", b"output", &[("a.o", b"a")])
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V16, 1)
+            .lines()
+            .filter(|line| !line.starts_with("input-order\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.input_order_hash, None);
+    }
+
+    #[test]
     fn v15_state_version_is_accepted_without_link_options_hash() {
         let rendered = state("args", b"output", &[("a.o", b"a")])
             .render()
@@ -5430,6 +5531,9 @@ mod tests {
         let previous = PersistedState {
             args_hash: "args".to_owned(),
             link_options_hash: Some("args".to_owned()),
+            input_order_hash: Some(input_order_hash_for_paths([missing_input
+                .to_str()
+                .unwrap()])),
             wild_version: Some("wild-test".to_owned()),
             output: FileContentState::from_bytes(b"output"),
             build_id_hashes: None,
@@ -5839,6 +5943,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5862,6 +5967,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5885,6 +5991,7 @@ mod tests {
             state_dir: state_dir.clone(),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5912,6 +6019,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "new-args".to_owned(),
             link_options_hash: "new-args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5936,6 +6044,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "new-wild".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5961,6 +6070,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -5985,6 +6095,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: state("args", b"output", &[("a.o", b"b")]).input_files,
         };
@@ -6009,6 +6120,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "new-exact-args".to_owned(),
             link_options_hash: "old-exact-args".to_owned(),
+            input_order_hash: input_order_hash_for_paths(["a.o", "b.o"]),
             wild_version: "wild-test".to_owned(),
             input_files: state("new-exact-args", b"output", &[("a.o", b"a"), ("b.o", b"b")])
                 .input_files,
@@ -6034,6 +6146,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "new-exact-args".to_owned(),
             link_options_hash: "old-exact-args".to_owned(),
+            input_order_hash: input_order_hash_for_paths(["a.o"]),
             wild_version: "wild-test".to_owned(),
             input_files: state("new-exact-args", b"output", &[("a.o", b"a")]).input_files,
         };
@@ -6048,6 +6161,57 @@ mod tests {
     }
 
     #[test]
+    fn reordered_input_list_keeps_unchanged_section_reuse_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let previous = state("old-exact-args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "new-exact-args".to_owned(),
+            link_options_hash: "old-exact-args".to_owned(),
+            input_order_hash: input_order_hash_for_paths(["b.o", "a.o"]),
+            wild_version: "wild-test".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: true,
+            } if reason == "input file order changed"
+        ));
+    }
+
+    #[test]
+    fn missing_input_order_hash_forces_initial_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let mut previous = state("args", b"output", &[("a.o", b"a")]);
+        previous.input_order_hash = None;
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            link_options_hash: "args".to_owned(),
+            input_order_hash: input_order_hash_for_paths(["a.o"]),
+            wild_version: "wild-test".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "input file order missing from previous state"
+        ));
+    }
+
+    #[test]
     fn missing_output_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
@@ -6056,6 +6220,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -6079,6 +6244,7 @@ mod tests {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
             link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
@@ -6255,6 +6421,7 @@ mod tests {
                 state_dir: PathBuf::new(),
                 args_hash: "args".to_owned(),
                 link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
                 input_files: Vec::new(),
             },
@@ -6287,6 +6454,7 @@ mod tests {
                 state_dir: PathBuf::new(),
                 args_hash: "args".to_owned(),
                 link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
                 input_files: Vec::new(),
             },
