@@ -173,8 +173,8 @@
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Can be repeated to mutate multiple inputs. Defaults to the last linker input.
 //!
-//! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
-//! to .data.
+//! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Can be
+//! repeated to mutate multiple sections in each changed input. Defaults to .data.
 //!
 //! TestIncrementalChangedSectionOffset:{bytes} Offset within the selected ELF section to mutate.
 //! Defaults to 0.
@@ -802,7 +802,8 @@ struct Config {
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
-    test_incremental_changed_section: String,
+    test_incremental_changed_sections: Vec<String>,
+    test_incremental_changed_sections_explicit: bool,
     test_incremental_changed_section_offset: u64,
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
@@ -1129,6 +1130,17 @@ impl Config {
         linker.enabled_by_default()
     }
 
+    fn incremental_changed_sections(&self) -> Vec<&str> {
+        if self.test_incremental_changed_sections.is_empty() {
+            vec![".data"]
+        } else {
+            self.test_incremental_changed_sections
+                .iter()
+                .map(String::as_str)
+                .collect()
+        }
+    }
+
     /// Returns the configuration that should be used when building our dependencies. This is a copy
     /// of the current config with anything that shouldn't be inherited cleared.
     fn config_for_deps(&self) -> Config {
@@ -1390,7 +1402,8 @@ impl Config {
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
-            test_incremental_changed_section: ".data".to_owned(),
+            test_incremental_changed_sections: Vec::new(),
+            test_incremental_changed_sections_explicit: false,
             test_incremental_changed_section_offset: 0,
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
@@ -1514,6 +1527,7 @@ fn process_directive(
                 arg
             };
             config.is_abstract = directive == "AbstractConfig";
+            config.test_incremental_changed_sections_explicit = false;
             if config_name_to_index.contains_key(name) {
                 bail!("Duplicate config `{name}`");
             }
@@ -1798,7 +1812,13 @@ fn process_directive(
             config.test_incremental_changed_inputs.push(arg.to_owned());
         }
         "TestIncrementalChangedSection" => {
-            arg.clone_into(&mut config.test_incremental_changed_section);
+            if !config.test_incremental_changed_sections_explicit {
+                config.test_incremental_changed_sections.clear();
+                config.test_incremental_changed_sections_explicit = true;
+            }
+            config
+                .test_incremental_changed_sections
+                .push(arg.to_owned());
         }
         "TestIncrementalChangedSectionOffset" => {
             config.test_incremental_changed_section_offset = arg
@@ -2205,20 +2225,19 @@ impl ProgramInputs {
             }
 
             let mut _restore_changed_inputs = Vec::with_capacity(changed_inputs.len());
+            let changed_sections = config.incremental_changed_sections();
             for changed_input in &changed_inputs {
                 _restore_changed_inputs.push(RestoreFileOnDrop::new(&changed_input.path)?);
-                if let Some(growth) = config.test_incremental_changed_grow_section {
-                    grow_section_bytes(
-                        &changed_input.path,
-                        &config.test_incremental_changed_section,
-                        growth,
-                    )?;
-                } else {
-                    mutate_section_byte(
-                        &changed_input.path,
-                        &config.test_incremental_changed_section,
-                        config.test_incremental_changed_section_offset,
-                    )?;
+                for changed_section in &changed_sections {
+                    if let Some(growth) = config.test_incremental_changed_grow_section {
+                        grow_section_bytes(&changed_input.path, changed_section, growth)?;
+                    } else {
+                        mutate_section_byte(
+                            &changed_input.path,
+                            changed_section,
+                            config.test_incremental_changed_section_offset,
+                        )?;
+                    }
                 }
                 if config.test_incremental_changed_append_archive_member {
                     append_archive_member(&changed_input.path)?;
@@ -2343,7 +2362,7 @@ impl ProgramInputs {
                         log
                     );
                 }
-                let patched_section_count = changed_inputs.len();
+                let patched_section_count = changed_inputs.len() * changed_sections.len();
                 let patched_section_message = format!(
                     "patched {patched_section_count} changed input sections before loading inputs"
                 );
