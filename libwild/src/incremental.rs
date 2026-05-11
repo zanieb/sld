@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v21";
+const STATE_VERSION: &str = "wild-incremental-state-v22";
+const STATE_VERSION_V21: &str = "wild-incremental-state-v21";
 const STATE_VERSION_V20: &str = "wild-incremental-state-v20";
 const STATE_VERSION_V19: &str = "wild-incremental-state-v19";
 const STATE_VERSION_V18: &str = "wild-incremental-state-v18";
@@ -533,13 +534,42 @@ fn patch_changed_inputs(
                     .iter()
                     .filter(|record| record.input_file == input.path),
             )?;
+            let previous_snapshot = input_snapshot_path_for_encoded_path(state_dir, &input.path);
+            let previous_snapshot_bytes = if input
+                .content
+                .identity_matches_snapshot_path(&previous_snapshot)
+                .unwrap_or(false)
+            {
+                Some(std::fs::read(&previous_snapshot)?)
+            } else {
+                None
+            };
+            let eh_frame_patches = if let Some(previous_bytes) = previous_snapshot_bytes.as_deref()
+            {
+                fde_relocation_patches_for_input(
+                    &bytes,
+                    previous_bytes,
+                    input.path.as_str(),
+                    previous
+                        .fdes
+                        .iter()
+                        .filter(|record| record.input_file == input.path),
+                )?
+            } else {
+                Vec::new()
+            };
             let Some(fingerprint) = patch_fingerprint_with_extra_ranges(
                 &bytes,
                 input.path.as_str(),
                 current_sections.iter().cloned(),
                 dynamic_relocation_patches
                     .iter()
-                    .map(|patch| patch.input_range.clone()),
+                    .map(|patch| patch.input_range.clone())
+                    .chain(
+                        eh_frame_patches
+                            .iter()
+                            .flat_map(|patch| patch.input_ranges.iter().map(Clone::clone)),
+                    ),
             )?
             else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
@@ -593,6 +623,10 @@ fn patch_changed_inputs(
             }
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
             patched_section_count += dynamic_relocation_patches.len();
+            patched_section_count += eh_frame_patches
+                .iter()
+                .filter(|patch| patch.patch.is_some())
+                .count();
 
             (
                 fingerprint,
@@ -606,6 +640,7 @@ fn patch_changed_inputs(
                             .into_iter()
                             .map(|relocation| relocation.patch),
                     )
+                    .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
             )
         };
@@ -719,6 +754,16 @@ fn patch_changed_inputs(
                 ));
             };
             data_range.copy_from_slice(previous_range);
+        }
+        for adjustment in &patch.adjustments {
+            let Some(data_range) = patch.data.get_mut(adjustment.range.clone()) else {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed patch adjustment range is out of bounds".to_owned(),
+                ));
+            };
+            if let Err(reason) = apply_addend_delta(data_range, adjustment.addend_delta) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
         }
         let (data_out, padding) = output_range.split_at_mut(patch.data.len());
         data_out.copy_from_slice(&patch.data);
@@ -846,6 +891,12 @@ struct SectionPatch {
     size: u64,
     data: Vec<u8>,
     preserve_ranges: Vec<std::ops::Range<usize>>,
+    adjustments: Vec<PatchAdjustment>,
+}
+
+struct PatchAdjustment {
+    range: std::ops::Range<usize>,
+    addend_delta: i64,
 }
 
 struct ResolvedSectionPatch {
@@ -856,6 +907,11 @@ struct ResolvedSectionPatch {
 struct DynamicRelocationPatch {
     input_range: std::ops::Range<usize>,
     patch: SectionPatch,
+}
+
+struct FdeRelocationPatch {
+    input_ranges: Vec<std::ops::Range<usize>>,
+    patch: Option<SectionPatch>,
 }
 
 const GENERATED_SECTION_INPUT_FILE: &str = "generated";
@@ -899,6 +955,29 @@ fn patch_output_range_rejection_reason(patches: &[SectionPatch]) -> Option<Strin
         previous_end = previous_end.max(range.end);
     }
     None
+}
+
+fn apply_addend_delta(data: &mut [u8], addend_delta: i64) -> std::result::Result<(), String> {
+    match data.len() {
+        4 => {
+            let value = i32::from_le_bytes(data.try_into().unwrap()) as i64;
+            let adjusted = value
+                .checked_add(addend_delta)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| "changed .eh_frame relocation adjustment overflowed".to_owned())?;
+            data.copy_from_slice(&adjusted.to_le_bytes());
+            Ok(())
+        }
+        8 => {
+            let value = i64::from_le_bytes(data.try_into().unwrap());
+            let adjusted = value
+                .checked_add(addend_delta)
+                .ok_or_else(|| "changed .eh_frame relocation adjustment overflowed".to_owned())?;
+            data.copy_from_slice(&adjusted.to_le_bytes());
+            Ok(())
+        }
+        _ => Err("unsupported .eh_frame relocation field size for incremental patch".to_owned()),
+    }
 }
 
 fn flush_output_ranges(
@@ -1250,6 +1329,7 @@ impl PreparedState {
             &mut input_files,
             file_loader,
             &sections,
+            &fdes,
             &dynamic_relocations,
             &mut output_bytes,
         )?;
@@ -1473,6 +1553,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V21
             && version != STATE_VERSION_V20
             && version != STATE_VERSION_V19
             && version != STATE_VERSION_V18
@@ -1561,6 +1642,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V21
             || version == STATE_VERSION_V20
             || version == STATE_VERSION_V19
             || version == STATE_VERSION_V18
@@ -2189,6 +2271,7 @@ fn record_patch_fingerprints<F>(
     input_files: &mut [FileState],
     file_loader: &FileLoader<'_>,
     sections: &[SectionRecord],
+    fdes: &[FdeRecord],
     dynamic_relocations: &[DynamicRelocationRecord],
     output: &mut LazyOutputBytes<F>,
 ) -> Result
@@ -2211,7 +2294,18 @@ where
             .push(relocation);
     }
 
-    if sections_by_file.is_empty() && dynamic_relocations_by_file.is_empty() {
+    let mut fdes_by_file = HashMap::<&str, Vec<&FdeRecord>>::new();
+    for fde in fdes {
+        fdes_by_file
+            .entry(fde.input_file.as_str())
+            .or_default()
+            .push(fde);
+    }
+
+    if sections_by_file.is_empty()
+        && dynamic_relocations_by_file.is_empty()
+        && fdes_by_file.is_empty()
+    {
         return Ok(());
     }
 
@@ -2227,7 +2321,9 @@ where
             continue;
         };
         let input_dynamic_relocations = dynamic_relocations_by_file.get(input.path.as_str());
+        let input_fdes = fdes_by_file.get(input.path.as_str());
         if input_dynamic_relocations.is_none()
+            && input_fdes.is_none()
             && input
                 .patch
                 .as_ref()
@@ -2252,13 +2348,21 @@ where
                 .into_iter()
                 .flat_map(|relocations| relocations.iter().copied()),
         )?;
+        let fde_relocation_ranges = fde_relocation_addend_ranges_for_input(
+            input_file.data(),
+            input.path.as_str(),
+            input_fdes
+                .into_iter()
+                .flat_map(|records| records.iter().copied()),
+        )?;
         input.patch = patch_fingerprint_with_extra_ranges(
             input_file.data(),
             input.path.as_str(),
             patch_sections.iter().cloned(),
             dynamic_relocation_patches
                 .iter()
-                .map(|patch| patch.input_range.clone()),
+                .map(|patch| patch.input_range.clone())
+                .chain(fde_relocation_ranges.into_iter()),
         )?
         .map(|fingerprint| FilePatchState {
             fingerprint,
@@ -3096,6 +3200,7 @@ fn resolved_patch_sections_for_input(
                     size: patch_section.output_size,
                     data: data.to_owned(),
                     preserve_ranges,
+                    adjustments: Vec::new(),
                 },
             });
         }
@@ -3169,10 +3274,275 @@ fn dynamic_relocation_patches_for_input_bytes(
                 size: record.size,
                 data,
                 preserve_ranges: vec![0..16],
+                adjustments: Vec::new(),
             },
         });
     }
     Ok(patches)
+}
+
+fn fde_relocation_addend_ranges_for_input<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a FdeRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut records_by_input = HashMap::<&str, Vec<&FdeRecord>>::new();
+    for record in records {
+        records_by_input
+            .entry(record.input.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    for (input_ref, records) in records_by_input {
+        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+            continue;
+        };
+        ranges.extend(fde_relocation_addend_ranges_for_input_bytes(
+            input_bytes.bytes,
+            input_bytes.file_offset,
+            records,
+        )?);
+    }
+    Ok(ranges)
+}
+
+fn fde_relocation_addend_ranges_for_input_bytes(
+    bytes: &[u8],
+    file_offset: usize,
+    records: Vec<&FdeRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let Some(section_headers) = elf_section_headers(bytes) else {
+        return Ok(Vec::new());
+    };
+    let file = object::File::parse(bytes).context("Failed to parse .eh_frame relocation input")?;
+    let mut ranges = Vec::new();
+    for record in records {
+        let relocation_sizes =
+            eh_frame_relocation_sizes(&file, record.eh_frame_section_index, record)?;
+        for entry in
+            rela_entries_for_section(bytes, &section_headers, record.eh_frame_section_index)
+                .into_iter()
+                .flatten()
+                .filter(|entry| fde_contains_relocation(record, entry.offset))
+        {
+            if relocation_sizes.contains_key(&entry.offset) {
+                ranges.push(
+                    file_offset + entry.addend_range.start..file_offset + entry.addend_range.end,
+                );
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+fn fde_relocation_patches_for_input<'a>(
+    current_bytes: &[u8],
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a FdeRecord>,
+) -> Result<Vec<FdeRelocationPatch>> {
+    let records = records.into_iter().collect::<Vec<_>>();
+    let mut patches = Vec::new();
+    let mut records_by_input = HashMap::<&str, Vec<&FdeRecord>>::new();
+    for record in records {
+        records_by_input
+            .entry(record.input.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    for (input_ref, records) in records_by_input {
+        let Some(current_input_bytes) =
+            patch_input_bytes(current_bytes, input_file_path, input_ref)?
+        else {
+            continue;
+        };
+        let Some(previous_input_bytes) =
+            patch_input_bytes(previous_bytes, input_file_path, input_ref)?
+        else {
+            continue;
+        };
+        patches.extend(fde_relocation_patches_for_input_bytes(
+            current_input_bytes.bytes,
+            current_input_bytes.file_offset,
+            previous_input_bytes.bytes,
+            records,
+        )?);
+    }
+    Ok(patches)
+}
+
+fn fde_relocation_patches_for_input_bytes(
+    current_bytes: &[u8],
+    current_file_offset: usize,
+    previous_bytes: &[u8],
+    records: Vec<&FdeRecord>,
+) -> Result<Vec<FdeRelocationPatch>> {
+    let Some(current_section_headers) = elf_section_headers(current_bytes) else {
+        return Ok(Vec::new());
+    };
+    let Some(previous_section_headers) = elf_section_headers(previous_bytes) else {
+        return Ok(Vec::new());
+    };
+    let current_file = object::File::parse(current_bytes)
+        .context("Failed to parse changed .eh_frame relocation input")?;
+
+    let mut patches = Vec::new();
+    for record in records {
+        let current_entries = rela_entries_for_section(
+            current_bytes,
+            &current_section_headers,
+            record.eh_frame_section_index,
+        );
+        let previous_entries = rela_entries_for_section(
+            previous_bytes,
+            &previous_section_headers,
+            record.eh_frame_section_index,
+        );
+        let Some(current_entries) = current_entries else {
+            continue;
+        };
+        let Some(previous_entries) = previous_entries else {
+            continue;
+        };
+        let current_entries = current_entries
+            .into_iter()
+            .filter(|entry| fde_contains_relocation(record, entry.offset))
+            .collect::<Vec<_>>();
+        let previous_entries = previous_entries
+            .into_iter()
+            .filter(|entry| fde_contains_relocation(record, entry.offset))
+            .collect::<Vec<_>>();
+        if current_entries.len() != previous_entries.len() {
+            continue;
+        }
+        let relocation_sizes =
+            eh_frame_relocation_sizes(&current_file, record.eh_frame_section_index, record)?;
+
+        let mut input_ranges = Vec::new();
+        let mut adjustments = Vec::new();
+        for (current, previous) in current_entries.iter().zip(&previous_entries) {
+            if current.offset != previous.offset || current.info != previous.info {
+                input_ranges.clear();
+                adjustments.clear();
+                break;
+            }
+            let Some(field_size) = relocation_sizes.get(&current.offset).copied() else {
+                input_ranges.clear();
+                adjustments.clear();
+                break;
+            };
+            input_ranges.push(
+                current_file_offset + current.addend_range.start
+                    ..current_file_offset + current.addend_range.end,
+            );
+            let Some(addend_delta) = current.addend.checked_sub(previous.addend) else {
+                input_ranges.clear();
+                adjustments.clear();
+                break;
+            };
+            if addend_delta == 0 {
+                continue;
+            }
+            let field_start = usize::try_from(current.offset - record.input_offset)
+                .context("Incremental .eh_frame relocation offset is too large")?;
+            let field_end = field_start
+                .checked_add(usize::from(field_size))
+                .context("Incremental .eh_frame relocation range overflow")?;
+            if field_end > record.size as usize {
+                input_ranges.clear();
+                adjustments.clear();
+                break;
+            }
+            adjustments.push(PatchAdjustment {
+                range: field_start..field_end,
+                addend_delta,
+            });
+        }
+        patches.push(FdeRelocationPatch {
+            input_ranges,
+            patch: (!adjustments.is_empty()).then(|| SectionPatch {
+                output_offset: record.output_offset,
+                size: record.size,
+                data: vec![0; record.size as usize],
+                preserve_ranges: vec![0..record.size as usize],
+                adjustments,
+            }),
+        });
+    }
+    Ok(patches)
+}
+
+fn eh_frame_relocation_sizes(
+    file: &object::File<'_>,
+    eh_frame_section_index: u32,
+    record: &FdeRecord,
+) -> Result<HashMap<u64, u8>> {
+    let section = file
+        .section_by_index(object::SectionIndex(eh_frame_section_index as usize))
+        .context("Missing changed .eh_frame section")?;
+    let mut sizes = HashMap::new();
+    for (offset, relocation) in section.relocations() {
+        if !fde_contains_relocation(record, offset)
+            || relocation.has_implicit_addend()
+            || relocation.encoding() != object::RelocationEncoding::Generic
+            || relocation.size() == 0
+            || relocation.size() % 8 != 0
+        {
+            continue;
+        }
+        sizes.insert(offset, relocation.size() / 8);
+    }
+    Ok(sizes)
+}
+
+fn fde_contains_relocation(record: &FdeRecord, relocation_offset: u64) -> bool {
+    relocation_offset >= record.input_offset
+        && relocation_offset < record.input_offset.saturating_add(record.size)
+}
+
+struct RelaPatchEntry {
+    offset: u64,
+    info: u64,
+    addend: i64,
+    addend_range: std::ops::Range<usize>,
+}
+
+fn rela_entries_for_section(
+    bytes: &[u8],
+    section_headers: &[ElfSectionHeader],
+    section_index: u32,
+) -> Option<Vec<RelaPatchEntry>> {
+    let mut entries = Vec::new();
+    for section in section_headers {
+        if section.sh_type != u64::from(object::elf::SHT_RELA)
+            || section.sh_info != u64::from(section_index)
+            || section.sh_entsize != crate::elf::RELA_ENTRY_SIZE
+        {
+            continue;
+        }
+        let start = usize::try_from(section.sh_offset).ok()?;
+        let size = usize::try_from(section.sh_size).ok()?;
+        let end = start.checked_add(size)?;
+        let section_bytes = bytes.get(start..end)?;
+        for (entry_index, entry) in section_bytes
+            .chunks_exact(crate::elf::RELA_ENTRY_SIZE as usize)
+            .enumerate()
+        {
+            let entry_start =
+                start.checked_add(entry_index * crate::elf::RELA_ENTRY_SIZE as usize)?;
+            let addend_start = entry_start + 16;
+            entries.push(RelaPatchEntry {
+                offset: read_u64_le(entry.get(0..8)?)?,
+                info: read_u64_le(entry.get(8..16)?)?,
+                addend: read_i64_le(entry.get(16..24)?)?,
+                addend_range: addend_start..addend_start + 8,
+            });
+        }
+    }
+    Some(entries)
 }
 
 fn dynamic_relocation_entry_range(
@@ -3441,6 +3811,10 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
 
 fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_i64_le(bytes: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn build_id_note_range(bytes: &[u8]) -> Result<Option<std::ops::Range<usize>>> {
@@ -5716,6 +6090,150 @@ mod tests {
     }
 
     #[test]
+    fn patch_fingerprint_allows_fde_relocation_addend_changes() {
+        let previous = eh_frame_relocation_elf(8, -4);
+        let current = eh_frame_relocation_elf(8, 2);
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+        };
+        let fde = fde_record("input.o", 1, 2, 0, 300, 16);
+        let previous_ranges =
+            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+        let previous_fingerprint = patch_fingerprint_with_extra_ranges(
+            &previous,
+            &input_ref,
+            [patch_section.clone()],
+            previous_ranges.into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let current_patches =
+            fde_relocation_patches_for_input(&current, &previous, &input_ref, [&fde]).unwrap();
+
+        assert_eq!(
+            patch_fingerprint_with_extra_ranges(
+                &current,
+                &input_ref,
+                [patch_section],
+                current_patches
+                    .iter()
+                    .flat_map(|patch| patch.input_ranges.iter().cloned()),
+            )
+            .unwrap()
+            .unwrap(),
+            previous_fingerprint
+        );
+        assert_eq!(current_patches.len(), 1);
+        assert_eq!(current_patches[0].input_ranges, vec![0x58 + 16..0x58 + 24]);
+        let patch = current_patches[0].patch.as_ref().unwrap();
+        assert_eq!(patch.output_offset, 300);
+        assert_eq!(patch.size, 16);
+        assert_eq!(patch.preserve_ranges, vec![0..16]);
+        assert_eq!(patch.adjustments.len(), 1);
+        assert_eq!(patch.adjustments[0].range, 8..12);
+        assert_eq!(patch.adjustments[0].addend_delta, 6);
+    }
+
+    #[test]
+    fn patch_fingerprint_rejects_fde_relocation_offset_changes() {
+        let previous = eh_frame_relocation_elf(8, -4);
+        let current = eh_frame_relocation_elf(12, -4);
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+        };
+        let fde = fde_record("input.o", 1, 2, 0, 300, 16);
+        let previous_ranges =
+            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+        let previous_fingerprint = patch_fingerprint_with_extra_ranges(
+            &previous,
+            &input_ref,
+            [patch_section.clone()],
+            previous_ranges.into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let current_patches =
+            fde_relocation_patches_for_input(&current, &previous, &input_ref, [&fde]).unwrap();
+
+        assert_eq!(current_patches.len(), 1);
+        assert!(current_patches[0].input_ranges.is_empty());
+        assert!(current_patches[0].patch.is_none());
+        assert_ne!(
+            patch_fingerprint_with_extra_ranges(
+                &current,
+                &input_ref,
+                [patch_section],
+                current_patches
+                    .iter()
+                    .flat_map(|patch| patch.input_ranges.iter().cloned()),
+            )
+            .unwrap()
+            .unwrap(),
+            previous_fingerprint
+        );
+    }
+
+    #[test]
+    fn patch_fingerprint_rejects_fde_relocation_field_overflow() {
+        let previous = eh_frame_relocation_elf(14, -4);
+        let current = eh_frame_relocation_elf(14, 2);
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+        };
+        let fde = fde_record("input.o", 1, 2, 0, 300, 16);
+        let previous_ranges =
+            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+        let previous_fingerprint = patch_fingerprint_with_extra_ranges(
+            &previous,
+            &input_ref,
+            [patch_section.clone()],
+            previous_ranges.into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let current_patches =
+            fde_relocation_patches_for_input(&current, &previous, &input_ref, [&fde]).unwrap();
+
+        assert_eq!(current_patches.len(), 1);
+        assert!(current_patches[0].input_ranges.is_empty());
+        assert!(current_patches[0].patch.is_none());
+        assert_ne!(
+            patch_fingerprint_with_extra_ranges(
+                &current,
+                &input_ref,
+                [patch_section],
+                current_patches
+                    .iter()
+                    .flat_map(|patch| patch.input_ranges.iter().cloned()),
+            )
+            .unwrap()
+            .unwrap(),
+            previous_fingerprint
+        );
+    }
+
+    #[test]
     fn resolve_current_patch_sections_updates_section_size_after_growth() {
         let mut bytes = growable_data_elf();
         bytes[0x44] = 5;
@@ -5824,6 +6342,154 @@ mod tests {
         bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0xa0_u64.to_le_bytes());
         bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&28_u64.to_le_bytes());
         bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
+    }
+
+    fn eh_frame_relocation_elf(relocation_offset: u64, addend: i64) -> Vec<u8> {
+        let mut bytes = vec![0; 0x288];
+        let shstrtab = b"\0.text\0.eh_frame\0.rela.eh_frame\0.symtab\0.strtab\0.shstrtab\0";
+        let shstrtab_offset = 0xa8;
+        bytes[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&object::elf::ET_REL.to_le_bytes());
+        bytes[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0xc8_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&7_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&6_u16.to_le_bytes());
+
+        bytes[0x40..0x44].copy_from_slice(&[0xc3, 0, 0, 0]);
+        bytes[0x48..0x58].copy_from_slice(&[
+            12, 0, 0, 0, // length
+            4, 0, 0, 0, // CIE pointer
+            0, 0, 0, 0, // relocated pc begin
+            4, 0, 0, 0, // pc range
+        ]);
+        bytes[0x58..0x60].copy_from_slice(&relocation_offset.to_le_bytes());
+        let relocation_info = (1_u64 << 32) | u64::from(object::elf::R_X86_64_PC32);
+        bytes[0x60..0x68].copy_from_slice(&relocation_info.to_le_bytes());
+        bytes[0x68..0x70].copy_from_slice(&addend.to_le_bytes());
+
+        let symbol_offset = 0x70 + 24;
+        bytes[symbol_offset..symbol_offset + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[symbol_offset + 4] = object::elf::STT_FUNC;
+        bytes[symbol_offset + 6..symbol_offset + 8].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[symbol_offset + 16..symbol_offset + 24].copy_from_slice(&4_u64.to_le_bytes());
+        bytes[0xa0..0xa6].copy_from_slice(b"\0func\0");
+
+        let name_offset = |name: &[u8]| -> u32 {
+            shstrtab
+                .windows(name.len())
+                .position(|window| window == name)
+                .unwrap() as u32
+        };
+        let write_section = |bytes: &mut [u8],
+                             index: usize,
+                             name: &[u8],
+                             ty: u32,
+                             flags: u64,
+                             offset: u64,
+                             size: u64,
+                             link: u32,
+                             info: u32,
+                             align: u64,
+                             entsize: u64| {
+            let header = 0xc8 + index * 64;
+            bytes[header..header + 4].copy_from_slice(&name_offset(name).to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&ty.to_le_bytes());
+            bytes[header + 8..header + 16].copy_from_slice(&flags.to_le_bytes());
+            bytes[header + 24..header + 32].copy_from_slice(&offset.to_le_bytes());
+            bytes[header + 32..header + 40].copy_from_slice(&size.to_le_bytes());
+            bytes[header + 40..header + 44].copy_from_slice(&link.to_le_bytes());
+            bytes[header + 44..header + 48].copy_from_slice(&info.to_le_bytes());
+            bytes[header + 48..header + 56].copy_from_slice(&align.to_le_bytes());
+            bytes[header + 56..header + 64].copy_from_slice(&entsize.to_le_bytes());
+        };
+        write_section(
+            &mut bytes,
+            1,
+            b".text",
+            object::elf::SHT_PROGBITS,
+            u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR),
+            0x40,
+            4,
+            0,
+            0,
+            4,
+            0,
+        );
+        write_section(
+            &mut bytes,
+            2,
+            b".eh_frame",
+            object::elf::SHT_PROGBITS,
+            u64::from(object::elf::SHF_ALLOC),
+            0x48,
+            16,
+            0,
+            0,
+            8,
+            0,
+        );
+        write_section(
+            &mut bytes,
+            3,
+            b".rela.eh_frame",
+            object::elf::SHT_RELA,
+            0,
+            0x58,
+            24,
+            4,
+            2,
+            8,
+            crate::elf::RELA_ENTRY_SIZE,
+        );
+        write_section(
+            &mut bytes,
+            4,
+            b".symtab",
+            object::elf::SHT_SYMTAB,
+            0,
+            0x70,
+            48,
+            5,
+            1,
+            8,
+            24,
+        );
+        write_section(
+            &mut bytes,
+            5,
+            b".strtab",
+            object::elf::SHT_STRTAB,
+            0,
+            0xa0,
+            6,
+            0,
+            0,
+            1,
+            0,
+        );
+        write_section(
+            &mut bytes,
+            6,
+            b".shstrtab",
+            object::elf::SHT_STRTAB,
+            0,
+            shstrtab_offset as u64,
+            shstrtab.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
 
         bytes
     }
@@ -6252,8 +6918,15 @@ mod tests {
         }];
         let sections = vec![section_record("a.o", 1, 100, 4)];
 
-        record_patch_fingerprints(&mut input_files, &file_loader, &sections, &[], &mut output)
-            .unwrap();
+        record_patch_fingerprints(
+            &mut input_files,
+            &file_loader,
+            &sections,
+            &[],
+            &[],
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(
             input_files[0].patch.as_ref().unwrap().fingerprint,
@@ -6285,8 +6958,15 @@ mod tests {
         }];
         let sections = vec![section_record("a.o", 1, 108, 4)];
 
-        record_patch_fingerprints(&mut input_files, &file_loader, &sections, &[], &mut output)
-            .unwrap();
+        record_patch_fingerprints(
+            &mut input_files,
+            &file_loader,
+            &sections,
+            &[],
+            &[],
+            &mut output,
+        )
+        .unwrap();
 
         assert!(input_files[0].patch.is_none());
     }
@@ -7622,6 +8302,7 @@ mod tests {
             size,
             data: Vec::new(),
             preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
         };
 
         assert!(patch_output_range_rejection_reason(&[patch(16, 8), patch(24, 8)]).is_none());
