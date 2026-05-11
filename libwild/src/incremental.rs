@@ -117,7 +117,7 @@ struct FileContentState {
     identity: Option<FileIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct FileIdentity {
     len: u64,
     dev: u64,
@@ -127,6 +127,18 @@ struct FileIdentity {
     changed_sec: i64,
     changed_nsec: i64,
 }
+
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && self.modified_sec == other.modified_sec
+            && self.modified_nsec == other.modified_nsec
+    }
+}
+
+impl Eq for FileIdentity {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct SectionRecord {
@@ -224,7 +236,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     timing_phase!("Check incremental fast path");
 
     let state_dir = state_dir_for_output(args.output());
-    let Some(previous) = PersistedState::read_metadata(&state_dir).unwrap_or_default() else {
+    let Some(mut previous) = PersistedState::read_metadata(&state_dir).unwrap_or_default() else {
         return Ok(false);
     };
 
@@ -236,12 +248,34 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     let mut changed_inputs = Vec::new();
+    let mut rewritten_inputs = Vec::new();
     for (index, input) in previous.input_files.iter().enumerate() {
         let path = decode_path(&input.path)?;
         if input.content.identity_matches_path(&path)? {
             continue;
         }
+        if input_content_matches_snapshot(&state_dir, input, &path)? {
+            rewritten_inputs.push((index, path));
+            continue;
+        }
         changed_inputs.push((index, path));
+    }
+
+    if !rewritten_inputs.is_empty() {
+        snapshot_input_paths(
+            &state_dir,
+            rewritten_inputs.iter().map(|(_, path)| path.as_path()),
+        )?;
+        for (input_index, path) in &rewritten_inputs {
+            previous.input_files[*input_index].content =
+                FileContentState::from_path_identity_only(path).with_context(|| {
+                    format!(
+                        "Failed to record rewritten incremental input `{}`",
+                        path.display()
+                    )
+                })?;
+        }
+        refresh_input_file_identities(&mut previous.input_files);
     }
 
     if !changed_inputs.is_empty() {
@@ -251,6 +285,17 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
 
+    if !rewritten_inputs.is_empty() {
+        previous.write_index(&state_dir)?;
+        append_log(
+            &state_dir,
+            &format!(
+                "updated {} rewritten input file{} before loading inputs",
+                rewritten_inputs.len(),
+                if rewritten_inputs.len() == 1 { "" } else { "s" }
+            ),
+        )?;
+    }
     append_log(&state_dir, "reused existing output before loading inputs")?;
     Ok(true)
 }
@@ -2037,6 +2082,36 @@ fn snapshot_loaded_files(state_dir: &Path, file_loader: &FileLoader<'_>) -> Resu
     )
 }
 
+fn input_content_matches_snapshot(
+    state_dir: &Path,
+    previous_input: &FileState,
+    current_path: &Path,
+) -> Result<bool> {
+    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    if !previous_input
+        .content
+        .identity_matches_path(&snapshot)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    files_equal(&snapshot, current_path)
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    let left = match std::fs::read(left) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let right = match std::fs::read(right) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(left == right)
+}
+
 fn refresh_input_file_identities(input_files: &mut [FileState]) {
     for input in input_files {
         let Ok(path) = decode_path(&input.path) else {
@@ -2111,7 +2186,11 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
 }
 
 fn input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
-    input_snapshot_dir(state_dir).join(hash_text(&encode_path(path)))
+    input_snapshot_path_for_encoded_path(state_dir, &encode_path(path))
+}
+
+fn input_snapshot_path_for_encoded_path(state_dir: &Path, encoded_path: &str) -> PathBuf {
+    input_snapshot_dir(state_dir).join(hash_text(encoded_path))
 }
 
 fn input_snapshot_dir(state_dir: &Path) -> PathBuf {
@@ -2521,6 +2600,51 @@ mod tests {
     }
 
     #[test]
+    fn input_snapshot_matches_rewritten_file_with_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let mut previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            patch: None,
+        };
+        refresh_input_file_identities(std::slice::from_mut(&mut previous));
+
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"object").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert!(!previous.content.identity_matches_path(&input).unwrap());
+        assert!(input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
+    }
+
+    #[test]
+    fn input_snapshot_rejects_rewritten_file_with_changed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let mut previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            patch: None,
+        };
+        refresh_input_file_identities(std::slice::from_mut(&mut previous));
+
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert!(!input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
+    }
+
+    #[test]
     fn persisted_state_round_trips() {
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
@@ -2711,11 +2835,27 @@ mod tests {
         let changed = FileContentState {
             len: 4,
             hash: String::new(),
-            identity: Some(identity(4, 1, 2, 3, 6)),
+            identity: Some(identity(4, 1, 2, 4, 5)),
         };
 
         assert_eq!(first, same);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn file_identity_ignores_changed_time() {
+        let first = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 3, 5)),
+        };
+        let same = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 3, 6)),
+        };
+
+        assert_eq!(first, same);
     }
 
     #[test]

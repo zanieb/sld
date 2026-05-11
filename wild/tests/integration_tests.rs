@@ -1999,6 +1999,39 @@ impl ProgramInputs {
             );
         }
 
+        let rewritten_input = inputs.last().with_context(|| {
+            format!(
+                "Incremental rewritten-input test for {} needs at least one input",
+                self.name()
+            )
+        })?;
+        rewrite_file_with_same_contents(&rewritten_input.path)?;
+        let link_output_rewritten =
+            Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+        let rewritten_content =
+            std::fs::read(&link_output_rewritten.binary).with_context(|| {
+                format!(
+                    "Failed to read rewritten incremental output: {}",
+                    link_output_rewritten.binary.display()
+                )
+            })?;
+        if final_content != rewritten_content {
+            bail!(
+                "Incremental test failed for {}: rewritten input with unchanged content changed output",
+                self.name()
+            );
+        }
+        let log = std::fs::read_to_string(&log_path)
+            .with_context(|| format!("Failed to read incremental log `{}`", log_path.display()))?;
+        if !log.contains("updated 1 rewritten input file before loading inputs") {
+            bail!(
+                "Incremental test failed for {}: rewritten input with unchanged content did not \
+                update metadata before loading all inputs. Log:\n{}",
+                self.name(),
+                log
+            );
+        }
+
         if config.test_incremental_changed {
             let changed_input = inputs.last().with_context(|| {
                 format!(
@@ -2066,6 +2099,22 @@ impl ProgramInputs {
 
         Ok(())
     }
+}
+
+fn rewrite_file_with_same_contents(path: &Path) -> Result {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let tmp_path = append_to_path(path, ".rewrite");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write rewritten object `{}`", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to replace `{}` with rewritten object `{}`",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
