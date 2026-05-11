@@ -154,9 +154,8 @@
 //! testing runs wild twice with incremental linking enabled and verifies that the second run reuses
 //! the existing output.
 //!
-//! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object
-//! without changing its loaded sections, then checking that sections from unchanged inputs are
-//! reused.
+//! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
+//! then checking that the changed-input incremental link matches a full relink.
 //!
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
 //! to .data.
@@ -1938,6 +1937,12 @@ impl ProgramInputs {
         }
 
         let incremental_output = Linker::Wild.output_path(self.name(), &incremental_config);
+        let baseline_content = std::fs::read(&incremental_output).with_context(|| {
+            format!(
+                "Failed to read full link output before incremental test: {}",
+                incremental_output.display()
+            )
+        })?;
         let _ = std::fs::remove_file(&incremental_output);
         let _ = std::fs::remove_dir_all(append_to_path(&incremental_output, ".incr"));
 
@@ -1949,6 +1954,15 @@ impl ProgramInputs {
                 link_output_1.binary.display()
             )
         })?;
+
+        if original_content != baseline_content {
+            let diffs = sections_with_diffs(&original_content, &baseline_content)?;
+            bail!(
+                "Incremental test failed for {}: first incremental output differs from a full \
+                link of the same inputs. Diffs:\n{diffs:#?}",
+                self.name()
+            );
+        }
 
         let link_output_2 =
             Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
