@@ -393,7 +393,12 @@ fn import_symbol_name(name: &[u8]) -> &[u8] {
 
 fn import_library_ordinal(layout: &MachOLayout<'_>, name: &[u8]) -> Result<u8> {
     let Some(library) = import_library_name(name) else {
-        return Ok(1);
+        return Ok(layout
+            .args()
+            .dylib_symbol_ordinals
+            .get(name)
+            .copied()
+            .unwrap_or(1));
     };
     for (index, path) in load_dylib_paths(layout.args()).enumerate() {
         if path_matches_library(path, library) {
@@ -1424,6 +1429,10 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     resolution.raw_value = resolution.raw_value.wrapping_add(paired_addend as u64);
 
     let raw_value = resolution.raw_value;
+    let uses_tlv_got = matches!(
+        rel.r_type,
+        macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) && resolution.format_specific.got_address.is_some();
     let target_value = match rel_info.kind {
         RelocationKind::Got | RelocationKind::GotRelative => resolution
             .format_specific
@@ -1431,6 +1440,11 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             .map(|address| address.get())
             .unwrap_or(raw_value)
             .wrapping_add(paired_addend as u64),
+        RelocationKind::Relative if uses_tlv_got => resolution
+            .format_specific
+            .got_address
+            .map(|address| address.get())
+            .unwrap_or(raw_value),
         RelocationKind::PltRelative => resolution
             .format_specific
             .stub_address
@@ -1459,6 +1473,12 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         RelocationKind::Absolute | RelocationKind::Got => {
             target_value.bitand(mask.symbol_plus_addend)
         }
+        RelocationKind::AbsoluteLowPart if uses_tlv_got => resolution
+            .format_specific
+            .got_address
+            .map(|address| address.get())
+            .unwrap_or(target_value)
+            .bitand(mask.symbol_plus_addend),
         RelocationKind::AbsoluteLowPart => target_value.bitand(mask.symbol_plus_addend),
         RelocationKind::Relative | RelocationKind::GotRelative | RelocationKind::PltRelative => {
             target_value
@@ -1488,7 +1508,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         )?;
     }
 
-    if rel.r_type == macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 {
+    if rel.r_type == macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 && !uses_tlv_got {
         rewrite_tlv_pageoff_to_add(&mut out[offset_in_section as usize..])?;
     }
 
@@ -1500,7 +1520,14 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             symbol_name = %target_name,
             "relocation applied");
 
-    rel_info.write_to_buffer(value, &mut out[offset_in_section as usize..])?;
+    rel_info
+        .write_to_buffer(value, &mut out[offset_in_section as usize..])
+        .with_context(|| {
+            format!(
+                "failed to apply Mach-O relocation type {} at offset {:#x} against {target_name}",
+                rel.r_type, offset_in_section
+            )
+        })?;
 
     Ok(())
 }

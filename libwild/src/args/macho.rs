@@ -17,13 +17,26 @@ use crate::error::Context;
 use crate::error::Result;
 use crate::platform;
 use crate::platform::Args as _;
+use crate::platform::Symbol as _;
 use crate::save_dir::SaveDir;
 use jobserver::Client;
+use object::Endian as _;
+use object::Endianness;
+use object::FileKind;
+use object::macho;
+use object::read::macho::FatArch as _;
+use object::read::macho::MachHeader;
+use object::read::macho::MachOFatFile32;
+use object::read::macho::MachOFatFile64;
+use object::read::macho::Nlist;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zerocopy::IntoBytes;
 
 #[derive(Debug)]
 pub struct MachOArgs {
@@ -32,6 +45,7 @@ pub struct MachOArgs {
     pub(crate) output: Arc<Path>,
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) extra_dylib_paths: Vec<Vec<u8>>,
+    pub(crate) dylib_symbol_ordinals: HashMap<Vec<u8>, u8>,
     pub(crate) sysroot: Option<PathBuf>,
     pub(crate) relocation_model: RelocationModel,
     pub(crate) should_output_executable: bool,
@@ -69,6 +83,7 @@ impl Default for MachOArgs {
             output: Arc::from(Path::new("a.out")),
             lib_search_path: Vec::new(),
             extra_dylib_paths: Vec::new(),
+            dylib_symbol_ordinals: HashMap::new(),
             sysroot: None,
             should_adhoc_codesign: cfg!(target_os = "macos"),
             dead_strip: false,
@@ -174,32 +189,63 @@ impl platform::Args for MachOArgs {
 }
 
 impl MachOArgs {
-    fn add_dylib_path(&mut self, path: impl Into<Vec<u8>>) {
+    fn add_dylib_path(&mut self, path: impl Into<Vec<u8>>) -> Result<u8> {
         let path = path.into();
-        if !self
+        let index = if let Some(index) = self
             .extra_dylib_paths
             .iter()
-            .any(|existing| existing == &path)
+            .position(|existing| existing == &path)
         {
+            index
+        } else {
             self.extra_dylib_paths.push(path);
-        }
+            self.extra_dylib_paths.len() - 1
+        };
+        u8::try_from(index + 2).context("Mach-O dylib ordinal exceeds u8")
     }
 
-    fn add_framework(&mut self, framework: &str) {
-        self.add_dylib_path(framework_dylib_path(framework));
+    fn add_framework(&mut self, framework: &str) -> Result {
+        self.add_dylib_path(framework_dylib_path(framework))?;
+        Ok(())
     }
 
     fn add_linked_library(&mut self, library: &str) -> Result {
         match library {
             "System" | "c" | "m" => {}
-            "objc" => self.add_dylib_path(b"/usr/lib/libobjc.A.dylib".to_vec()),
-            "iconv" => self.add_dylib_path(b"/usr/lib/libiconv.2.dylib".to_vec()),
-            "c++" => self.add_dylib_path(b"/usr/lib/libc++.1.dylib".to_vec()),
-            "z" => self.add_dylib_path(b"/usr/lib/libz.1.dylib".to_vec()),
+            "objc" => {
+                self.add_dylib_path(b"/usr/lib/libobjc.A.dylib".to_vec())?;
+            }
+            "iconv" => {
+                self.add_dylib_path(b"/usr/lib/libiconv.2.dylib".to_vec())?;
+            }
+            "c++" => {
+                self.add_dylib_path(b"/usr/lib/libc++.1.dylib".to_vec())?;
+            }
+            "z" => {
+                self.add_dylib_path(b"/usr/lib/libz.1.dylib".to_vec())?;
+            }
             _ => {
                 self.warn_unsupported(&format!("-l{library}"))?;
             }
         }
+        Ok(())
+    }
+
+    fn add_direct_dylib(&mut self, path: &str) -> Result {
+        self.common_mut().save_dir.handle_file(path);
+
+        let metadata = read_direct_dylib_metadata(Path::new(path))?;
+        // Use the path that rustc/clang passed to us as the load command. Most dylibs also carry
+        // an install name, but direct Rust dylib inputs often use @rpath install names and rely on
+        // the driver environment to make the original path available at runtime.
+        let ordinal = self.add_dylib_path(path.as_bytes().to_vec())?;
+
+        for symbol_name in metadata.exported_symbols {
+            self.dylib_symbol_ordinals
+                .entry(symbol_name)
+                .or_insert(ordinal);
+        }
+
         Ok(())
     }
 }
@@ -216,6 +262,11 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         let arg = arg.as_ref();
 
         if handle_ld64_multi_arg(args, arg, &mut input)? {
+            continue;
+        }
+
+        if is_direct_dylib_arg(arg) {
+            args.add_direct_dylib(arg)?;
             continue;
         }
 
@@ -542,14 +593,14 @@ fn handle_ld64_multi_arg<S: AsRef<str>, I: Iterator<Item = S>>(
         }
         "-framework" | "--framework" => {
             let framework = input.next().context("-framework requires an argument")?;
-            args.add_framework(framework.as_ref());
+            args.add_framework(framework.as_ref())?;
             Ok(true)
         }
         "-weak_framework" | "--weak_framework" => {
             let framework = input
                 .next()
                 .context("-weak_framework requires an argument")?;
-            args.add_framework(framework.as_ref());
+            args.add_framework(framework.as_ref())?;
             Ok(true)
         }
         "-dynamiclib" | "--dynamiclib" | "-dylib" | "--dylib" => {
@@ -589,13 +640,13 @@ fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
                 let framework = values
                     .next()
                     .context("-Wl,-framework requires an argument")?;
-                args.add_framework(framework);
+                args.add_framework(framework)?;
             }
             "-weak_framework" => {
                 let framework = values
                     .next()
                     .context("-Wl,-weak_framework requires an argument")?;
-                args.add_framework(framework);
+                args.add_framework(framework)?;
             }
             _ if value.starts_with("-l") && value.len() > 2 => {
                 args.add_linked_library(&value[2..])?
@@ -663,6 +714,97 @@ fn canonical_framework_name(framework: &str) -> &str {
     }
 }
 
+fn is_direct_dylib_arg(arg: &str) -> bool {
+    !arg.starts_with('-') && Path::new(arg).extension().is_some_and(|ext| ext == "dylib")
+}
+
+#[derive(Debug, Default)]
+struct DirectDylibMetadata {
+    exported_symbols: BTreeSet<Vec<u8>>,
+}
+
+fn read_direct_dylib_metadata(path: &Path) -> Result<DirectDylibMetadata> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read dylib `{}`", path.display()))?;
+
+    direct_dylib_metadata_from_file_bytes(bytes.as_slice())
+        .with_context(|| format!("failed to inspect dylib `{}`", path.display()))
+}
+
+fn direct_dylib_metadata_from_file_bytes(bytes: &[u8]) -> Result<DirectDylibMetadata> {
+    let Ok(kind) = FileKind::parse(bytes) else {
+        return Ok(DirectDylibMetadata::default());
+    };
+
+    match kind {
+        FileKind::MachO64 => direct_dylib_metadata_from_macho_bytes(bytes),
+        FileKind::MachOFat32 => {
+            let fat = MachOFatFile32::parse(bytes)?;
+            for arch in fat.arches() {
+                if arch.cputype() == macho::CPU_TYPE_ARM64 {
+                    return direct_dylib_metadata_from_macho_bytes(arch.data(bytes)?);
+                }
+            }
+            Ok(DirectDylibMetadata::default())
+        }
+        FileKind::MachOFat64 => {
+            let fat = MachOFatFile64::parse(bytes)?;
+            for arch in fat.arches() {
+                if arch.cputype() == macho::CPU_TYPE_ARM64 {
+                    return direct_dylib_metadata_from_macho_bytes(arch.data(bytes)?);
+                }
+            }
+            Ok(DirectDylibMetadata::default())
+        }
+        _ => Ok(DirectDylibMetadata::default()),
+    }
+}
+
+fn direct_dylib_metadata_from_macho_bytes(bytes: &[u8]) -> Result<DirectDylibMetadata> {
+    let header = macho::MachHeader64::<Endianness>::parse(bytes, 0)?;
+    ensure!(
+        header.endian()?.is_little_endian(),
+        "only little-endian Mach-O dylibs are currently supported"
+    );
+    ensure!(
+        header.cputype(Endianness::Little) == macho::CPU_TYPE_ARM64,
+        "only ARM64 Mach-O dylibs are currently supported"
+    );
+
+    if header.filetype(Endianness::Little) != macho::MH_DYLIB {
+        return Ok(DirectDylibMetadata::default());
+    }
+
+    let mut commands = header.load_commands(Endianness::Little, bytes, 0)?;
+    let mut exported_symbols = BTreeSet::new();
+
+    while let Some(command) = commands.next()? {
+        if command.cmd() == macho::LC_DYLD_EXPORTS_TRIE {
+            let export_command: &macho::LinkeditDataCommand<_> = command.data()?;
+            for export in export_command.exports_trie(Endianness::Little, bytes)? {
+                exported_symbols.insert(export?.name().to_vec());
+            }
+        }
+        if let Some(symtab_command) = command.symtab()? {
+            let symbols =
+                symtab_command.symbols::<macho::MachHeader64<_>, _>(Endianness::Little, bytes)?;
+
+            for symbol in symbols.iter() {
+                if symbol.has_name()
+                    && !symbol.is_local()
+                    && !platform::Symbol::is_undefined(symbol)
+                    && !symbol.is_hidden()
+                {
+                    exported_symbols
+                        .insert(symbol.name(Endianness::Little, symbols.strings())?.to_vec());
+                }
+            }
+        }
+    }
+
+    Ok(DirectDylibMetadata { exported_symbols })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::Args as _;
@@ -678,5 +820,173 @@ mod tests {
         assert!(args.is_dynamiclib);
         assert!(!args.should_output_executable);
         assert!(!args.should_output_executable());
+    }
+
+    #[test]
+    fn direct_dylib_input_records_export_ordinals() {
+        let bytes = synthetic_dylib_with_symbol(b"_wild_exported_symbol");
+        let metadata = direct_dylib_metadata_from_macho_bytes(&bytes).unwrap();
+
+        assert_one_export(metadata, b"_wild_exported_symbol");
+    }
+
+    #[test]
+    fn direct_dylib_input_reads_export_trie() {
+        let bytes = synthetic_dylib_with_export_trie(b"_wild_trie_symbol");
+        let metadata = direct_dylib_metadata_from_macho_bytes(&bytes).unwrap();
+
+        assert_one_export(metadata, b"_wild_trie_symbol");
+    }
+
+    #[test]
+    fn direct_dylib_input_reads_universal_arm64_slice() {
+        let slice = synthetic_dylib_with_symbol(b"_wild_fat_symbol");
+        let bytes = synthetic_fat_with_arm64_slice(&slice);
+        let metadata = direct_dylib_metadata_from_file_bytes(&bytes).unwrap();
+
+        assert_one_export(metadata, b"_wild_fat_symbol");
+    }
+
+    fn assert_one_export(metadata: DirectDylibMetadata, symbol_name: &[u8]) {
+        assert_eq!(metadata.exported_symbols.len(), 1);
+        assert!(metadata.exported_symbols.contains(symbol_name));
+    }
+
+    fn synthetic_dylib_with_symbol(symbol_name: &[u8]) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const DYLIB_COMMAND_SIZE: usize = 24;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_SIZE: usize = 16;
+
+        let install_name = b"@rpath/libwild-test.dylib";
+        let id_command_size = (DYLIB_COMMAND_SIZE + install_name.len() + 1)
+            .next_multiple_of(crate::macho::MACHO_COMMAND_ALIGNMENT);
+        let sizeofcmds = id_command_size + SYMTAB_COMMAND_SIZE;
+        let symoff = HEADER_SIZE + sizeofcmds;
+        let stroff = symoff + NLIST_SIZE;
+
+        let mut string_table = Vec::with_capacity(symbol_name.len() + 2);
+        string_table.push(0);
+        string_table.extend_from_slice(symbol_name);
+        string_table.push(0);
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, macho::MH_MAGIC_64);
+        push_u32(&mut bytes, macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, macho::MH_DYLIB);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, sizeofcmds as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, macho::LC_ID_DYLIB);
+        push_u32(&mut bytes, id_command_size as u32);
+        push_u32(&mut bytes, DYLIB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        bytes.extend_from_slice(install_name);
+        bytes.push(0);
+        bytes.resize(HEADER_SIZE + id_command_size, 0);
+
+        push_u32(&mut bytes, macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, string_table.len() as u32);
+
+        push_u32(&mut bytes, 1);
+        bytes.push(macho::N_SECT | macho::N_EXT);
+        bytes.push(1);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&string_table);
+
+        bytes
+    }
+
+    fn synthetic_dylib_with_export_trie(symbol_name: &[u8]) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const DYLIB_COMMAND_SIZE: usize = 24;
+        const LINKEDIT_DATA_COMMAND_SIZE: usize = 16;
+
+        let install_name = b"@rpath/libwild-test.dylib";
+        let id_command_size = (DYLIB_COMMAND_SIZE + install_name.len() + 1)
+            .next_multiple_of(crate::macho::MACHO_COMMAND_ALIGNMENT);
+        let sizeofcmds = id_command_size + LINKEDIT_DATA_COMMAND_SIZE;
+        let trie = synthetic_export_trie(symbol_name);
+        let trieoff = HEADER_SIZE + sizeofcmds;
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, macho::MH_MAGIC_64);
+        push_u32(&mut bytes, macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, macho::MH_DYLIB);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, sizeofcmds as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, macho::LC_ID_DYLIB);
+        push_u32(&mut bytes, id_command_size as u32);
+        push_u32(&mut bytes, DYLIB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        bytes.extend_from_slice(install_name);
+        bytes.push(0);
+        bytes.resize(HEADER_SIZE + id_command_size, 0);
+
+        push_u32(&mut bytes, macho::LC_DYLD_EXPORTS_TRIE);
+        push_u32(&mut bytes, LINKEDIT_DATA_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, trieoff as u32);
+        push_u32(&mut bytes, trie.len() as u32);
+        bytes.extend_from_slice(&trie);
+
+        bytes
+    }
+
+    fn synthetic_export_trie(symbol_name: &[u8]) -> Vec<u8> {
+        let child_offset = 2 + symbol_name.len() + 1 + 1;
+        assert!(child_offset < 128);
+
+        let mut trie = Vec::new();
+        trie.push(0);
+        trie.push(1);
+        trie.extend_from_slice(symbol_name);
+        trie.push(0);
+        trie.push(child_offset as u8);
+        trie.push(2);
+        trie.push(0);
+        trie.push(0);
+        trie.push(0);
+        trie
+    }
+
+    fn synthetic_fat_with_arm64_slice(slice: &[u8]) -> Vec<u8> {
+        const FAT_SLICE_OFFSET: usize = 0x1000;
+
+        let mut bytes = Vec::new();
+        push_be_u32(&mut bytes, macho::FAT_MAGIC);
+        push_be_u32(&mut bytes, 1);
+        push_be_u32(&mut bytes, macho::CPU_TYPE_ARM64 as u32);
+        push_be_u32(&mut bytes, 0);
+        push_be_u32(&mut bytes, FAT_SLICE_OFFSET as u32);
+        push_be_u32(&mut bytes, slice.len() as u32);
+        push_be_u32(&mut bytes, 12);
+
+        bytes.resize(FAT_SLICE_OFFSET, 0);
+        bytes.extend_from_slice(slice);
+        bytes
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_be_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_be_bytes());
     }
 }

@@ -1681,10 +1681,13 @@ impl platform::Platform for MachO {
 
     fn finalise_sizes_for_symbol<'data>(
         common: &mut crate::layout::CommonGroupState<'data, Self>,
-        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        symbol_id: crate::symbol_db::SymbolId,
+        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        _symbol_id: crate::symbol_db::SymbolId,
         flags: crate::value_flags::ValueFlags,
     ) -> crate::error::Result {
+        if flags.is_dynamic() && flags.has_resolution() {
+            common.allocate(part_id::DYNSYM, size_of::<SymtabEntry>() as u64);
+        }
         Ok(())
     }
 
@@ -2388,7 +2391,9 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
                 }
                 macho::ARM64_RELOC_GOT_LOAD_PAGE21
                 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
-                | macho::ARM64_RELOC_POINTER_TO_GOT => {
+                | macho::ARM64_RELOC_POINTER_TO_GOT
+                | macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+                | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
                     flags_to_add |= ValueFlags::GOT;
                 }
                 _ => {}
