@@ -2999,7 +2999,7 @@ fn direct_copy_patch_sections<'a>(
             .context("Failed to parse incremental patch candidate input")?;
         for record in records {
             let section = file
-                .section_by_index(object::SectionIndex(record.section_index as usize))
+                .section_by_index(patch_section_object_index(&file, record.section_index)?)
                 .context("Missing incremental patch candidate section")?;
             let data = section
                 .data()
@@ -3654,15 +3654,19 @@ fn changed_patch_sections(
             .context("Failed to parse current patch input")?;
 
         for patch_section in sections {
+            let Some(previous_index) = patch_section_index(&previous_file, &patch_section.previous)?
+            else {
+                return Ok(None);
+            };
+            let Some(current_index) = patch_section_index(&current_file, &patch_section.current)?
+            else {
+                return Ok(None);
+            };
             let previous_section = previous_file
-                .section_by_index(object::SectionIndex(
-                    patch_section.previous.section_index as usize,
-                ))
+                .section_by_index(previous_index)
                 .context("Missing previous incremental patch section")?;
             let current_section = current_file
-                .section_by_index(object::SectionIndex(
-                    patch_section.current.section_index as usize,
-                ))
+                .section_by_index(current_index)
                 .context("Missing current incremental patch section")?;
             let previous_data = previous_section
                 .data()
@@ -3684,9 +3688,7 @@ fn patch_section_index(
     patch_section: &PatchSection,
 ) -> Result<Option<object::SectionIndex>> {
     let Some(name) = patch_section.section_name.as_deref() else {
-        return Ok(Some(object::SectionIndex(
-            patch_section.section_index as usize,
-        )));
+        return patch_section_object_index(file, patch_section.section_index).map(Some);
     };
 
     let mut matches = file
@@ -4912,6 +4914,20 @@ fn patch_ranges(
     } else {
         Ok(Some(ranges))
     }
+}
+
+fn patch_section_object_index(
+    file: &object::File<'_>,
+    section_index: u32,
+) -> Result<object::SectionIndex> {
+    let section_index = section_index as usize;
+    let section_index = match file {
+        object::File::MachO32(_) | object::File::MachO64(_) => section_index
+            .checked_add(1)
+            .context("Mach-O incremental section index overflow")?,
+        _ => section_index,
+    };
+    Ok(object::SectionIndex(section_index))
 }
 
 fn update_hash_with_zeroes(hasher: &mut blake3::Hasher, mut len: usize) {

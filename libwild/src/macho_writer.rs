@@ -623,6 +623,7 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::compact_unwind_dwarf_offset_hint;
     use super::path_matches_library;
 
     #[test]
@@ -652,6 +653,13 @@ mod tests {
             b"/usr/lib/libcompression.dylib",
             b"libc",
         ));
+    }
+
+    #[test]
+    fn compact_unwind_dwarf_offset_hint_falls_back_to_section_start() {
+        assert_eq!(compact_unwind_dwarf_offset_hint(0), 0);
+        assert_eq!(compact_unwind_dwarf_offset_hint(0x00ff_ffff), 0x00ff_ffff);
+        assert_eq!(compact_unwind_dwarf_offset_hint(0x0100_0000), 0);
     }
 }
 
@@ -1727,6 +1735,7 @@ struct FdeInfo {
 
 const UNWIND_ARM64_MODE_MASK: u32 = 0x0f00_0000;
 const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
+const UNWIND_DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
 const UNWIND_PERSONALITY_MASK: u32 = 0x3000_0000;
 const UNWIND_HAS_LSDA: u32 = 0x4000_0000;
 const UNWIND_COMMON_ENCODINGS: [u32; 3] = [0x0200_0000, 0x0400_0000, 0];
@@ -1944,12 +1953,9 @@ fn collect_unwind_info_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindInf
                         else {
                             continue;
                         };
-                        let output_dwarf_offset = fde_info.output_offset;
-                        ensure!(
-                            output_dwarf_offset <= 0x00ff_ffff,
-                            "Mach-O __eh_frame offset {output_dwarf_offset:#x} exceeds compact-unwind DWARF encoding range"
-                        );
-                        encoding = (encoding & !0x00ff_ffff) | output_dwarf_offset as u32;
+                        let output_dwarf_offset =
+                            compact_unwind_dwarf_offset_hint(fde_info.output_offset);
+                        encoding = (encoding & !UNWIND_DWARF_OFFSET_MASK) | output_dwarf_offset;
                         personality_offset = personality_offset.or(fde_info.personality_offset);
                         lsda_offset = lsda_offset.or(fde_info.lsda_offset);
                     }
@@ -1972,15 +1978,12 @@ fn collect_unwind_info_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindInf
                     else {
                         continue;
                     };
-                    ensure!(
-                        fde_info.output_offset <= 0x00ff_ffff,
-                        "Mach-O __eh_frame offset {:#x} exceeds compact-unwind DWARF encoding range",
-                        fde_info.output_offset
-                    );
+                    let output_dwarf_offset =
+                        compact_unwind_dwarf_offset_hint(fde_info.output_offset);
                     entries.push(UnwindInfoEntry {
                         function_offset,
                         length: fde_info.length,
-                        encoding: UNWIND_ARM64_MODE_DWARF | fde_info.output_offset as u32,
+                        encoding: UNWIND_ARM64_MODE_DWARF | output_dwarf_offset,
                         personality_offset: fde_info.personality_offset,
                         lsda_offset: fde_info.lsda_offset,
                     });
@@ -1990,6 +1993,17 @@ fn collect_unwind_info_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindInf
     }
 
     Ok(entries)
+}
+
+fn compact_unwind_dwarf_offset_hint(output_offset: u64) -> u32 {
+    if output_offset <= u64::from(UNWIND_DWARF_OFFSET_MASK) {
+        output_offset as u32
+    } else {
+        // This field is only a DWARF FDE search hint. When the exact offset
+        // does not fit, Darwin linkers point the unwinder at the start of
+        // __eh_frame so it can scan from there.
+        0
+    }
 }
 
 fn eh_frame_fde_infos<'data>(
