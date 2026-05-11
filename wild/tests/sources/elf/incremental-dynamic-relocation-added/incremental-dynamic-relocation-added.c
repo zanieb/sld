@@ -2,6 +2,7 @@
 //#Mode:dynamic
 //#Object:incremental-dynamic-relocation-added-unchanged.c
 //#Shared:incremental-dynamic-relocation-added-shared.c
+//#LinkArgs:--no-gc-sections
 //#RunEnabled:false
 //#DiffEnabled:false
 //#TestIncremental:true
