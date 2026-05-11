@@ -1,3 +1,5 @@
+use crate::archive::ArchiveEntry;
+use crate::archive::ArchiveIterator;
 use crate::error::Context as _;
 use crate::error::Result;
 use crate::input_data::FileLoader;
@@ -615,6 +617,11 @@ struct SectionReference {
 struct PatchInputBytes<'data> {
     bytes: &'data [u8],
     file_offset: usize,
+}
+
+struct ParsedPatchInputRef {
+    identifier: Vec<u8>,
+    range: std::ops::Range<usize>,
 }
 
 impl MatchedPatchSection {
@@ -1481,29 +1488,41 @@ fn patch_input_bytes<'data>(
     input_file_path: &str,
     input_ref: &str,
 ) -> Result<Option<PatchInputBytes<'data>>> {
-    let Some(range) = patch_input_range(input_file_path, input_ref)? else {
+    let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)? else {
         return Ok(Some(PatchInputBytes {
             bytes,
             file_offset: 0,
         }));
     };
-    if range.is_empty() {
+    if parsed.range.is_empty() {
         return Ok(None);
     }
 
-    let Some(input_bytes) = bytes.get(range.clone()) else {
+    if let Some(member) = patch_archive_member_bytes(bytes, &parsed.identifier)? {
+        return Ok(Some(member));
+    }
+
+    let Some(input_bytes) = bytes.get(parsed.range.clone()) else {
         return Ok(None);
     };
     Ok(Some(PatchInputBytes {
         bytes: input_bytes,
-        file_offset: range.start,
+        file_offset: parsed.range.start,
     }))
 }
 
+#[cfg(test)]
 fn patch_input_range(
     input_file_path: &str,
     input_ref: &str,
 ) -> Result<Option<std::ops::Range<usize>>> {
+    Ok(parse_patch_input_ref(input_file_path, input_ref)?.map(|input_ref| input_ref.range))
+}
+
+fn parse_patch_input_ref(
+    input_file_path: &str,
+    input_ref: &str,
+) -> Result<Option<ParsedPatchInputRef>> {
     let input_file_path_bytes =
         hex::decode(input_file_path).context("Malformed incremental input file path")?;
     let input_ref_bytes = hex::decode(input_ref).context("Malformed incremental input ref")?;
@@ -1515,16 +1534,26 @@ fn patch_input_range(
         .strip_prefix(input_file_path_bytes.as_slice())
         .and_then(|rest| rest.strip_prefix(&[0]))
     else {
-        return Ok(Some(0..0));
+        return Ok(Some(ParsedPatchInputRef {
+            identifier: Vec::new(),
+            range: 0..0,
+        }));
     };
     let Some(separator) = rest.iter().position(|byte| *byte == 0) else {
-        return Ok(Some(0..0));
+        return Ok(Some(ParsedPatchInputRef {
+            identifier: Vec::new(),
+            range: 0..0,
+        }));
     };
+    let identifier = rest[..separator].to_vec();
     let range_bytes = &rest[separator + 1..];
     let range =
         std::str::from_utf8(range_bytes).context("Malformed incremental archive member range")?;
     let Some((start, end)) = range.split_once(':') else {
-        return Ok(Some(0..0));
+        return Ok(Some(ParsedPatchInputRef {
+            identifier: Vec::new(),
+            range: 0..0,
+        }));
     };
     let start = start
         .parse()
@@ -1533,9 +1562,39 @@ fn patch_input_range(
         .parse()
         .context("Invalid incremental archive member end offset")?;
     if start > end {
-        return Ok(Some(0..0));
+        return Ok(Some(ParsedPatchInputRef {
+            identifier: Vec::new(),
+            range: 0..0,
+        }));
     }
-    Ok(Some(start..end))
+    Ok(Some(ParsedPatchInputRef {
+        identifier,
+        range: start..end,
+    }))
+}
+
+fn patch_archive_member_bytes<'data>(
+    bytes: &'data [u8],
+    identifier: &[u8],
+) -> Result<Option<PatchInputBytes<'data>>> {
+    if identifier.is_empty() {
+        return Ok(None);
+    }
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    for entry in archive {
+        match entry? {
+            ArchiveEntry::Regular(content) if content.ident.as_slice() == identifier => {
+                return Ok(Some(PatchInputBytes {
+                    bytes: content.entry_data,
+                    file_offset: content.data_offset,
+                }));
+            }
+            ArchiveEntry::Regular(_) | ArchiveEntry::Thin(_) => {}
+        }
+    }
+    Ok(None)
 }
 
 fn patch_fingerprint(
@@ -3422,6 +3481,33 @@ mod tests {
         let input_file = hex::encode("main.o");
 
         assert_eq!(patch_input_range(&input_file, &input_file).unwrap(), None);
+    }
+
+    #[test]
+    fn patch_input_bytes_finds_archive_member_by_identifier() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"padding.o".to_vec(), 4),
+                b"xxxx".as_slice(),
+            )
+            .unwrap();
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 11),
+                b"member-data".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let input_file = hex::encode("libarchive.a");
+        let stale_ref = hex::encode("libarchive.a\0member.o\01:5");
+
+        let member = patch_input_bytes(&archive, &input_file, &stale_ref)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(member.bytes, b"member-data");
+        assert_ne!(member.file_offset, 1);
     }
 
     #[test]
