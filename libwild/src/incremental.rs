@@ -2815,14 +2815,10 @@ where
         let input_relocations = relocations_by_file.get(input.path.as_str());
         let input_relocation_targets = relocation_targets_by_file.get(input.path.as_str());
         let input_fdes = fdes_by_file.get(input.path.as_str());
-        if input_dynamic_relocations.is_none()
-            && input_relocations.is_none()
-            && input_relocation_targets.is_none()
-            && input_fdes.is_none()
-            && input
-                .patch
-                .as_ref()
-                .is_some_and(|patch| patch_state_matches_section_records(patch, sections))
+        if input
+            .patch
+            .as_ref()
+            .is_some_and(|patch| patch_state_matches_section_records(patch, sections))
         {
             continue;
         }
@@ -8549,6 +8545,63 @@ mod tests {
             &[],
             &[],
             &[],
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            input_files[0].patch.as_ref().unwrap().fingerprint,
+            "patch-hash"
+        );
+    }
+
+    #[test]
+    fn record_patch_fingerprints_preserves_matching_existing_patch_with_metadata() {
+        let arena = colosseum::sync::Arena::new();
+        let file_loader = FileLoader::new(&arena);
+        let mut output =
+            LazyOutputBytes::new(|| panic!("matching patch metadata should not read output bytes"));
+        let mut input_files = vec![FileState {
+            path: hex::encode("a.o"),
+            content: FileContentState::from_bytes(b"a"),
+            patch: Some(FilePatchState {
+                fingerprint: "patch-hash".to_owned(),
+                sections: vec![FilePatchSectionState {
+                    input: hex::encode("a.o"),
+                    section_index: 1,
+                    section_name: Some(".data.a".to_owned()),
+                    input_size: 4,
+                    output_offset: 100,
+                    output_size: 4,
+                    data_hash: Some("patch-section-hash".to_owned()),
+                }],
+            }),
+        }];
+        let sections = vec![section_record("a.o", 1, 100, 4)];
+        let relocations = vec![relocation_record(
+            "a.o",
+            1,
+            42,
+            Some(0x1000),
+            0x1000,
+            Some("target"),
+            Some(("a.o", 1, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        )];
+        let fdes = vec![fde_record("a.o", 1, 2, 0, 200, 24)];
+        let dynamic_relocations = vec![dynamic_relocation_record("a.o", 1, 0, 300, 24)];
+
+        record_patch_fingerprints(
+            &mut input_files,
+            &file_loader,
+            &sections,
+            &relocations,
+            &fdes,
+            &dynamic_relocations,
             &mut output,
         )
         .unwrap();
