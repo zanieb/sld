@@ -2773,7 +2773,7 @@ fn section_allows_incremental_padding<'data, P: Platform>(
     object_state
         .object
         .section_name(header)
-        .is_ok_and(crate::incremental::section_name_allows_direct_patching)
+        .is_ok_and(crate::incremental::section_name_allows_incremental_padding)
 }
 
 pub(crate) fn resolution_flags(rel_kind: RelocationKind) -> ValueFlags {

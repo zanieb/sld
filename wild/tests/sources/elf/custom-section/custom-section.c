@@ -13,6 +13,12 @@
 //#Config:object:default
 //#Object:custom_section0.c
 
+//#Config:incremental-padding:object
+//#WildExtraLinkArgs:--incremental --incremental-padding-percent=100
+//#DiffEnabled:false
+//#TestIncremental:true
+//#TestIncrementalCompareFull:false
+
 #include "../common/runtime.h"
 
 static int foo1 __attribute__((used, section("foo"))) = 2;
