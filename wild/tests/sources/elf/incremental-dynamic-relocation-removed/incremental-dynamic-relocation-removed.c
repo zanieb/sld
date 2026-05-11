@@ -13,6 +13,7 @@
 //#TestIncrementalChangedSection:.rela.data.rel.incremental_dynamic_removed
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
+//#TestIncrementalChangedRestore:true
 //#TestIncrementalChangedSymbolBytes:incremental_dynamic_removed_payload=0x2b000000
 //#TestIncrementalStateContains:dynrel\t
 
