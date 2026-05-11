@@ -6,6 +6,7 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
+//#TestIncrementalChangedExpectReuse:true
 //#TestIncrementalChangedInput:incremental-strict.c.o
 //#TestIncrementalChangedSection:.init
 

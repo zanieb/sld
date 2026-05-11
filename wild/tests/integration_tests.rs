@@ -163,6 +163,9 @@
 //! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
 //! Only used when TestIncrementalChangedExpectPatch is false.
 //!
+//! TestIncrementalChangedExpectReuse:{bool} Whether the changed-input incremental relink should
+//! log reuse of unchanged input sections. Defaults to false.
+//!
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Defaults to the last linker input.
 //!
@@ -772,6 +775,7 @@ struct Config {
     test_incremental_changed: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
+    test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
     test_config: TestConfig,
@@ -1346,6 +1350,7 @@ impl Config {
             test_incremental_changed: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
+            test_incremental_changed_expect_reuse: false,
             test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
             test_config: test_config.clone(),
@@ -1727,6 +1732,9 @@ fn process_directive(
         }
         "TestIncrementalChangedFallbackReason" => {
             config.test_incremental_changed_fallback_reason = Some(arg.to_owned());
+        }
+        "TestIncrementalChangedExpectReuse" => {
+            config.test_incremental_changed_expect_reuse = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedInput" => {
             config.test_incremental_changed_input = Some(arg.to_owned());
@@ -2178,6 +2186,16 @@ impl ProgramInputs {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not record the \
                     expected incremental fallback. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+            if config.test_incremental_changed_expect_reuse
+                && (!log.contains("reused ") || !log.contains(" unchanged input sections"))
+            {
+                bail!(
+                    "Incremental test failed for {}: changed-input relink did not reuse \
+                    unchanged input sections. Log:\n{}",
                     self.name(),
                     log
                 );
