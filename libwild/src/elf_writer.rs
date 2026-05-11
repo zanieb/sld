@@ -3158,6 +3158,7 @@ fn apply_relocation<
             table_writer,
             resolution,
             place,
+            rel.offset(),
             addend,
             section_info,
             symbol_index,
@@ -3756,6 +3757,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
     table_writer: &mut TableWriter,
     resolution: Resolution<Elf>,
     place: u64,
+    relocation_offset: u64,
     addend: i64,
     section_info: SectionInfo<<A::Platform as Platform>::SectionFlags>,
     symbol_index: object::SymbolIndex,
@@ -3789,6 +3791,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             incremental,
             object_layout,
             section_info,
+            relocation_offset,
             output_offset,
             elf::RELA_ENTRY_SIZE,
         );
@@ -3806,6 +3809,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             incremental,
             object_layout,
             section_info,
+            relocation_offset,
             output_offset,
             elf::RELA_ENTRY_SIZE,
         );
@@ -3824,6 +3828,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             incremental,
             object_layout,
             section_info,
+            relocation_offset,
             written.output_offset,
             written.size,
         );
@@ -3844,6 +3849,7 @@ fn record_dynamic_relocation_for_section(
     incremental: &PreparedState,
     object_layout: &ObjectLayout<'_, Elf>,
     section_info: SectionInfo<impl platform::SectionFlags>,
+    relocation_offset: u64,
     output_offset: u64,
     size: u64,
 ) {
@@ -3851,6 +3857,7 @@ fn record_dynamic_relocation_for_section(
         incremental.record_dynamic_relocation(
             object_layout.input,
             section_index,
+            relocation_offset,
             output_offset,
             size,
         );
