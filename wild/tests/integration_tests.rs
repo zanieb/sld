@@ -2208,16 +2208,8 @@ fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
     let original =
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
     let mut bytes = original.clone();
-    let (offset, len) = {
-        let file = object::File::parse(bytes.as_slice())
-            .with_context(|| format!("Failed to parse `{}` as an object file", path.display()))?;
-        let section = file
-            .section_by_name(section_name)
-            .with_context(|| format!("Missing {section_name} section in `{}`", path.display()))?;
-        section
-            .file_range()
-            .with_context(|| format!("Missing {section_name} file range in `{}`", path.display()))?
-    };
+    let (offset, len) = mutation_section_file_range(bytes.as_slice(), path, section_name)?
+        .with_context(|| format!("Missing {section_name} section in `{}`", path.display()))?;
     ensure!(
         len > 0,
         "Cannot mutate empty {section_name} section in `{}`",
@@ -2244,6 +2236,56 @@ fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
         path.display()
     );
     Ok(())
+}
+
+fn mutation_section_file_range(
+    bytes: &[u8],
+    path: &Path,
+    section_name: &str,
+) -> Result<Option<(u64, u64)>> {
+    match object::File::parse(bytes) {
+        Ok(file) => {
+            let section = file.section_by_name(section_name).with_context(|| {
+                format!("Missing {section_name} section in `{}`", path.display())
+            })?;
+            return Ok(Some(section.file_range().with_context(|| {
+                format!("Missing {section_name} file range in `{}`", path.display())
+            })?));
+        }
+        Err(object_error) => {
+            let archive = object::read::archive::ArchiveFile::parse(bytes).with_context(|| {
+                format!(
+                    "Failed to parse `{}` as an object file ({object_error}) or archive",
+                    path.display()
+                )
+            })?;
+            if archive.is_thin() {
+                return Ok(None);
+            }
+            for member in archive.members() {
+                let member = member.with_context(|| {
+                    format!("Failed to read archive member in `{}`", path.display())
+                })?;
+                let member_data = member.data(bytes).with_context(|| {
+                    format!("Failed to read archive member data in `{}`", path.display())
+                })?;
+                let Ok(file) = object::File::parse(member_data) else {
+                    continue;
+                };
+                let Some(section) = file.section_by_name(section_name) else {
+                    continue;
+                };
+                let Some((section_offset, len)) = section.file_range() else {
+                    bail!(
+                        "Missing {section_name} file range in archive member of `{}`",
+                        path.display()
+                    );
+                };
+                return Ok(Some((member.file_range().0 + section_offset, len)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Removes the specified sections from the output file.

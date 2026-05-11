@@ -27,7 +27,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v11";
+const STATE_VERSION: &str = "wild-incremental-state-v12";
+const STATE_VERSION_V11: &str = "wild-incremental-state-v11";
 const STATE_VERSION_V10: &str = "wild-incremental-state-v10";
 const STATE_VERSION_V9: &str = "wild-incremental-state-v9";
 const STATE_VERSION_V8: &str = "wild-incremental-state-v8";
@@ -106,6 +107,7 @@ struct FilePatchState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilePatchSectionState {
+    input: String,
     section_index: u32,
     section_name: Option<String>,
     input_size: u64,
@@ -339,12 +341,12 @@ fn patch_changed_inputs(
                 path.display()
             )));
         }
-        let patch_section_indexes = previous_patch
+        let patch_section_keys = previous_patch
             .sections
             .iter()
-            .map(|section| section.section_index)
+            .map(|section| (section.input.as_str(), section.section_index))
             .collect::<HashSet<_>>();
-        if patch_section_indexes.len() != previous_patch.sections.len() {
+        if patch_section_keys.len() != previous_patch.sections.len() {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "duplicate patchable section metadata for `{}`",
                 path.display()
@@ -354,6 +356,7 @@ fn patch_changed_inputs(
             .sections
             .iter()
             .map(|section| PatchSection {
+                input: section.input.clone(),
                 section_index: section.section_index,
                 section_name: section.section_name.clone(),
                 input_size: section.input_size,
@@ -390,7 +393,11 @@ fn patch_changed_inputs(
             .map(|section| section.current.clone())
             .collect::<Vec<_>>();
 
-        let fingerprint = patch_fingerprint(&bytes, current_sections.iter().cloned())?;
+        let fingerprint = patch_fingerprint(
+            &bytes,
+            input.path.as_str(),
+            current_sections.iter().cloned(),
+        )?;
         if fingerprint.as_deref() != Some(previous_patch.fingerprint.as_str()) {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "changed bytes outside patchable sections in `{}`",
@@ -412,7 +419,7 @@ fn patch_changed_inputs(
         input_files[*input_index].patch = Some(previous_patch.clone());
 
         let Some(section_patches) =
-            patch_sections_for_input(&bytes, patch_sections.iter().cloned())?
+            patch_sections_for_input(&bytes, input.path.as_str(), patch_sections.iter().cloned())?
         else {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "changed patchable section size in `{}`",
@@ -581,6 +588,7 @@ fn flush_output_ranges(
 
 #[derive(Clone)]
 struct PatchSection {
+    input: String,
     section_index: u32,
     section_name: Option<String>,
     input_size: u64,
@@ -602,6 +610,11 @@ struct SectionReference {
     relocation_encoding: String,
     relocation_size: u8,
     relocation_addend: i64,
+}
+
+struct PatchInputBytes<'data> {
+    bytes: &'data [u8],
+    file_offset: usize,
 }
 
 impl MatchedPatchSection {
@@ -880,6 +893,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V11
             && version != STATE_VERSION_V10
             && version != STATE_VERSION_V9
             && version != STATE_VERSION_V8
@@ -919,6 +933,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V11
             || version == STATE_VERSION_V10
             || version == STATE_VERSION_V9
             || version == STATE_VERSION_V8
@@ -1310,12 +1325,10 @@ fn record_patch_fingerprints(
 ) -> Result {
     let mut sections_by_file = HashMap::<&str, Vec<&SectionRecord>>::new();
     for section in sections {
-        if section.input == section.input_file {
-            sections_by_file
-                .entry(section.input_file.as_str())
-                .or_default()
-                .push(section);
-        }
+        sections_by_file
+            .entry(section.input_file.as_str())
+            .or_default()
+            .push(section);
     }
 
     if sections_by_file.is_empty() {
@@ -1337,22 +1350,27 @@ fn record_patch_fingerprints(
             input.patch = None;
             continue;
         };
-        let patch_sections = direct_copy_patch_sections(input_file.data(), output, sections)?;
-        input.patch = patch_fingerprint(input_file.data(), patch_sections.iter().cloned())?.map(
-            |fingerprint| FilePatchState {
-                fingerprint,
-                sections: patch_sections
-                    .iter()
-                    .map(|section| FilePatchSectionState {
-                        section_index: section.section_index,
-                        section_name: section.section_name.clone(),
-                        input_size: section.input_size,
-                        output_offset: section.output_offset,
-                        output_size: section.output_size,
-                    })
-                    .collect(),
-            },
-        );
+        let patch_sections =
+            direct_copy_patch_sections(input_file.data(), input.path.as_str(), output, sections)?;
+        input.patch = patch_fingerprint(
+            input_file.data(),
+            input.path.as_str(),
+            patch_sections.iter().cloned(),
+        )?
+        .map(|fingerprint| FilePatchState {
+            fingerprint,
+            sections: patch_sections
+                .iter()
+                .map(|section| FilePatchSectionState {
+                    input: section.input.clone(),
+                    section_index: section.section_index,
+                    section_name: section.section_name.clone(),
+                    input_size: section.input_size,
+                    output_offset: section.output_offset,
+                    output_size: section.output_size,
+                })
+                .collect(),
+        });
     }
 
     Ok(())
@@ -1360,41 +1378,57 @@ fn record_patch_fingerprints(
 
 fn direct_copy_patch_sections<'a>(
     bytes: &[u8],
+    input_file_path: &str,
     output: &[u8],
     sections: &[&'a SectionRecord],
 ) -> Result<Vec<PatchSection>> {
-    let file =
-        object::File::parse(bytes).context("Failed to parse incremental patch candidate input")?;
     let mut patch_sections = Vec::new();
+
+    let mut sections_by_input = HashMap::<&str, Vec<&SectionRecord>>::new();
     for record in sections {
-        let section = file
-            .section_by_index(object::SectionIndex(record.section_index as usize))
-            .context("Missing incremental patch candidate section")?;
-        if !section_allows_direct_patching(&section) {
-            continue;
-        }
-        let data = section
-            .data()
-            .context("Failed to read incremental patch candidate section data")?;
-        if data.len() > record.size as usize {
-            continue;
-        }
-        let start = record.output_offset as usize;
-        let end = start
-            .checked_add(record.size as usize)
-            .context("Incremental patch output range overflow")?;
-        let Some(output_range) = output.get(start..end) else {
+        sections_by_input
+            .entry(record.input.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    for (input_ref, records) in sections_by_input {
+        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
             continue;
         };
-        let (data_out, padding) = output_range.split_at(data.len());
-        if data_out == data && padding.iter().all(|byte| *byte == 0) {
-            patch_sections.push(PatchSection {
-                section_index: record.section_index,
-                section_name: patch_section_name_for_matching(&section),
-                input_size: data.len() as u64,
-                output_offset: record.output_offset,
-                output_size: record.size,
-            });
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse incremental patch candidate input")?;
+        for record in records {
+            let section = file
+                .section_by_index(object::SectionIndex(record.section_index as usize))
+                .context("Missing incremental patch candidate section")?;
+            if !section_allows_direct_patching(&section) {
+                continue;
+            }
+            let data = section
+                .data()
+                .context("Failed to read incremental patch candidate section data")?;
+            if data.len() > record.size as usize {
+                continue;
+            }
+            let start = record.output_offset as usize;
+            let end = start
+                .checked_add(record.size as usize)
+                .context("Incremental patch output range overflow")?;
+            let Some(output_range) = output.get(start..end) else {
+                continue;
+            };
+            let (data_out, padding) = output_range.split_at(data.len());
+            if data_out == data && padding.iter().all(|byte| *byte == 0) {
+                patch_sections.push(PatchSection {
+                    input: record.input.clone(),
+                    section_index: record.section_index,
+                    section_name: patch_section_name_for_matching(&section),
+                    input_size: data.len() as u64,
+                    output_offset: record.output_offset,
+                    output_size: record.size,
+                });
+            }
         }
     }
     Ok(patch_sections)
@@ -1442,11 +1476,74 @@ fn section_name_is_stable_for_patch_matching(name: &str) -> bool {
         && !name.contains("__unnamed_")
 }
 
+fn patch_input_bytes<'data>(
+    bytes: &'data [u8],
+    input_file_path: &str,
+    input_ref: &str,
+) -> Result<Option<PatchInputBytes<'data>>> {
+    let Some(range) = patch_input_range(input_file_path, input_ref)? else {
+        return Ok(Some(PatchInputBytes {
+            bytes,
+            file_offset: 0,
+        }));
+    };
+    if range.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(input_bytes) = bytes.get(range.clone()) else {
+        return Ok(None);
+    };
+    Ok(Some(PatchInputBytes {
+        bytes: input_bytes,
+        file_offset: range.start,
+    }))
+}
+
+fn patch_input_range(
+    input_file_path: &str,
+    input_ref: &str,
+) -> Result<Option<std::ops::Range<usize>>> {
+    let input_file_path_bytes =
+        hex::decode(input_file_path).context("Malformed incremental input file path")?;
+    let input_ref_bytes = hex::decode(input_ref).context("Malformed incremental input ref")?;
+    if input_ref_bytes == input_file_path_bytes {
+        return Ok(None);
+    }
+
+    let Some(rest) = input_ref_bytes
+        .strip_prefix(input_file_path_bytes.as_slice())
+        .and_then(|rest| rest.strip_prefix(&[0]))
+    else {
+        return Ok(Some(0..0));
+    };
+    let Some(separator) = rest.iter().position(|byte| *byte == 0) else {
+        return Ok(Some(0..0));
+    };
+    let range_bytes = &rest[separator + 1..];
+    let range =
+        std::str::from_utf8(range_bytes).context("Malformed incremental archive member range")?;
+    let Some((start, end)) = range.split_once(':') else {
+        return Ok(Some(0..0));
+    };
+    let start = start
+        .parse()
+        .context("Invalid incremental archive member start offset")?;
+    let end = end
+        .parse()
+        .context("Invalid incremental archive member end offset")?;
+    if start > end {
+        return Ok(Some(0..0));
+    }
+    Ok(Some(start..end))
+}
+
 fn patch_fingerprint(
     bytes: &[u8],
+    input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<String>> {
-    let Some(ranges) = patch_ranges(bytes, sections)? else {
+    let Some(ranges) = patch_ranges(bytes, input_file_path, sections)? else {
         return Ok(None);
     };
 
@@ -1482,37 +1579,62 @@ fn match_patch_sections(
         Err(error) => return Err(error.into()),
     };
 
-    let previous_file =
-        object::File::parse(&*previous_bytes).context("Failed to parse previous patch input")?;
-    let current_file =
-        object::File::parse(current_bytes).context("Failed to parse current patch input")?;
-    let previous_references = section_reference_map(&previous_file)?;
-    let current_references = section_reference_map(&current_file)?;
+    let mut sections_by_input = HashMap::<&str, Vec<(usize, &PatchSection)>>::new();
+    for (section_index, section) in sections.iter().enumerate() {
+        sections_by_input
+            .entry(section.input.as_str())
+            .or_default()
+            .push((section_index, section));
+    }
 
-    let mut matched_sections = Vec::new();
-    for section in sections.iter().cloned() {
-        let Some(previous_index) = patch_section_index(&previous_file, &section)? else {
-            return Ok(None);
-        };
-        let Some(current_index) = match_current_patch_section_index(
-            &current_file,
-            &section,
-            previous_index,
-            &previous_references,
-            &current_references,
-        )?
+    let mut matched_sections = vec![None; sections.len()];
+    for (input_ref, sections) in sections_by_input {
+        let Some(previous_input_bytes) =
+            patch_input_bytes(&previous_bytes, previous_input.path.as_str(), input_ref)?
         else {
             return Ok(None);
         };
+        let Some(current_input_bytes) =
+            patch_input_bytes(current_bytes, previous_input.path.as_str(), input_ref)?
+        else {
+            return Ok(None);
+        };
+        let previous_file = object::File::parse(previous_input_bytes.bytes)
+            .context("Failed to parse previous patch input")?;
+        let current_file = object::File::parse(current_input_bytes.bytes)
+            .context("Failed to parse current patch input")?;
+        let previous_references = section_reference_map(&previous_file)?;
+        let current_references = section_reference_map(&current_file)?;
 
-        let mut previous = section.clone();
-        previous.section_index = previous_index.0 as u32;
-        let mut current = section;
-        current.section_index = current_index.0 as u32;
-        matched_sections.push(MatchedPatchSection { previous, current });
+        for (matched_index, section) in sections {
+            let Some(previous_index) = patch_section_index(&previous_file, section)? else {
+                return Ok(None);
+            };
+            let Some(current_index) = match_current_patch_section_index(
+                &current_file,
+                section,
+                previous_index,
+                &previous_references,
+                &current_references,
+            )?
+            else {
+                return Ok(None);
+            };
+
+            let mut previous = section.clone();
+            previous.section_index = previous_index.0 as u32;
+            let mut current = section.clone();
+            current.section_index = current_index.0 as u32;
+            matched_sections[matched_index] = Some(MatchedPatchSection { previous, current });
+        }
     }
 
-    Ok(Some(matched_sections))
+    Ok(Some(
+        matched_sections
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .context("Missing matched incremental patch section")?,
+    ))
 }
 
 fn match_current_patch_section_index(
@@ -1616,31 +1738,52 @@ fn changed_patch_sections(
         Err(error) => return Err(error.into()),
     };
 
-    let previous_file =
-        object::File::parse(&*previous_bytes).context("Failed to parse previous patch input")?;
-    let current_file =
-        object::File::parse(current_bytes).context("Failed to parse current patch input")?;
     let mut changed_sections = Vec::new();
 
-    for patch_section in sections {
-        let previous_section = previous_file
-            .section_by_index(object::SectionIndex(
-                patch_section.previous.section_index as usize,
-            ))
-            .context("Missing previous incremental patch section")?;
-        let current_section = current_file
-            .section_by_index(object::SectionIndex(
-                patch_section.current.section_index as usize,
-            ))
-            .context("Missing current incremental patch section")?;
-        let previous_data = previous_section
-            .data()
-            .context("Failed to read previous incremental patch section data")?;
-        let current_data = current_section
-            .data()
-            .context("Failed to read current incremental patch section data")?;
-        if previous_data != current_data {
-            changed_sections.push(patch_section.current.clone());
+    let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
+    for section in sections {
+        sections_by_input
+            .entry(section.current.input.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    for (input_ref, sections) in sections_by_input {
+        let Some(previous_input_bytes) =
+            patch_input_bytes(&previous_bytes, previous_input.path.as_str(), input_ref)?
+        else {
+            return Ok(None);
+        };
+        let Some(current_input_bytes) =
+            patch_input_bytes(current_bytes, previous_input.path.as_str(), input_ref)?
+        else {
+            return Ok(None);
+        };
+        let previous_file = object::File::parse(previous_input_bytes.bytes)
+            .context("Failed to parse previous patch input")?;
+        let current_file = object::File::parse(current_input_bytes.bytes)
+            .context("Failed to parse current patch input")?;
+
+        for patch_section in sections {
+            let previous_section = previous_file
+                .section_by_index(object::SectionIndex(
+                    patch_section.previous.section_index as usize,
+                ))
+                .context("Missing previous incremental patch section")?;
+            let current_section = current_file
+                .section_by_index(object::SectionIndex(
+                    patch_section.current.section_index as usize,
+                ))
+                .context("Missing current incremental patch section")?;
+            let previous_data = previous_section
+                .data()
+                .context("Failed to read previous incremental patch section data")?;
+            let current_data = current_section
+                .data()
+                .context("Failed to read current incremental patch section data")?;
+            if previous_data != current_data {
+                changed_sections.push(patch_section.current.clone());
+            }
         }
     }
 
@@ -1671,61 +1814,96 @@ fn patch_section_index(
 
 fn patch_sections_for_input(
     bytes: &[u8],
+    input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<Vec<SectionPatch>>> {
-    let file = object::File::parse(bytes).context("Failed to parse changed incremental input")?;
     let mut patches = Vec::new();
-    for patch_section in sections {
-        let Some(section_index) = patch_section_index(&file, &patch_section)? else {
+    let sections = sections.into_iter().collect::<Vec<_>>();
+    let mut sections_by_input = HashMap::<&str, Vec<&PatchSection>>::new();
+    for section in &sections {
+        sections_by_input
+            .entry(section.input.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    for (input_ref, sections) in sections_by_input {
+        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
             return Ok(None);
         };
-        let section = file
-            .section_by_index(section_index)
-            .context("Missing changed incremental input section")?;
-        let data = section
-            .data()
-            .context("Failed to read changed incremental input section data")?;
-        if data.len() as u64 != patch_section.input_size
-            || data.len() > patch_section.output_size as usize
-        {
-            return Ok(None);
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse changed incremental input")?;
+        for patch_section in sections {
+            let Some(section_index) = patch_section_index(&file, patch_section)? else {
+                return Ok(None);
+            };
+            let section = file
+                .section_by_index(section_index)
+                .context("Missing changed incremental input section")?;
+            let data = section
+                .data()
+                .context("Failed to read changed incremental input section data")?;
+            if data.len() as u64 != patch_section.input_size
+                || data.len() > patch_section.output_size as usize
+            {
+                return Ok(None);
+            }
+            patches.push(SectionPatch {
+                output_offset: patch_section.output_offset,
+                size: patch_section.output_size,
+                data: data.to_owned(),
+            });
         }
-        patches.push(SectionPatch {
-            output_offset: patch_section.output_offset,
-            size: patch_section.output_size,
-            data: data.to_owned(),
-        });
     }
     Ok(Some(patches))
 }
 
 fn patch_ranges(
     bytes: &[u8],
+    input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<Vec<std::ops::Range<usize>>>> {
-    let file = object::File::parse(bytes).context("Failed to parse incremental patch input")?;
     let mut ranges = Vec::new();
-    for patch_section in sections {
-        let Some(section_index) = patch_section_index(&file, &patch_section)? else {
+    let sections = sections.into_iter().collect::<Vec<_>>();
+    let mut sections_by_input = HashMap::<&str, Vec<&PatchSection>>::new();
+    for section in &sections {
+        sections_by_input
+            .entry(section.input.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    for (input_ref, sections) in sections_by_input {
+        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
             return Ok(None);
         };
-        let section = file
-            .section_by_index(section_index)
-            .context("Missing incremental patch input section")?;
-        let Some((offset, size)) = section.file_range() else {
-            return Ok(None);
-        };
-        if size != patch_section.input_size || size > patch_section.output_size {
-            return Ok(None);
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse incremental patch input")?;
+        for patch_section in sections {
+            let Some(section_index) = patch_section_index(&file, patch_section)? else {
+                return Ok(None);
+            };
+            let section = file
+                .section_by_index(section_index)
+                .context("Missing incremental patch input section")?;
+            let Some((offset, size)) = section.file_range() else {
+                return Ok(None);
+            };
+            if size != patch_section.input_size || size > patch_section.output_size {
+                return Ok(None);
+            }
+            let start = input_bytes
+                .file_offset
+                .checked_add(offset as usize)
+                .context("Incremental patch input range overflow")?;
+            let end = start
+                .checked_add(size as usize)
+                .context("Incremental patch input range overflow")?;
+            if end > bytes.len() {
+                return Ok(None);
+            }
+            ranges.push(start..end);
         }
-        let start = offset as usize;
-        let end = start
-            .checked_add(size as usize)
-            .context("Incremental patch input range overflow")?;
-        if end > bytes.len() {
-            return Ok(None);
-        }
-        ranges.push(start..end);
     }
 
     ranges.sort_by_key(|range| range.start);
@@ -2262,7 +2440,7 @@ fn parse_input_line(line: &str) -> Result<FileState> {
     let patch = patch_fingerprint
         .zip(patch_sections)
         .map(|(fingerprint, sections)| {
-            parse_patch_sections(sections).map(|sections| FilePatchState {
+            parse_patch_sections(&path, sections).map(|sections| FilePatchState {
                 fingerprint: fingerprint.to_owned(),
                 sections,
             })
@@ -2288,7 +2466,8 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
         .iter()
         .map(|section| {
             format!(
-                "{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}",
+                section.input,
                 section.section_index,
                 section.input_size,
                 section.output_offset,
@@ -2308,13 +2487,18 @@ fn render_build_id_hash_state(state: &BuildIdHashState) -> String {
     format!("{}\t{}", state.output_len, state.nodes)
 }
 
-fn parse_patch_sections(sections: &str) -> Result<Vec<FilePatchSectionState>> {
+fn parse_patch_sections(default_input: &str, sections: &str) -> Result<Vec<FilePatchSectionState>> {
     if sections.is_empty() {
         return Ok(Vec::new());
     }
     let mut parsed = Vec::new();
     for section in sections.split(',') {
         let parts = section.split(':').collect::<Vec<_>>();
+        let (input, parts) = match parts.len() {
+            4 | 5 => (default_input.to_owned(), parts.as_slice()),
+            6 => (parts[0].to_owned(), &parts[1..]),
+            _ => return Ok(Vec::new()),
+        };
         if parts.len() != 4 && parts.len() != 5 {
             return Ok(Vec::new());
         }
@@ -2329,6 +2513,7 @@ fn parse_patch_sections(sections: &str) -> Result<Vec<FilePatchSectionState>> {
             })
             .transpose()?;
         parsed.push(FilePatchSectionState {
+            input,
             section_index: parts[0]
                 .parse()
                 .context("Invalid incremental patch section index")?,
@@ -3058,9 +3243,11 @@ mod tests {
             content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
             patch: None,
         };
+        let input_ref = encode_path(&input);
         let mut current = bytes.clone();
         current[offset as usize] ^= 1;
         let patch_section = PatchSection {
+            input: input_ref,
             section_index: section.index().0 as u32,
             section_name: section.name().ok().map(str::to_owned),
             input_size: size,
@@ -3133,7 +3320,9 @@ mod tests {
         let Some((_, size)) = section.file_range() else {
             return;
         };
+        let input_ref = encode_path(Path::new("input.o"));
         let patch_section = PatchSection {
+            input: input_ref.clone(),
             section_index: section.index().0 as u32,
             section_name: section.name().ok().map(str::to_owned),
             input_size: size + 1,
@@ -3142,7 +3331,7 @@ mod tests {
         };
 
         assert!(
-            patch_sections_for_input(&bytes, [patch_section])
+            patch_sections_for_input(&bytes, &input_ref, [patch_section])
                 .unwrap()
                 .is_none()
         );
@@ -3182,7 +3371,9 @@ mod tests {
         let Some((section_name, size)) = selected else {
             return;
         };
+        let input_ref = encode_path(Path::new("input.o"));
         let patch_section = PatchSection {
+            input: input_ref.clone(),
             section_index: u32::MAX,
             section_name: Some(section_name),
             input_size: size,
@@ -3191,12 +3382,12 @@ mod tests {
         };
 
         assert!(
-            patch_ranges(&bytes, [patch_section.clone()])
+            patch_ranges(&bytes, &input_ref, [patch_section.clone()])
                 .unwrap()
                 .is_some()
         );
         assert!(
-            patch_sections_for_input(&bytes, [patch_section])
+            patch_sections_for_input(&bytes, &input_ref, [patch_section])
                 .unwrap()
                 .is_some()
         );
@@ -3213,6 +3404,24 @@ mod tests {
         assert!(!section_name_is_stable_for_patch_matching(
             ".data.rel.ro..L__unnamed_12"
         ));
+    }
+
+    #[test]
+    fn patch_input_range_decodes_archive_member_offsets() {
+        let input_file = hex::encode("libarchive.a");
+        let input_ref = hex::encode("libarchive.a\0member.o\012:34");
+
+        assert_eq!(
+            patch_input_range(&input_file, &input_ref).unwrap(),
+            Some(12..34)
+        );
+    }
+
+    #[test]
+    fn patch_input_range_uses_whole_file_for_direct_inputs() {
+        let input_file = hex::encode("main.o");
+
+        assert_eq!(patch_input_range(&input_file, &input_file).unwrap(), None);
     }
 
     #[test]
@@ -3245,6 +3454,7 @@ mod tests {
             fingerprint: "patch-hash".to_owned(),
             sections: vec![
                 FilePatchSectionState {
+                    input: hex::encode("a.o"),
                     section_index: 1,
                     section_name: Some(".text.foo".to_owned()),
                     input_size: 4,
@@ -3252,6 +3462,7 @@ mod tests {
                     output_size: 4,
                 },
                 FilePatchSectionState {
+                    input: hex::encode("a.o"),
                     section_index: 3,
                     section_name: Some(".data".to_owned()),
                     input_size: 8,
@@ -3259,6 +3470,7 @@ mod tests {
                     output_size: 12,
                 },
                 FilePatchSectionState {
+                    input: hex::encode("a.o"),
                     section_index: 5,
                     section_name: None,
                     input_size: 16,
@@ -3272,9 +3484,12 @@ mod tests {
         let rendered = state.render();
 
         assert!(rendered.contains(&format!(
-            "\tpatch-hash\t1:4:100:4:{},3:8:112:12:{},5:16:128:16:-\n",
+            "\tpatch-hash\t{}:1:4:100:4:{},{}:3:8:112:12:{},{}:5:16:128:16:-\n",
+            hex::encode("a.o"),
             hex::encode(".text.foo"),
-            hex::encode(".data")
+            hex::encode("a.o"),
+            hex::encode(".data"),
+            hex::encode("a.o"),
         )));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
@@ -3291,6 +3506,8 @@ mod tests {
         let sections = parsed.patch.unwrap().sections;
 
         assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].input, hex::encode("a.o"));
+        assert_eq!(sections[1].input, hex::encode("a.o"));
         assert_eq!(sections[0].section_name, None);
         assert_eq!(sections[1].section_name, None);
     }
