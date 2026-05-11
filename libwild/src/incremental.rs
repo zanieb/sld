@@ -1949,9 +1949,7 @@ fn patch_sections_for_input(
             let data = section
                 .data()
                 .context("Failed to read changed incremental input section data")?;
-            if data.len() as u64 != patch_section.input_size
-                || data.len() > patch_section.output_size as usize
-            {
+            if data.len() > patch_section.output_size as usize {
                 return Ok(None);
             }
             patches.push(SectionPatch {
@@ -1995,7 +1993,7 @@ fn patch_ranges(
             let Some((offset, size)) = section.file_range() else {
                 return Ok(None);
             };
-            if size != patch_section.input_size || size > patch_section.output_size {
+            if size > patch_section.output_size {
                 return Ok(None);
             }
             let start = input_bytes
@@ -2009,6 +2007,14 @@ fn patch_ranges(
                 return Ok(None);
             }
             ranges.push(start..end);
+            if let Some(size_range) =
+                elf_section_size_field_range(input_bytes.bytes, section_index.0)
+            {
+                ranges.push(
+                    input_bytes.file_offset + size_range.start
+                        ..input_bytes.file_offset + size_range.end,
+                );
+            }
         }
     }
 
@@ -2035,6 +2041,81 @@ fn update_hash_with_zeroes(hasher: &mut blake3::Hasher, mut len: usize) {
         hasher.update(&ZEROES[..chunk_len]);
         len -= chunk_len;
     }
+}
+
+fn elf_section_size_field_range(
+    bytes: &[u8],
+    section_index: usize,
+) -> Option<std::ops::Range<usize>> {
+    if bytes.len() < 0x34 || bytes.get(0..4)? != b"\x7fELF" || *bytes.get(5)? != 1 {
+        return None;
+    }
+
+    match *bytes.get(4)? {
+        1 => {
+            let section_header_offset = read_u32_le(bytes.get(0x20..0x24)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x2e..0x30)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x30..0x32)?)? as usize;
+            elf_section_header_field_range(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x14,
+                4,
+            )
+        }
+        2 => {
+            if bytes.len() < 0x40 {
+                return None;
+            }
+            let section_header_offset = read_u64_le(bytes.get(0x28..0x30)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x3a..0x3c)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x3c..0x3e)?)? as usize;
+            elf_section_header_field_range(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x20,
+                8,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn elf_section_header_field_range(
+    bytes: &[u8],
+    section_index: usize,
+    section_header_offset: usize,
+    section_header_size: usize,
+    section_count: usize,
+    field_offset: usize,
+    field_size: usize,
+) -> Option<std::ops::Range<usize>> {
+    if section_index >= section_count || section_header_size < field_offset + field_size {
+        return None;
+    }
+    let section_start =
+        section_header_offset.checked_add(section_index.checked_mul(section_header_size)?)?;
+    let field_start = section_start.checked_add(field_offset)?;
+    let field_end = field_start.checked_add(field_size)?;
+    (field_end <= bytes.len()).then_some(field_start..field_end)
+}
+
+fn read_u16_le(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u32_le(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u64_le(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn build_id_note_range(bytes: &[u8]) -> Result<Option<std::ops::Range<usize>>> {
@@ -3463,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_sections_for_input_rejects_section_size_changes() {
+    fn patch_sections_for_input_rejects_section_growth_beyond_capacity() {
         let Ok(current_exe) = std::env::current_exe() else {
             return;
         };
@@ -3487,9 +3568,9 @@ mod tests {
             input: input_ref.clone(),
             section_index: section.index().0 as u32,
             section_name: section.name().ok().map(str::to_owned),
-            input_size: size + 1,
+            input_size: size,
             output_offset: 64,
-            output_size: size + 1,
+            output_size: size - 1,
         };
 
         assert!(
@@ -3497,6 +3578,78 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn patch_fingerprint_allows_section_size_growth_within_capacity() {
+        let bytes = growable_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+        };
+        let previous_fingerprint = patch_fingerprint(&bytes, &input_ref, [patch_section.clone()])
+            .unwrap()
+            .unwrap();
+
+        let mut current = bytes.clone();
+        current[0x44] = 5;
+        current[0xe0..0xe8].copy_from_slice(&5_u64.to_le_bytes());
+
+        assert_eq!(
+            patch_fingerprint(&current, &input_ref, [patch_section.clone()])
+                .unwrap()
+                .unwrap(),
+            previous_fingerprint
+        );
+        let patches = patch_sections_for_input(&current, &input_ref, [patch_section])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].size, 8);
+        assert_eq!(patches[0].data, [1, 2, 3, 4, 5]);
+    }
+
+    fn growable_data_elf() -> Vec<u8> {
+        let mut bytes = vec![0; 0x140];
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0x80_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&3_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        bytes[0x40..0x44].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[0x48..0x59].copy_from_slice(b"\0.data\0.shstrtab\0");
+
+        let data_header = 0x80 + 64;
+        bytes[data_header..data_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 4..data_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 8..data_header + 16].copy_from_slice(&3_u64.to_le_bytes());
+        bytes[data_header + 24..data_header + 32].copy_from_slice(&0x40_u64.to_le_bytes());
+        bytes[data_header + 32..data_header + 40].copy_from_slice(&4_u64.to_le_bytes());
+        bytes[data_header + 48..data_header + 56].copy_from_slice(&8_u64.to_le_bytes());
+
+        let shstrtab_header = 0x80 + 128;
+        bytes[shstrtab_header..shstrtab_header + 4].copy_from_slice(&7_u32.to_le_bytes());
+        bytes[shstrtab_header + 4..shstrtab_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0x48_u64.to_le_bytes());
+        bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&17_u64.to_le_bytes());
+        bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
     }
 
     #[test]

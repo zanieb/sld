@@ -172,6 +172,9 @@
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
 //! to .data.
 //!
+//! TestIncrementalChangedGrowSection:{bytes} Whether the changed-input test should grow the
+//! selected ELF section by the supplied number of bytes instead of mutating an existing byte.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -778,6 +781,7 @@ struct Config {
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
+    test_incremental_changed_grow_section: Option<u64>,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1353,6 +1357,7 @@ impl Config {
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
+            test_incremental_changed_grow_section: None,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1742,6 +1747,12 @@ fn process_directive(
         "TestIncrementalChangedSection" => {
             arg.clone_into(&mut config.test_incremental_changed_section);
         }
+        "TestIncrementalChangedGrowSection" => {
+            config.test_incremental_changed_grow_section = Some(
+                arg.parse()
+                    .context("Invalid TestIncrementalChangedGrowSection")?,
+            );
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -2108,10 +2119,18 @@ impl ProgramInputs {
                 );
             }
 
-            mutate_section_byte(
-                &changed_input.path,
-                &config.test_incremental_changed_section,
-            )?;
+            if let Some(growth) = config.test_incremental_changed_grow_section {
+                grow_section_bytes(
+                    &changed_input.path,
+                    &config.test_incremental_changed_section,
+                    growth,
+                )?;
+            } else {
+                mutate_section_byte(
+                    &changed_input.path,
+                    &config.test_incremental_changed_section,
+                )?;
+            }
 
             let link_output_3 =
                 Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -2254,6 +2273,196 @@ fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
         path.display()
     );
     Ok(())
+}
+
+fn grow_section_bytes(path: &Path, section_name: &str, growth: u64) -> Result {
+    ensure!(growth > 0, "Section growth must be non-zero");
+
+    let original =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let mut bytes = original.clone();
+    let (offset, size, section_index, limit, size_field) = {
+        let file = object::File::parse(bytes.as_slice())
+            .with_context(|| format!("Failed to parse `{}`", path.display()))?;
+        let section = file
+            .section_by_name(section_name)
+            .with_context(|| format!("Missing {section_name} section in `{}`", path.display()))?;
+        let Some((offset, size)) = section.file_range() else {
+            bail!(
+                "Cannot grow {section_name} section without file data in `{}`",
+                path.display()
+            );
+        };
+        let section_index = section.index().0;
+        let size_field = elf_section_size_field(bytes.as_slice(), section_index)
+            .with_context(|| format!("Cannot locate ELF section size for `{}`", path.display()))?;
+        let limit = section_growth_limit(&file, section_index, offset, bytes.len())?;
+        (offset, size, section_index, limit, size_field)
+    };
+
+    let new_size = size
+        .checked_add(growth)
+        .context("Incremental changed section size overflow")?;
+    ensure!(
+        offset + new_size <= limit,
+        "Cannot grow {section_name} in `{}` by {growth} bytes without moving later object data",
+        path.display()
+    );
+
+    let old_end = usize::try_from(offset + size)
+        .with_context(|| format!("Invalid {section_name} end offset"))?;
+    let new_end = usize::try_from(offset + new_size)
+        .with_context(|| format!("Invalid grown {section_name} end offset"))?;
+    for (index, byte) in bytes[old_end..new_end].iter_mut().enumerate() {
+        *byte = 0x80_u8.wrapping_add(index as u8);
+    }
+    size_field.write(&mut bytes, new_size)?;
+
+    let tmp_path = append_to_path(path, ".mutated");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write mutated object `{}`", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to replace `{}` with mutated object `{}`",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    let mutated =
+        std::fs::read(path).with_context(|| format!("Failed to reread `{}`", path.display()))?;
+    ensure!(
+        mutated != original,
+        "Mutation did not change `{}` section index {section_index}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ElfSizeField {
+    range: std::ops::Range<usize>,
+    width: usize,
+}
+
+impl ElfSizeField {
+    fn write(self, bytes: &mut [u8], value: u64) -> Result {
+        match self.width {
+            4 => {
+                let value = u32::try_from(value).context("ELF32 section size overflow")?;
+                bytes[self.range].copy_from_slice(&value.to_le_bytes());
+            }
+            8 => bytes[self.range].copy_from_slice(&value.to_le_bytes()),
+            _ => bail!("Unsupported ELF section size width {}", self.width),
+        }
+        Ok(())
+    }
+}
+
+fn section_growth_limit(
+    file: &object::File<'_>,
+    section_index: usize,
+    offset: u64,
+    file_len: usize,
+) -> Result<u64> {
+    let mut limit = file_len as u64;
+    if let Some(section_header_offset) = elf_section_header_offset(file) {
+        limit = limit.min(section_header_offset);
+    }
+    for section in file.sections() {
+        if section.index().0 == section_index {
+            continue;
+        }
+        let Some((next_offset, _)) = section.file_range() else {
+            continue;
+        };
+        if next_offset > offset {
+            limit = limit.min(next_offset);
+        }
+    }
+    Ok(limit)
+}
+
+fn elf_section_header_offset(file: &object::File<'_>) -> Option<u64> {
+    match file {
+        object::File::Elf32(file) => Some(u64::from(file.elf_header().e_shoff.get(file.endian()))),
+        object::File::Elf64(file) => Some(file.elf_header().e_shoff.get(file.endian())),
+        _ => None,
+    }
+}
+
+fn elf_section_size_field(bytes: &[u8], section_index: usize) -> Option<ElfSizeField> {
+    if bytes.len() < 0x34 || bytes.get(0..4)? != b"\x7fELF" || *bytes.get(5)? != 1 {
+        return None;
+    }
+
+    match *bytes.get(4)? {
+        1 => {
+            let section_header_offset = read_u32_le(bytes.get(0x20..0x24)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x2e..0x30)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x30..0x32)?)? as usize;
+            elf_section_header_field(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x14,
+                4,
+            )
+        }
+        2 => {
+            if bytes.len() < 0x40 {
+                return None;
+            }
+            let section_header_offset = read_u64_le(bytes.get(0x28..0x30)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x3a..0x3c)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x3c..0x3e)?)? as usize;
+            elf_section_header_field(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x20,
+                8,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn elf_section_header_field(
+    bytes: &[u8],
+    section_index: usize,
+    section_header_offset: usize,
+    section_header_size: usize,
+    section_count: usize,
+    field_offset: usize,
+    field_size: usize,
+) -> Option<ElfSizeField> {
+    if section_index >= section_count || section_header_size < field_offset + field_size {
+        return None;
+    }
+    let section_start =
+        section_header_offset.checked_add(section_index.checked_mul(section_header_size)?)?;
+    let field_start = section_start.checked_add(field_offset)?;
+    let field_end = field_start.checked_add(field_size)?;
+    (field_end <= bytes.len()).then_some(ElfSizeField {
+        range: field_start..field_end,
+        width: field_size,
+    })
+}
+
+fn read_u16_le(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u32_le(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u64_le(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn mutation_section_file_range(
