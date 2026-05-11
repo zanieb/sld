@@ -15,6 +15,7 @@ use object::Object as _;
 use object::ObjectSection as _;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -214,22 +215,111 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
         .with_context(|| format!("Benchmark path `{}` has no parent", bench.path.display()))?;
 
     for mutation in &bench.config.mutate_files {
-        let relative_path = mutation.path();
-        ensure_relative_path(relative_path)?;
-        let path = save_dir.join(relative_path);
         match mutation {
-            Mutation::AppendZero(_) => append_zero(&path)?,
-            Mutation::ElfSection { section, grow, .. } => {
-                if *grow == 0 {
-                    mutate_elf_section_byte(&path, section)?;
-                } else {
-                    grow_elf_section(&path, section, *grow)?;
-                }
+            Mutation::AppendZero(relative_path) => {
+                ensure_relative_path(relative_path)?;
+                append_zero(&save_dir.join(relative_path))?;
+            }
+            Mutation::ElfSection {
+                path: relative_path,
+                section,
+                grow,
+            } => {
+                ensure_relative_path(relative_path)?;
+                mutate_elf_section(&save_dir.join(relative_path), section, *grow)?;
+            }
+            Mutation::FirstElfSection { section, grow } => {
+                let (path, section) = find_first_relocatable_elf_with_section(save_dir, section)?;
+                mutate_elf_section(&path, &section, *grow)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn mutate_elf_section(path: &Path, section: &str, grow: u64) -> Result {
+    if grow == 0 {
+        mutate_elf_section_byte(path, section)
+    } else {
+        grow_elf_section(path, section, grow)
+    }
+}
+
+fn find_first_relocatable_elf_with_section(
+    save_dir: &Path,
+    section_selector: &str,
+) -> Result<(std::path::PathBuf, String)> {
+    let mut dirs = VecDeque::from([save_dir.to_owned()]);
+
+    while let Some(dir) = dirs.pop_front() {
+        let mut entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("Failed to read benchmark save-dir `{}`", dir.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("Failed to read benchmark save-dir `{}`", dir.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "Failed to read benchmark save-dir entry `{}`",
+                    path.display()
+                )
+            })?;
+            if file_type.is_dir() {
+                if entry.file_name().to_string_lossy().ends_with(".incr") {
+                    continue;
+                }
+                dirs.push_back(path);
+                continue;
+            }
+            if file_type.is_file()
+                && let Some(section) = relocatable_elf_section_name(&path, section_selector)?
+            {
+                return Ok((path, section));
+            }
+        }
+    }
+
+    bail!(
+        "Could not find a relocatable ELF input with section `{section_selector}` under `{}`",
+        save_dir.display()
+    )
+}
+
+fn relocatable_elf_section_name(path: &Path, section_selector: &str) -> Result<Option<String>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read benchmark input `{}`", path.display()))?;
+    let Ok(object) = object::File::parse(&*bytes) else {
+        return Ok(None);
+    };
+    if object.kind() != object::ObjectKind::Relocatable {
+        return Ok(None);
+    }
+    for section in object.sections() {
+        let Ok(name) = section.name() else {
+            continue;
+        };
+        if !section_selector_matches(section_selector, name) {
+            continue;
+        }
+        let Some((_, size)) = section.file_range() else {
+            continue;
+        };
+        if size > 0 {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn section_selector_matches(selector: &str, section_name: &str) -> bool {
+    selector
+        .strip_suffix('*')
+        .map_or(section_name == selector, |prefix| {
+            section_name.starts_with(prefix)
+        })
 }
 
 fn append_zero(path: &Path) -> Result {
@@ -700,6 +790,7 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
 #[cfg(test)]
 mod tests {
     use super::ensure_relative_path;
+    use super::find_first_relocatable_elf_with_section;
     use super::grow_elf_section;
     use super::incremental_log_path;
     use super::mutate_elf_section_byte;
@@ -830,6 +921,57 @@ mod tests {
         assert_eq!(
             object.section_by_name(".data").unwrap().data().unwrap(),
             &[1, 2, 3, 4, 0x80]
+        );
+    }
+
+    #[test]
+    fn first_elf_section_mutation_finds_deterministic_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        let nested = save_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(save_dir.join("run-with"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(save_dir.join("not-object"), b"abc").unwrap();
+        let input = nested.join("changed.o");
+        std::fs::write(&input, growable_data_elf()).unwrap();
+        let bench = Benchmark {
+            name: "first-elf-section".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::FirstElfSection {
+                    section: ".data".to_owned(),
+                    grow: 0,
+                }],
+                ..BenchConfig::default()
+            },
+        };
+
+        assert_eq!(
+            find_first_relocatable_elf_with_section(&save_dir, ".data").unwrap(),
+            (input, ".data".to_owned())
+        );
+
+        mutate_inputs(&bench).unwrap();
+
+        let bytes = std::fs::read(nested.join("changed.o")).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[2, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn first_elf_section_mutation_can_match_section_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let input = save_dir.join("changed.o");
+        std::fs::write(&input, growable_data_elf()).unwrap();
+
+        assert_eq!(
+            find_first_relocatable_elf_with_section(&save_dir, ".dat*").unwrap(),
+            (input, ".data".to_owned())
         );
     }
 

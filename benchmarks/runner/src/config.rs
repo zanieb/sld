@@ -50,15 +50,11 @@ pub(crate) enum Mutation {
         #[serde(default)]
         grow: u64,
     },
-}
-
-impl Mutation {
-    pub(crate) fn path(&self) -> &str {
-        match self {
-            Mutation::AppendZero(path) => path,
-            Mutation::ElfSection { path, .. } => path,
-        }
-    }
+    FirstElfSection {
+        section: String,
+        #[serde(default)]
+        grow: u64,
+    },
 }
 
 impl Config {
@@ -147,6 +143,54 @@ mutate_files = [{ path = "changed.o", section = ".data", grow = 1 }]
     }
 
     #[test]
+    fn parses_incremental_first_elf_section_mutation() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".data" }]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(
+            bench.mutate_files,
+            [super::Mutation::FirstElfSection {
+                section: ".data".to_owned(),
+                grow: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_incremental_first_elf_section_growth_mutation() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".data", grow = 1 }]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(
+            bench.mutate_files,
+            [super::Mutation::FirstElfSection {
+                section: ".data".to_owned(),
+                grow: 1,
+            }]
+        );
+    }
+
+    #[test]
     fn parses_incremental_log_expectations() {
         let config: Config = toml::from_str(
             r#"
@@ -184,5 +228,16 @@ expect_output_change = true
 
         let bench = config.benches.get("changed-incremental").unwrap();
         assert!(bench.expect_output_change);
+    }
+
+    #[test]
+    fn checked_in_incremental_linux_config_parses() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir
+            .parent()
+            .unwrap()
+            .join("incremental-linux.toml");
+
+        Config::load(&config_path).unwrap();
     }
 }
