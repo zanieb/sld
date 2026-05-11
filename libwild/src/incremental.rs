@@ -6024,6 +6024,30 @@ mod tests {
     }
 
     #[test]
+    fn removed_input_list_keeps_unchanged_section_reuse_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let previous = state("old-exact-args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "new-exact-args".to_owned(),
+            link_options_hash: "old-exact-args".to_owned(),
+            wild_version: "wild-test".to_owned(),
+            input_files: state("new-exact-args", b"output", &[("a.o", b"a")]).input_files,
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: true,
+            } if reason.contains("input file removed")
+        ));
+    }
+
+    #[test]
     fn missing_output_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");

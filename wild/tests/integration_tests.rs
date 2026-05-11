@@ -167,6 +167,9 @@
 //! TestIncrementalAddedInput:{source-filename} Whether to extend TestIncremental by appending the
 //! compiled object for the source file, then checking that the relink reuses unchanged sections.
 //!
+//! TestIncrementalRemovedInput:{filename} Whether to extend TestIncremental by removing the named
+//! linker input, then checking that the relink reuses unchanged sections.
+//!
 //! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
@@ -806,6 +809,7 @@ struct Config {
     test_incremental_changed: bool,
     test_incremental_interrupted: bool,
     test_incremental_added_input: Option<String>,
+    test_incremental_removed_input: Option<String>,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
@@ -1408,6 +1412,7 @@ impl Config {
             test_incremental_changed: false,
             test_incremental_interrupted: false,
             test_incremental_added_input: None,
+            test_incremental_removed_input: None,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
@@ -1814,6 +1819,9 @@ fn process_directive(
         }
         "TestIncrementalAddedInput" => {
             config.test_incremental_added_input = Some(arg.to_owned());
+        }
+        "TestIncrementalRemovedInput" => {
+            config.test_incremental_removed_input = Some(arg.to_owned());
         }
         "TestIncrementalChangedExpectPatch" => {
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
@@ -2520,6 +2528,80 @@ impl ProgramInputs {
             {
                 bail!(
                     "Incremental test failed for {}: added-input relink did not reuse unchanged \
+                    sections. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+        }
+
+        if let Some(removed_input) = &config.test_incremental_removed_input {
+            let mut removed_count = 0;
+            let removed_inputs = inputs
+                .iter()
+                .filter_map(|input| {
+                    if input
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name == removed_input.as_str())
+                    {
+                        removed_count += 1;
+                        None
+                    } else {
+                        Some(input.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            if removed_count != 1 {
+                bail!(
+                    "Incremental removed-input test for {} expected exactly one input named \
+                    `{}`, found {}",
+                    self.name(),
+                    removed_input,
+                    removed_count
+                );
+            }
+
+            let link_output_removed = Linker::Wild.link(
+                self.name(),
+                &removed_inputs,
+                &incremental_config,
+                cross_arch,
+            )?;
+            let removed_content =
+                std::fs::read(&link_output_removed.binary).with_context(|| {
+                    format!(
+                        "Failed to read removed-input incremental output: {}",
+                        link_output_removed.binary.display()
+                    )
+                })?;
+            let link_output_removed_full =
+                Linker::Wild.link(self.name(), &removed_inputs, config, cross_arch)?;
+            let removed_full_content = std::fs::read(&link_output_removed_full.binary)
+                .with_context(|| {
+                    format!(
+                        "Failed to read removed-input full output: {}",
+                        link_output_removed_full.binary.display()
+                    )
+                })?;
+            if removed_content != removed_full_content {
+                let diffs = sections_with_diffs(&removed_content, &removed_full_content)?;
+                bail!(
+                    "Incremental test failed for {}: removed-input incremental output differs \
+                    from a full relink of the same inputs. Diffs:\n{diffs:#?}",
+                    self.name()
+                );
+            }
+
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if !log.contains("full relink: input file removed:")
+                || !log.contains("reused ")
+                || !log.contains(" unchanged input sections")
+            {
+                bail!(
+                    "Incremental test failed for {}: removed-input relink did not reuse unchanged \
                     sections. Log:\n{}",
                     self.name(),
                     log
