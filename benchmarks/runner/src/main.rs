@@ -340,11 +340,17 @@ impl LinkerIdentifier {
         } else if let Some(mut rest) = version_line.strip_prefix("mold ") {
             kind = LinkerKind::Mold;
             version = take_word(&mut rest)?.to_owned();
-        } else {
-            let mut rest = version_line.strip_prefix("GNU ld (GNU Binutils for Ubuntu) ")?;
+        } else if let Some(mut rest) =
+            version_line.strip_prefix("GNU ld (GNU Binutils for Ubuntu) ")
+        {
             kind = LinkerKind::Bfd;
             version = take_word(&mut rest)?.to_owned();
             variant = Some("Ubuntu".to_owned());
+        } else {
+            let mut rest = version_line.strip_prefix("GNU ld (GNU Binutils for Debian) ")?;
+            kind = LinkerKind::Bfd;
+            version = take_word(&mut rest)?.to_owned();
+            variant = Some("Debian".to_owned());
         }
 
         let mut effective_version = parse_version_number(&version).ok()?;
@@ -485,5 +491,18 @@ mod tests {
         assert_eq!(identifier.kind, LinkerKind::Wild);
         assert_eq!(identifier.version, "0.8.0");
         assert_eq!(identifier.hash.as_deref(), Some("non-git-build"));
+    }
+
+    #[test]
+    fn parses_debian_bfd_version_output() {
+        let identifier = LinkerIdentifier::parse(
+            "GNU ld (GNU Binutils for Debian) 2.40",
+            Path::new("/usr/bin/ld"),
+        )
+        .unwrap();
+
+        assert_eq!(identifier.kind, LinkerKind::Bfd);
+        assert_eq!(identifier.version, "2.40");
+        assert_eq!(identifier.variant.as_deref(), Some("Debian"));
     }
 }
