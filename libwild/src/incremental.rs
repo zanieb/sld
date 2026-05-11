@@ -624,6 +624,12 @@ struct ParsedPatchInputRef {
     range: std::ops::Range<usize>,
 }
 
+enum ArchiveMemberMatch<'data> {
+    Unique(PatchInputBytes<'data>),
+    Ambiguous,
+    Unavailable,
+}
+
 impl MatchedPatchSection {
     fn same(section: PatchSection) -> Self {
         Self {
@@ -1498,8 +1504,10 @@ fn patch_input_bytes<'data>(
         return Ok(None);
     }
 
-    if let Some(member) = patch_archive_member_bytes(bytes, &parsed.identifier)? {
-        return Ok(Some(member));
+    match patch_archive_member_bytes(bytes, &parsed.identifier)? {
+        ArchiveMemberMatch::Unique(member) => return Ok(Some(member)),
+        ArchiveMemberMatch::Ambiguous => return Ok(None),
+        ArchiveMemberMatch::Unavailable => {}
     }
 
     let Some(input_bytes) = bytes.get(parsed.range.clone()) else {
@@ -1576,25 +1584,29 @@ fn parse_patch_input_ref(
 fn patch_archive_member_bytes<'data>(
     bytes: &'data [u8],
     identifier: &[u8],
-) -> Result<Option<PatchInputBytes<'data>>> {
+) -> Result<ArchiveMemberMatch<'data>> {
     if identifier.is_empty() {
-        return Ok(None);
+        return Ok(ArchiveMemberMatch::Unavailable);
     }
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
-        return Ok(None);
+        return Ok(ArchiveMemberMatch::Unavailable);
     };
+    let mut matched = None;
     for entry in archive {
         match entry? {
             ArchiveEntry::Regular(content) if content.ident.as_slice() == identifier => {
-                return Ok(Some(PatchInputBytes {
+                let member = PatchInputBytes {
                     bytes: content.entry_data,
                     file_offset: content.data_offset,
-                }));
+                };
+                if matched.replace(member).is_some() {
+                    return Ok(ArchiveMemberMatch::Ambiguous);
+                }
             }
             ArchiveEntry::Regular(_) | ArchiveEntry::Thin(_) => {}
         }
     }
-    Ok(None)
+    Ok(matched.map_or(ArchiveMemberMatch::Unavailable, ArchiveMemberMatch::Unique))
 }
 
 fn patch_fingerprint(
@@ -3508,6 +3520,32 @@ mod tests {
 
         assert_eq!(member.bytes, b"member-data");
         assert_ne!(member.file_offset, 1);
+    }
+
+    #[test]
+    fn patch_input_bytes_rejects_ambiguous_archive_member_names() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 5),
+                b"first".as_slice(),
+            )
+            .unwrap();
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 6),
+                b"second".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let input_file = hex::encode("libarchive.a");
+        let input_ref = hex::encode("libarchive.a\0member.o\01:5");
+
+        assert!(
+            patch_input_bytes(&archive, &input_file, &input_ref)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
