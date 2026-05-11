@@ -177,15 +177,19 @@ struct Run {
     /// future.
     pid: u32,
     extra_flags: Vec<String>,
+    #[serde(with = "duration_serde")]
     elapsed: std::time::Duration,
     pub(crate) max_rss: u64,
+    #[serde(with = "duration_serde")]
     pub(crate) stime: Duration,
+    #[serde(with = "duration_serde")]
     pub(crate) utime: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Bin {
     index: u32,
+    #[serde(with = "path_serde")]
     path: PathBuf,
     identifier: LinkerIdentifier,
 }
@@ -214,8 +218,79 @@ enum LinkerKind {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Benchmark {
     name: String,
+    #[serde(with = "path_serde")]
     path: PathBuf,
+    #[serde(skip)]
     config: BenchConfig,
+}
+
+mod path_serde {
+    use serde::Deserialize as _;
+    use serde::Deserializer;
+    use serde::Serializer;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    pub(crate) fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        serializer.serialize_bytes(path.as_os_str().as_bytes())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(path.to_string_lossy().as_ref())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let path = String::deserialize(deserializer)?;
+        Ok(PathBuf::from(path))
+    }
+}
+
+mod duration_serde {
+    use serde::Deserialize as _;
+    use serde::Deserializer;
+    use serde::Serialize as _;
+    use serde::Serializer;
+    use std::time::Duration;
+
+    pub(crate) fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (duration.as_secs(), duration.subsec_nanos()).serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (secs, nanos) = <(u64, u32)>::deserialize(deserializer)?;
+        Ok(Duration::new(secs, nanos))
+    }
 }
 
 impl LinkerKind {
@@ -504,5 +579,60 @@ mod tests {
         assert_eq!(identifier.kind, LinkerKind::Bfd);
         assert_eq!(identifier.version, "2.40");
         assert_eq!(identifier.variant.as_deref(), Some("Debian"));
+    }
+
+    #[test]
+    fn benchmark_results_round_trip_through_postcard() {
+        let results = Benchmarks {
+            benchmarks: vec![BenchmarkResult {
+                config: Benchmark {
+                    name: "incremental".to_owned(),
+                    path: PathBuf::from("/tmp/save/run-with"),
+                    config: BenchConfig {
+                        mutate_files: vec![crate::config::Mutation::AppendZero(
+                            "changed.o".to_owned(),
+                        )],
+                        ..BenchConfig::default()
+                    },
+                },
+                batches: vec![BatchResult {
+                    bin: Bin {
+                        index: 0,
+                        path: PathBuf::from("/tmp/wild"),
+                        identifier: LinkerIdentifier {
+                            kind: LinkerKind::Wild,
+                            version: "Wild 0.0.0 non-git-build".to_owned(),
+                            variant: None,
+                            hash: Some("non-git-build".to_owned()),
+                            effective_version: vec![0, 0, 1],
+                        },
+                    },
+                    runs: vec![Run {
+                        pid: 1234,
+                        extra_flags: vec!["--incremental".to_owned()],
+                        elapsed: Duration::new(1, 2),
+                        max_rss: 4096,
+                        stime: Duration::new(3, 4),
+                        utime: Duration::new(5, 6),
+                    }],
+                }],
+            }],
+        };
+
+        let bytes = postcard::to_stdvec(&results).unwrap();
+        let decoded: Benchmarks = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            decoded.benchmarks[0].config.path,
+            PathBuf::from("/tmp/save/run-with")
+        );
+        assert_eq!(
+            decoded.benchmarks[0].batches[0].bin.path,
+            PathBuf::from("/tmp/wild")
+        );
+        assert_eq!(
+            decoded.benchmarks[0].batches[0].runs[0].elapsed,
+            Duration::new(1, 2)
+        );
     }
 }
