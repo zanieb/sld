@@ -8,8 +8,8 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-dynamic-relocation-removed.c.o
 //#TestIncrementalChangedCompArgs:-DINCREMENTAL_DYNAMIC_RELOCATION_REMOVED=1
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_dynamic_removed_payload=0x2b000000
 //#TestIncrementalStateContains:dynrel\t
 
