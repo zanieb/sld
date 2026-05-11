@@ -41,19 +41,22 @@ pub(crate) fn run_report(args: &ReportArgs, config: &Config) -> Result {
     const UNGROUPED_HEADER: &str = "## UNGROUPED\n";
 
     for mode in [ReportMode::Time, ReportMode::Memory] {
-        for benchmark in &results.benchmarks {
-            let Some(bench_config) = config.benches.get(&benchmark.config.name) else {
-                continue;
-            };
-            if bench_config.skip {
-                continue;
-            }
-            let mut benchmark = mode.filter(benchmark, bench_config);
-            merge_batches(&mut benchmark);
-            if benchmark.batches.is_empty() {
-                continue;
-            }
-            let svg_filename = produce_chart(report_dir, &benchmark, mode, config)?;
+        let benchmarks = results
+            .benchmarks
+            .iter()
+            .filter_map(|benchmark| {
+                let bench_config = config.benches.get(&benchmark.config.name)?;
+                if bench_config.skip {
+                    return None;
+                }
+                let mut benchmark = mode.filter(benchmark, bench_config);
+                merge_batches(&mut benchmark);
+                (!benchmark.batches.is_empty()).then_some(benchmark)
+            })
+            .collect::<Vec<_>>();
+
+        for benchmark in &benchmarks {
+            let svg_filename = produce_chart(report_dir, benchmark, mode, config)?;
             existing_images.remove(&report_dir.join(&svg_filename));
 
             // Check to see if the markdown already has a link to this file. If it doesn't, add one.
@@ -66,7 +69,7 @@ pub(crate) fn run_report(args: &ReportArgs, config: &Config) -> Result {
                 markdown.push_str(&format!(
                     "### {} - {mode}\n![{alt}]({svg_filename})\n\n",
                     benchmark.config.name,
-                    alt = alt_text(mode, &benchmark)
+                    alt = alt_text(mode, benchmark)
                 ));
             }
 
@@ -74,8 +77,9 @@ pub(crate) fn run_report(args: &ReportArgs, config: &Config) -> Result {
                 println!(
                     "{}",
                     BenchmarkDisplay {
-                        benchmark: &benchmark,
-                        mode
+                        benchmark,
+                        mode,
+                        baseline: find_incremental_baseline(benchmark, &benchmarks),
                     }
                 );
             }
@@ -184,6 +188,7 @@ fn confidence_interval(batch_result: &BatchResult, mode: ReportMode) -> f64 {
 struct BenchmarkDisplay<'a> {
     benchmark: &'a BenchmarkResult,
     mode: ReportMode,
+    baseline: Option<&'a BenchmarkResult>,
 }
 
 impl Display for BenchmarkDisplay<'_> {
@@ -201,9 +206,19 @@ impl Display for BenchmarkDisplay<'_> {
         }
         if self.mode == ReportMode::Time {
             write_wild_speedups(f, self.benchmark, self.mode)?;
+            if let Some(baseline) = self.baseline {
+                write_incremental_wild_speedup(f, self.benchmark, baseline, self.mode)?;
+            }
         }
         Ok(())
     }
+}
+
+fn wild_batch(benchmark: &BenchmarkResult) -> Option<&BatchResult> {
+    benchmark
+        .batches
+        .iter()
+        .find(|batch| batch.bin.identifier.kind == LinkerKind::Wild)
 }
 
 fn write_wild_speedups(
@@ -211,11 +226,7 @@ fn write_wild_speedups(
     benchmark: &BenchmarkResult,
     mode: ReportMode,
 ) -> std::fmt::Result {
-    let Some(wild) = benchmark
-        .batches
-        .iter()
-        .find(|batch| batch.bin.identifier.kind == LinkerKind::Wild)
-    else {
+    let Some(wild) = wild_batch(benchmark) else {
         return Ok(());
     };
     let wild_mean = mean(wild, mode);
@@ -235,6 +246,57 @@ fn write_wild_speedups(
         )?;
     }
     Ok(())
+}
+
+fn write_incremental_wild_speedup(
+    f: &mut std::fmt::Formatter<'_>,
+    benchmark: &BenchmarkResult,
+    baseline: &BenchmarkResult,
+    mode: ReportMode,
+) -> std::fmt::Result {
+    let Some(incremental_wild) = wild_batch(benchmark) else {
+        return Ok(());
+    };
+    let Some(baseline_wild) = wild_batch(baseline) else {
+        return Ok(());
+    };
+    let incremental_mean = mean(incremental_wild, mode);
+    if incremental_mean <= 0.0 {
+        return Ok(());
+    }
+
+    writeln!(
+        f,
+        "  Wild incremental speedup over {baseline} Wild: {speedup:.2}x",
+        baseline = baseline.config.name,
+        speedup = mean(baseline_wild, mode) / incremental_mean,
+    )
+}
+
+fn find_incremental_baseline<'a>(
+    benchmark: &BenchmarkResult,
+    benchmarks: &'a [BenchmarkResult],
+) -> Option<&'a BenchmarkResult> {
+    incremental_baseline_candidates(&benchmark.config.name)
+        .into_iter()
+        .find_map(|name| {
+            benchmarks
+                .iter()
+                .find(|candidate| candidate.config.name == name)
+        })
+}
+
+fn incremental_baseline_candidates(name: &str) -> Vec<String> {
+    if let Some(base) = name.strip_suffix("-incremental-changed") {
+        return vec![base.to_owned(), format!("{base}-full")];
+    }
+    if let Some(base) = name.strip_suffix("-incremental") {
+        return vec![base.to_owned(), format!("{base}-full")];
+    }
+    if let Some(base) = name.strip_suffix("-incr") {
+        return vec![format!("{base}-full"), base.to_owned()];
+    }
+    Vec::new()
 }
 
 fn produce_chart(
@@ -446,6 +508,7 @@ impl Display for ReportMode {
 mod tests {
     use super::BenchmarkDisplay;
     use super::ReportMode;
+    use super::find_incremental_baseline;
     use crate::BatchResult;
     use crate::Benchmark;
     use crate::BenchmarkResult;
@@ -468,6 +531,7 @@ mod tests {
         let display = BenchmarkDisplay {
             benchmark: &benchmark,
             mode: ReportMode::Time,
+            baseline: None,
         }
         .to_string();
 
@@ -485,16 +549,70 @@ mod tests {
         let display = BenchmarkDisplay {
             benchmark: &benchmark,
             mode: ReportMode::Memory,
+            baseline: None,
         }
         .to_string();
 
         assert!(!display.contains("speedup"));
     }
 
+    #[test]
+    fn time_stats_include_incremental_speedup_against_paired_full_wild() {
+        let baseline = benchmark_result_with_name(
+            "ruff",
+            vec![
+                batch(LinkerKind::Wild, Duration::from_millis(100)),
+                batch(LinkerKind::Mold, Duration::from_millis(150)),
+            ],
+        );
+        let incremental = benchmark_result_with_name(
+            "ruff-incremental-changed",
+            vec![batch(LinkerKind::Wild, Duration::from_millis(25))],
+        );
+
+        let display = BenchmarkDisplay {
+            benchmark: &incremental,
+            mode: ReportMode::Time,
+            baseline: Some(&baseline),
+        }
+        .to_string();
+
+        assert!(display.contains("Wild incremental speedup over ruff Wild: 4.00x"));
+    }
+
+    #[test]
+    fn incremental_baseline_can_use_current_or_legacy_names() {
+        let benchmarks = vec![
+            benchmark_result_with_name("ruff", Vec::new()),
+            benchmark_result_with_name("uv-full", Vec::new()),
+            benchmark_result_with_name("ruff-incremental-changed", Vec::new()),
+            benchmark_result_with_name("uv-incr", Vec::new()),
+        ];
+
+        assert_eq!(
+            find_incremental_baseline(&benchmarks[2], &benchmarks)
+                .unwrap()
+                .config
+                .name,
+            "ruff"
+        );
+        assert_eq!(
+            find_incremental_baseline(&benchmarks[3], &benchmarks)
+                .unwrap()
+                .config
+                .name,
+            "uv-full"
+        );
+    }
+
     fn benchmark_result(batches: Vec<BatchResult>) -> BenchmarkResult {
+        benchmark_result_with_name("changed-incremental", batches)
+    }
+
+    fn benchmark_result_with_name(name: &str, batches: Vec<BatchResult>) -> BenchmarkResult {
         BenchmarkResult {
             config: Benchmark {
-                name: "changed-incremental".to_owned(),
+                name: name.to_owned(),
                 path: PathBuf::from("/tmp/save/run-with"),
                 config: BenchConfig::default(),
             },
