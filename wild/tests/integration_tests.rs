@@ -182,6 +182,9 @@
 //! TestIncrementalChangedGrowSection:{bytes} Whether the changed-input test should grow the
 //! selected ELF section by the supplied number of bytes instead of mutating an existing byte.
 //!
+//! TestIncrementalChangedAppendArchiveMember:{bool} Whether the changed-input test should append
+//! an extra archive member after mutating the selected section.
+//!
 //! TestIncrementalChangedCompareFull:{bool} Whether the changed-input incremental output should be
 //! byte-compared to a fresh full relink. Defaults to true. Disable this when the initial
 //! incremental link intentionally reserves capacity and the changed incremental output should
@@ -802,6 +805,7 @@ struct Config {
     test_incremental_changed_section: String,
     test_incremental_changed_section_offset: u64,
     test_incremental_changed_grow_section: Option<u64>,
+    test_incremental_changed_append_archive_member: bool,
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
@@ -1389,6 +1393,7 @@ impl Config {
             test_incremental_changed_section: ".data".to_owned(),
             test_incremental_changed_section_offset: 0,
             test_incremental_changed_grow_section: None,
+            test_incremental_changed_append_archive_member: false,
             test_incremental_changed_compare_full: true,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
@@ -1806,6 +1811,9 @@ fn process_directive(
                     .context("Invalid TestIncrementalChangedGrowSection")?,
             );
         }
+        "TestIncrementalChangedAppendArchiveMember" => {
+            config.test_incremental_changed_append_archive_member = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
         }
@@ -2212,6 +2220,9 @@ impl ProgramInputs {
                         config.test_incremental_changed_section_offset,
                     )?;
                 }
+                if config.test_incremental_changed_append_archive_member {
+                    append_archive_member(&changed_input.path)?;
+                }
             }
 
             let link_output_3 =
@@ -2515,6 +2526,66 @@ fn grow_section_bytes(path: &Path, section_name: &str, growth: u64) -> Result {
     ensure!(
         mutated != original,
         "Mutation did not change `{}` section index {section_index}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn append_archive_member(path: &Path) -> Result {
+    let original =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let mut archive = ar::Archive::new(std::io::Cursor::new(original.as_slice()));
+    let mut members = Vec::<(Vec<u8>, Vec<u8>)>::new();
+    let mut duplicate = None;
+    while let Some(entry) = archive.next_entry() {
+        let mut entry = entry
+            .with_context(|| format!("Failed to read archive entry in `{}`", path.display()))?;
+        let identifier = entry.header().identifier().to_vec();
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .with_context(|| format!("Failed to read archive member in `{}`", path.display()))?;
+        if duplicate.is_none() && object::File::parse(data.as_slice()).is_ok() {
+            duplicate = Some(data.clone());
+        }
+        members.push((identifier, data));
+    }
+    let duplicate = duplicate.with_context(|| {
+        format!(
+            "Cannot append archive member to `{}` without an object member to duplicate",
+            path.display()
+        )
+    })?;
+
+    let mut bytes = Vec::new();
+    let mut builder = ar::Builder::new(&mut bytes);
+    for (identifier, data) in &members {
+        let header = ar::Header::new(identifier.clone(), data.len() as u64);
+        builder
+            .append(&header, data.as_slice())
+            .with_context(|| format!("Failed to copy archive member in `{}`", path.display()))?;
+    }
+    let header = ar::Header::new(b"extra.o".to_vec(), duplicate.len() as u64);
+    builder
+        .append(&header, duplicate.as_slice())
+        .with_context(|| format!("Failed to append archive member to `{}`", path.display()))?;
+    drop(builder);
+
+    let tmp_path = append_to_path(path, ".mutated");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write mutated archive `{}`", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to replace `{}` with mutated archive `{}`",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    let mutated =
+        std::fs::read(path).with_context(|| format!("Failed to reread `{}`", path.display()))?;
+    ensure!(
+        mutated != original,
+        "Archive member append did not change `{}`",
         path.display()
     );
     Ok(())

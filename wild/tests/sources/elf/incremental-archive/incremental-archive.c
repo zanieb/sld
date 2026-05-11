@@ -6,6 +6,10 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-archive-member.a
 //#TestIncrementalChangedSection:.data
+//#Config:archive-membership:incremental-archive
+//#TestIncrementalChangedAppendArchiveMember:true
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:archive members changed
 
 int value(void);
 
