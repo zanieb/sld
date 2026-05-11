@@ -3654,7 +3654,8 @@ fn changed_patch_sections(
             .context("Failed to parse current patch input")?;
 
         for patch_section in sections {
-            let Some(previous_index) = patch_section_index(&previous_file, &patch_section.previous)?
+            let Some(previous_index) =
+                patch_section_index(&previous_file, &patch_section.previous)?
             else {
                 return Ok(None);
             };

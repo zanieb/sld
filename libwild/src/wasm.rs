@@ -800,8 +800,9 @@ impl platform::Platform for Wasm {
     }
 
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
-        output: &crate::file_writer::Output,
-        layout: &crate::layout::Layout<'data, Self>,
+        _output: &crate::file_writer::Output,
+        _layout: &crate::layout::Layout<'data, Self>,
+        _incremental: &crate::incremental::PreparedState,
     ) -> crate::error::Result {
         todo!()
     }
@@ -1071,10 +1072,12 @@ impl platform::Platform for Wasm {
     }
 
     fn allocate_header_sizes(
-        prelude: &mut crate::layout::PreludeLayoutState<Self>,
-        sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
-        header_info: &crate::layout::HeaderInfo,
-        output_sections: &crate::output_section_id::OutputSections<Self>,
+        _prelude: &mut crate::layout::PreludeLayoutState<Self>,
+        _sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        _header_info: &crate::layout::HeaderInfo,
+        _output_sections: &crate::output_section_id::OutputSections<Self>,
+        _args: &Self::Args,
+        _output_kind: crate::output_kind::OutputKind,
     ) {
         todo!()
     }
