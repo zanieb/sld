@@ -89,6 +89,10 @@ impl FileKind {
     pub(crate) fn is_compiler_ir(self) -> bool {
         matches!(self, FileKind::LlvmIr | FileKind::GccIr)
     }
+
+    pub(crate) fn is_relocatable_object(self) -> bool {
+        matches!(self, FileKind::ElfObject | FileKind::MachOObject)
+    }
 }
 
 /// Returns whether the supplied file contents is GCC IR. Scanning the entire section table would be

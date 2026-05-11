@@ -1745,6 +1745,8 @@ impl platform::Platform for Elf {
         sizes: &mut OutputSectionPartMap<u64>,
         header_info: &layout::HeaderInfo,
         output_sections: &OutputSections<Self>,
+        _args: &Self::Args,
+        _output_kind: OutputKind,
     ) {
         sizes.increment(part_id::FILE_HEADER, u64::from(elf::FILE_HEADER_SIZE));
         sizes.increment(part_id::PROGRAM_HEADERS, program_headers_size(header_info));

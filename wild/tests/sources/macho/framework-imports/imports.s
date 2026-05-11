@@ -1,0 +1,15 @@
+.section __DATA,__data
+.p2align 3
+.quad _AudioUnitRender
+.quad _AudioObjectGetPropertyData
+.quad _CGColorSpaceCreateDeviceRGB
+.quad _CMTimeGetSeconds
+.quad _CMSampleBufferGetDataBuffer
+.quad _CVPixelBufferRelease
+.quad _VTSessionSetProperty
+.quad _IOPMAssertionRelease
+.quad _IOSurfaceLock
+.quad _LSOpenFromURLSpec
+.quad _FSEventStreamCreate
+.quad _CMSEncodeContent
+.quad _SCStreamFrameInfoBoundingRect

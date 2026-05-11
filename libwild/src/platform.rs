@@ -564,6 +564,23 @@ pub(crate) trait Platform:
         is_undefined: bool,
     ) -> bool;
 
+    fn allow_duplicate_definition<'data>(
+        _args: &Self::Args,
+        _symbol_db: &SymbolDb<'data, Self>,
+        _existing: SymbolId,
+        _duplicate: SymbolId,
+    ) -> bool {
+        false
+    }
+
+    fn has_data_in_file(section_attributes: Self::SectionAttributes) -> bool {
+        // Treat TLS sections (e.g. .tbss) as having data in the file, even if they're NOBITS.
+        // This allows us to more easily place .tbss before other PROGBITS sections.
+        // Effectively .tbss is NOBITS, but we put zero padding of the same size in the file. GNU
+        // ld doesn't do this. It instead puts .tbss and the subsequent section at the same address.
+        !section_attributes.is_no_bits() || section_attributes.is_tls()
+    }
+
     /// Given the name of an init/fini section, returns the sort priority, if any.
     fn init_section_priority(_name: &[u8]) -> Option<u16> {
         None
@@ -581,6 +598,8 @@ pub(crate) trait Platform:
         sizes: &mut OutputSectionPartMap<u64>,
         header_info: &layout::HeaderInfo,
         output_sections: &OutputSections<Self>,
+        args: &Self::Args,
+        output_kind: OutputKind,
     );
 
     /// Gives the platform an opportunity to error out if an input stack section is requesting an

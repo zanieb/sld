@@ -492,6 +492,9 @@ fn process_archive<'data, P: Platform>(
         let entry = entry?;
         match entry {
             ArchiveEntry::Regular(archive_entry) => {
+                if should_skip_archive_member(archive_entry.ident.as_slice()) {
+                    continue;
+                }
                 let input_ref = InputRef {
                     file: input_file,
                     entry: Some(EntryMeta {
@@ -565,6 +568,10 @@ fn process_thin_archive<'data, P: Platform>(
     }
 
     Ok(LoadedFileState::ThinArchive(files, parsed_files))
+}
+
+fn should_skip_archive_member(identifier: &[u8]) -> bool {
+    identifier == b"__.SYMDEF" || identifier.ends_with(b".rmeta")
 }
 
 impl<'data, P: Platform> TemporaryState<'data, P> {
@@ -707,7 +714,7 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             })));
         }
 
-        if input_ref.is_archive_entry() && kind != FileKind::ElfObject {
+        if input_ref.is_archive_entry() && !kind.is_relocatable_object() {
             bail!("Unexpected archive member of kind {kind:?}: {input_ref}");
         }
 

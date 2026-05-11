@@ -1076,6 +1076,10 @@ impl<'data, P: Platform> CommonGroupState<'data, P> {
         }
     }
 
+    pub(crate) fn total_mem_size(&self) -> u64 {
+        self.mem_sizes.parts.iter().copied().sum()
+    }
+
     fn validate_sizes(&self) -> Result {
         P::validate_sizes(&self.mem_sizes)
     }
@@ -2333,6 +2337,21 @@ impl LocalWorkQueue {
             scope,
         );
     }
+
+    pub(crate) fn send_section_request<'data, 'scope, A: Arch>(
+        &mut self,
+        file_id: FileId,
+        section_index: SectionIndex,
+        resources: &'scope GraphResources<'data, '_, A::Platform>,
+        scope: &Scope<'scope>,
+    ) {
+        self.send_work::<A>(
+            resources,
+            file_id,
+            WorkItem::LoadSection(SectionLoadRequest::new(file_id, section_index)),
+            scope,
+        );
+    }
 }
 
 impl<'data, P: Platform> GraphResources<'data, '_, P> {
@@ -3244,7 +3263,14 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
         };
 
         // Allocate space for headers based on segment and section counts.
-        P::allocate_header_sizes(self, extra_sizes, &header_info, output_sections);
+        P::allocate_header_sizes(
+            self,
+            extra_sizes,
+            &header_info,
+            output_sections,
+            resources.symbol_db.args,
+            resources.symbol_db.output_kind,
+        );
 
         self.header_info = Some(header_info);
     }
