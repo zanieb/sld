@@ -280,6 +280,7 @@ impl Linker {
 
         let incremental_state = incremental::maybe_prepare(args, file_loader)?;
         if incremental_state.can_reuse_output() {
+            incremental_state.begin_update()?;
             incremental_state.finish(args, file_loader)?;
             return Ok(LinkerOutput { layout: None });
         }
@@ -359,6 +360,7 @@ impl Linker {
             &mut output,
         )?;
 
+        incremental_state.begin_update()?;
         P::write_output_file::<A>(&output, &layout, &incremental_state)?;
         diff::maybe_diff()?;
         incremental_state.finish(args, file_loader)?;

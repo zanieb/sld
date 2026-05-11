@@ -161,6 +161,9 @@
 //! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
 //! then checking that the changed-input incremental link matches a full relink.
 //!
+//! TestIncrementalInterrupted:{bool} Whether to extend TestIncremental by creating a stale
+//! update-in-progress marker, then checking that the next link performs a full relink.
+//!
 //! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
@@ -798,6 +801,7 @@ struct Config {
     test_incremental: bool,
     test_incremental_compare_full: bool,
     test_incremental_changed: bool,
+    test_incremental_interrupted: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
@@ -1398,6 +1402,7 @@ impl Config {
             test_incremental: false,
             test_incremental_compare_full: true,
             test_incremental_changed: false,
+            test_incremental_interrupted: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
@@ -1799,6 +1804,9 @@ fn process_directive(
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalInterrupted" => {
+            config.test_incremental_interrupted = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChangedExpectPatch" => {
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
         }
@@ -2140,6 +2148,50 @@ impl ProgramInputs {
                 self.name(),
                 log
             );
+        }
+
+        if config.test_incremental_interrupted {
+            let marker_path =
+                append_to_path(&link_output_2.binary, ".incr").join("update-in-progress");
+            std::fs::write(&marker_path, b"test interrupted update\n").with_context(|| {
+                format!(
+                    "Failed to create incremental update marker `{}`",
+                    marker_path.display()
+                )
+            })?;
+
+            let link_output_interrupted =
+                Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+            let interrupted_content =
+                std::fs::read(&link_output_interrupted.binary).with_context(|| {
+                    format!(
+                        "Failed to read interrupted incremental output: {}",
+                        link_output_interrupted.binary.display()
+                    )
+                })?;
+            if final_content != interrupted_content {
+                bail!(
+                    "Incremental test failed for {}: interrupted update recovery changed output",
+                    self.name()
+                );
+            }
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if !log.contains("full relink: previous incremental update did not complete") {
+                bail!(
+                    "Incremental test failed for {}: stale update marker did not force a full \
+                    relink. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+            if marker_path.exists() {
+                bail!(
+                    "Incremental test failed for {}: full relink did not clear stale update marker",
+                    self.name()
+                );
+            }
         }
 
         let rewritten_input = inputs
