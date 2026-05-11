@@ -26,7 +26,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v10";
+const STATE_VERSION: &str = "wild-incremental-state-v11";
+const STATE_VERSION_V10: &str = "wild-incremental-state-v10";
 const STATE_VERSION_V9: &str = "wild-incremental-state-v9";
 const STATE_VERSION_V8: &str = "wild-incremental-state-v8";
 const STATE_VERSION_V7: &str = "wild-incremental-state-v7";
@@ -105,6 +106,7 @@ struct FilePatchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilePatchSectionState {
     section_index: u32,
+    section_name: Option<String>,
     input_size: u64,
     output_offset: u64,
     output_size: u64,
@@ -352,6 +354,7 @@ fn patch_changed_inputs(
             .iter()
             .map(|section| PatchSection {
                 section_index: section.section_index,
+                section_name: section.section_name.clone(),
                 input_size: section.input_size,
                 output_offset: section.output_offset,
                 output_size: section.output_size,
@@ -364,7 +367,7 @@ fn patch_changed_inputs(
                 path.display()
             )
         })?;
-        let fingerprint = patch_fingerprint(&bytes, sections.iter().copied())?;
+        let fingerprint = patch_fingerprint(&bytes, sections.iter().cloned())?;
         if fingerprint.as_deref() != Some(previous_patch.fingerprint.as_str()) {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "changed bytes outside patchable sections in `{}`",
@@ -386,7 +389,7 @@ fn patch_changed_inputs(
         input_files[*input_index].patch = Some(previous_patch.clone());
 
         let Some(section_patches) =
-            patch_sections_for_input(&bytes, patch_sections.iter().copied())?
+            patch_sections_for_input(&bytes, patch_sections.iter().cloned())?
         else {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "changed patchable section size in `{}`",
@@ -553,9 +556,10 @@ fn flush_output_ranges(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PatchSection {
     section_index: u32,
+    section_name: Option<String>,
     input_size: u64,
     output_offset: u64,
     output_size: u64,
@@ -828,6 +832,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V10
             && version != STATE_VERSION_V9
             && version != STATE_VERSION_V8
             && version != STATE_VERSION_V7
@@ -866,6 +871,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V10
             || version == STATE_VERSION_V9
             || version == STATE_VERSION_V8
             || version == STATE_VERSION_V7
@@ -1276,13 +1282,14 @@ fn record_patch_fingerprints(
             continue;
         };
         let patch_sections = direct_copy_patch_sections(input_file.data(), output, sections)?;
-        input.patch = patch_fingerprint(input_file.data(), patch_sections.iter().copied())?.map(
+        input.patch = patch_fingerprint(input_file.data(), patch_sections.iter().cloned())?.map(
             |fingerprint| FilePatchState {
                 fingerprint,
                 sections: patch_sections
                     .iter()
                     .map(|section| FilePatchSectionState {
                         section_index: section.section_index,
+                        section_name: section.section_name.clone(),
                         input_size: section.input_size,
                         output_offset: section.output_offset,
                         output_size: section.output_size,
@@ -1327,6 +1334,7 @@ fn direct_copy_patch_sections<'a>(
         if data_out == data && padding.iter().all(|byte| *byte == 0) {
             patch_sections.push(PatchSection {
                 section_index: record.section_index,
+                section_name: section.name().ok().map(str::to_owned),
                 input_size: data.len() as u64,
                 output_offset: record.output_offset,
                 output_size: record.size,
@@ -1391,12 +1399,20 @@ fn changed_patch_sections(
         object::File::parse(current_bytes).context("Failed to parse current patch input")?;
     let mut changed_sections = Vec::new();
 
-    for &patch_section in sections {
+    for patch_section in sections.iter().cloned() {
+        let Some(previous_section_index) = patch_section_index(&previous_file, &patch_section)?
+        else {
+            return Ok(None);
+        };
+        let Some(current_section_index) = patch_section_index(&current_file, &patch_section)?
+        else {
+            return Ok(None);
+        };
         let previous_section = previous_file
-            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .section_by_index(previous_section_index)
             .context("Missing previous incremental patch section")?;
         let current_section = current_file
-            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .section_by_index(current_section_index)
             .context("Missing current incremental patch section")?;
         let previous_data = previous_section
             .data()
@@ -1412,6 +1428,28 @@ fn changed_patch_sections(
     Ok(Some(changed_sections))
 }
 
+fn patch_section_index(
+    file: &object::File<'_>,
+    patch_section: &PatchSection,
+) -> Result<Option<object::SectionIndex>> {
+    let Some(name) = patch_section.section_name.as_deref() else {
+        return Ok(Some(object::SectionIndex(
+            patch_section.section_index as usize,
+        )));
+    };
+
+    let mut matches = file
+        .sections()
+        .filter_map(|section| (section.name().ok() == Some(name)).then(|| section.index()));
+    let Some(index) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(index))
+}
+
 fn patch_sections_for_input(
     bytes: &[u8],
     sections: impl IntoIterator<Item = PatchSection>,
@@ -1419,8 +1457,11 @@ fn patch_sections_for_input(
     let file = object::File::parse(bytes).context("Failed to parse changed incremental input")?;
     let mut patches = Vec::new();
     for patch_section in sections {
+        let Some(section_index) = patch_section_index(&file, &patch_section)? else {
+            return Ok(None);
+        };
         let section = file
-            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .section_by_index(section_index)
             .context("Missing changed incremental input section")?;
         let data = section
             .data()
@@ -1446,8 +1487,11 @@ fn patch_ranges(
     let file = object::File::parse(bytes).context("Failed to parse incremental patch input")?;
     let mut ranges = Vec::new();
     for patch_section in sections {
+        let Some(section_index) = patch_section_index(&file, &patch_section)? else {
+            return Ok(None);
+        };
         let section = file
-            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .section_by_index(section_index)
             .context("Missing incremental patch input section")?;
         let Some((offset, size)) = section.file_range() else {
             return Ok(None);
@@ -2025,11 +2069,16 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
         .iter()
         .map(|section| {
             format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}",
                 section.section_index,
                 section.input_size,
                 section.output_offset,
-                section.output_size
+                section.output_size,
+                section
+                    .section_name
+                    .as_ref()
+                    .map(|name| hex::encode(name.as_bytes()))
+                    .unwrap_or_else(|| ABSENT_FIELD.to_owned())
             )
         })
         .collect::<Vec<_>>()
@@ -2047,13 +2096,24 @@ fn parse_patch_sections(sections: &str) -> Result<Vec<FilePatchSectionState>> {
     let mut parsed = Vec::new();
     for section in sections.split(',') {
         let parts = section.split(':').collect::<Vec<_>>();
-        if parts.len() != 4 {
+        if parts.len() != 4 && parts.len() != 5 {
             return Ok(Vec::new());
         }
+        let section_name = parts
+            .get(4)
+            .copied()
+            .filter(|name| *name != ABSENT_FIELD)
+            .map(|name| {
+                let bytes =
+                    hex::decode(name).context("Malformed incremental patch section name")?;
+                String::from_utf8(bytes).context("Invalid incremental patch section name")
+            })
+            .transpose()?;
         parsed.push(FilePatchSectionState {
             section_index: parts[0]
                 .parse()
                 .context("Invalid incremental patch section index")?,
+            section_name,
             input_size: parts[1]
                 .parse()
                 .context("Invalid incremental patch section input size")?,
@@ -2772,6 +2832,7 @@ mod tests {
         current[offset as usize] ^= 1;
         let patch_section = PatchSection {
             section_index: section.index().0 as u32,
+            section_name: section.name().ok().map(str::to_owned),
             input_size: size,
             output_offset: 64,
             output_size: size,
@@ -2808,6 +2869,7 @@ mod tests {
         };
         let patch_section = PatchSection {
             section_index: section.index().0 as u32,
+            section_name: section.name().ok().map(str::to_owned),
             input_size: size + 1,
             output_offset: 64,
             output_size: size + 1,
@@ -2817,6 +2879,60 @@ mod tests {
             patch_sections_for_input(&bytes, [patch_section])
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn patch_sections_for_input_resolves_unique_section_names() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&current_exe) else {
+            return;
+        };
+        let Ok(object) = object::File::parse(&*bytes) else {
+            return;
+        };
+        let mut selected = None;
+        for section in object.sections() {
+            let Ok(name) = section.name() else {
+                continue;
+            };
+            let Some((_, size)) = section.file_range() else {
+                continue;
+            };
+            if size == 0
+                || object
+                    .sections()
+                    .filter(|s| s.name().ok() == Some(name))
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            selected = Some((name.to_owned(), size));
+            break;
+        }
+        let Some((section_name, size)) = selected else {
+            return;
+        };
+        let patch_section = PatchSection {
+            section_index: u32::MAX,
+            section_name: Some(section_name),
+            input_size: size,
+            output_offset: 64,
+            output_size: size,
+        };
+
+        assert!(
+            patch_ranges(&bytes, [patch_section.clone()])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            patch_sections_for_input(&bytes, [patch_section])
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -2835,18 +2951,21 @@ mod tests {
             sections: vec![
                 FilePatchSectionState {
                     section_index: 1,
+                    section_name: Some(".text.foo".to_owned()),
                     input_size: 4,
                     output_offset: 100,
                     output_size: 4,
                 },
                 FilePatchSectionState {
                     section_index: 3,
+                    section_name: Some(".data".to_owned()),
                     input_size: 8,
                     output_offset: 112,
                     output_size: 12,
                 },
                 FilePatchSectionState {
                     section_index: 5,
+                    section_name: None,
                     input_size: 16,
                     output_offset: 128,
                     output_size: 16,
@@ -2857,8 +2976,28 @@ mod tests {
 
         let rendered = state.render();
 
-        assert!(rendered.contains("\tpatch-hash\t1:4:100:4,3:8:112:12,5:16:128:16\n"));
+        assert!(rendered.contains(&format!(
+            "\tpatch-hash\t1:4:100:4:{},3:8:112:12:{},5:16:128:16:-\n",
+            hex::encode(".text.foo"),
+            hex::encode(".data")
+        )));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v10_patch_metadata_without_section_names_is_accepted() {
+        let line = format!(
+            "input\t{}\t1\t{}\t-\tpatch-hash\t1:4:100:4,3:8:112:12",
+            hex::encode("a.o"),
+            hash_bytes(b"a")
+        );
+
+        let parsed = parse_input_line(&line).unwrap();
+        let sections = parsed.patch.unwrap().sections;
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].section_name, None);
+        assert_eq!(sections[1].section_name, None);
     }
 
     #[test]
