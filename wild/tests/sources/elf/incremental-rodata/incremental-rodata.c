@@ -4,6 +4,7 @@
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
+//#TestIncrementalChangedInput:incremental-rodata-value.c.o
 //#TestIncrementalChangedSection:.rodata
 
 extern const unsigned char incremental_rodata_value[4];

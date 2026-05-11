@@ -309,6 +309,7 @@ fn patch_changed_inputs(
     timing_phase!("Patch changed incremental inputs");
 
     let mut patches = Vec::new();
+    let mut patched_section_count = 0;
     let mut input_files = previous.input_files.clone();
     for (input_index, path) in changed_inputs {
         let input = &previous.input_files[*input_index];
@@ -348,6 +349,10 @@ fn patch_changed_inputs(
             return Ok(false);
         }
 
+        let patch_sections = changed_patch_sections(state_dir, input, &bytes, &sections)?
+            .unwrap_or_else(|| sections.clone());
+        patched_section_count += patch_sections.len();
+
         input_files[*input_index].content = FileContentState::from_path_identity_only(path)
             .with_context(|| {
                 format!(
@@ -357,7 +362,10 @@ fn patch_changed_inputs(
             })?;
         input_files[*input_index].patch = Some(previous_patch.clone());
 
-        patches.extend(patch_sections(&bytes, sections.iter().copied())?);
+        patches.extend(patch_sections_for_input(
+            &bytes,
+            patch_sections.iter().copied(),
+        )?);
     }
 
     let file = OpenOptions::new()
@@ -457,6 +465,10 @@ fn patch_changed_inputs(
             changed_inputs.len(),
             if changed_inputs.len() == 1 { "" } else { "s" }
         ),
+    )?;
+    append_log(
+        state_dir,
+        &format!("patched {patched_section_count} changed input sections before loading inputs"),
     )?;
     Ok(true)
 }
@@ -1314,7 +1326,55 @@ fn patch_fingerprint(
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
-fn patch_sections(
+fn changed_patch_sections(
+    state_dir: &Path,
+    previous_input: &FileState,
+    current_bytes: &[u8],
+    sections: &[PatchSection],
+) -> Result<Option<Vec<PatchSection>>> {
+    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    if !previous_input
+        .content
+        .identity_matches_path(&snapshot)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let previous_bytes = match std::fs::read(&snapshot) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let previous_file =
+        object::File::parse(&*previous_bytes).context("Failed to parse previous patch input")?;
+    let current_file =
+        object::File::parse(current_bytes).context("Failed to parse current patch input")?;
+    let mut changed_sections = Vec::new();
+
+    for &patch_section in sections {
+        let previous_section = previous_file
+            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .context("Missing previous incremental patch section")?;
+        let current_section = current_file
+            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .context("Missing current incremental patch section")?;
+        let previous_data = previous_section
+            .data()
+            .context("Failed to read previous incremental patch section data")?;
+        let current_data = current_section
+            .data()
+            .context("Failed to read current incremental patch section data")?;
+        if previous_data != current_data {
+            changed_sections.push(patch_section);
+        }
+    }
+
+    Ok(Some(changed_sections))
+}
+
+fn patch_sections_for_input(
     bytes: &[u8],
     sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Vec<SectionPatch>> {
@@ -2642,6 +2702,56 @@ mod tests {
         std::fs::rename(&replacement, &input).unwrap();
 
         assert!(!input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
+    }
+
+    #[test]
+    fn changed_patch_sections_identifies_changed_section() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&current_exe) else {
+            return;
+        };
+        let Ok(object) = object::File::parse(&*bytes) else {
+            return;
+        };
+        let Some(section) = object.section_by_name(".data") else {
+            return;
+        };
+        let Some((offset, size)) = section.file_range() else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, &bytes).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            patch: None,
+        };
+        let mut current = bytes.clone();
+        current[offset as usize] ^= 1;
+        let patch_section = PatchSection {
+            section_index: section.index().0 as u32,
+            input_size: size,
+            output_offset: 64,
+            output_size: size,
+        };
+
+        assert_eq!(
+            changed_patch_sections(&state_dir, &previous, &current, &[patch_section])
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
