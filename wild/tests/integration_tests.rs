@@ -171,7 +171,7 @@
 //! log reuse of unchanged input sections. Defaults to false.
 //!
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
-//! Defaults to the last linker input.
+//! Can be repeated to mutate multiple inputs. Defaults to the last linker input.
 //!
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
 //! to .data.
@@ -795,7 +795,7 @@ struct Config {
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
-    test_incremental_changed_input: Option<String>,
+    test_incremental_changed_inputs: Vec<String>,
     test_incremental_changed_section: String,
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_compare_full: bool,
@@ -1381,7 +1381,7 @@ impl Config {
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
-            test_incremental_changed_input: None,
+            test_incremental_changed_inputs: Vec::new(),
             test_incremental_changed_section: ".data".to_owned(),
             test_incremental_changed_grow_section: None,
             test_incremental_changed_compare_full: true,
@@ -1785,7 +1785,7 @@ fn process_directive(
             config.test_incremental_changed_expect_reuse = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedInput" => {
-            config.test_incremental_changed_input = Some(arg.to_owned());
+            config.test_incremental_changed_inputs.push(arg.to_owned());
         }
         "TestIncrementalChangedSection" => {
             arg.clone_into(&mut config.test_incremental_changed_section);
@@ -2143,37 +2143,42 @@ impl ProgramInputs {
         }
 
         if config.test_incremental_changed {
-            let changed_input =
-                if let Some(expected_name) = config.test_incremental_changed_input.as_deref() {
-                    let input_path = inputs
-                        .iter()
-                        .find(|input| {
-                            input
-                                .path
-                                .file_name()
-                                .is_some_and(|name| name == expected_name)
-                        })
-                        .map(|input| input.path.clone())
-                        .or_else(|| {
-                            let path = config.build_dir().join(expected_name);
-                            path.exists().then_some(path)
-                        })
-                        .with_context(|| {
-                            format!(
-                                "Incremental changed-input test for {} could not find input `{}`",
-                                self.name(),
-                                expected_name
-                            )
-                        })?;
-                    LinkerInput::new(input_path)
-                } else {
-                    inputs.last().cloned().with_context(|| {
-                        format!(
-                            "Incremental changed-input test for {} needs at least one input",
-                            self.name()
-                        )
-                    })?
-                };
+            let changed_inputs = if config.test_incremental_changed_inputs.is_empty() {
+                vec![inputs.last().cloned().with_context(|| {
+                    format!(
+                        "Incremental changed-input test for {} needs at least one input",
+                        self.name()
+                    )
+                })?]
+            } else {
+                config
+                    .test_incremental_changed_inputs
+                    .iter()
+                    .map(|expected_name| {
+                        let input_path = inputs
+                            .iter()
+                            .find(|input| {
+                                input
+                                    .path
+                                    .file_name()
+                                    .is_some_and(|name| name == expected_name.as_str())
+                            })
+                            .map(|input| input.path.clone())
+                            .or_else(|| {
+                                let path = config.build_dir().join(expected_name);
+                                path.exists().then_some(path)
+                            })
+                            .with_context(|| {
+                                format!(
+                                    "Incremental changed-input test for {} could not find input `{}`",
+                                    self.name(),
+                                    expected_name
+                                )
+                            })?;
+                        Ok(LinkerInput::new(input_path))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
             if inputs.len() < 2 {
                 bail!(
                     "Incremental changed-input test for {} needs at least two inputs",
@@ -2181,18 +2186,21 @@ impl ProgramInputs {
                 );
             }
 
-            let _restore_changed_input = RestoreFileOnDrop::new(&changed_input.path)?;
-            if let Some(growth) = config.test_incremental_changed_grow_section {
-                grow_section_bytes(
-                    &changed_input.path,
-                    &config.test_incremental_changed_section,
-                    growth,
-                )?;
-            } else {
-                mutate_section_byte(
-                    &changed_input.path,
-                    &config.test_incremental_changed_section,
-                )?;
+            let mut _restore_changed_inputs = Vec::with_capacity(changed_inputs.len());
+            for changed_input in &changed_inputs {
+                _restore_changed_inputs.push(RestoreFileOnDrop::new(&changed_input.path)?);
+                if let Some(growth) = config.test_incremental_changed_grow_section {
+                    grow_section_bytes(
+                        &changed_input.path,
+                        &config.test_incremental_changed_section,
+                        growth,
+                    )?;
+                } else {
+                    mutate_section_byte(
+                        &changed_input.path,
+                        &config.test_incremental_changed_section,
+                    )?;
+                }
             }
 
             let link_output_3 =
@@ -2262,11 +2270,14 @@ impl ProgramInputs {
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
-            let patched_input_message = "patched 1 changed input file before loading inputs";
-            let patched_section_message = "patched 1 changed input sections before loading inputs";
             let fallback_message = "changed-input patch unavailable before loading inputs";
             if config.test_incremental_changed_expect_patch {
-                if !log.contains(patched_input_message) {
+                let changed_input_count = changed_inputs.len();
+                let patched_input_message = format!(
+                    "patched {changed_input_count} changed input file{} before loading inputs",
+                    if changed_input_count == 1 { "" } else { "s" }
+                );
+                if !log.contains(&patched_input_message) {
                     bail!(
                         "Incremental test failed for {}: changed-input relink did not patch the \
                         changed input before loading all inputs. Log:\n{}",
@@ -2274,7 +2285,11 @@ impl ProgramInputs {
                         log
                     );
                 }
-                if !log.contains(patched_section_message) {
+                let patched_section_count = changed_inputs.len();
+                let patched_section_message = format!(
+                    "patched {patched_section_count} changed input sections before loading inputs"
+                );
+                if !log.contains(&patched_section_message) {
                     bail!(
                         "Incremental test failed for {}: changed-input relink did not narrow the \
                         update to the changed section. Log:\n{}",
@@ -2282,7 +2297,7 @@ impl ProgramInputs {
                         log
                     );
                 }
-            } else if log.contains(patched_input_message) {
+            } else if log.contains("patched ") && log.contains(" changed input file") {
                 bail!(
                     "Incremental test failed for {}: changed input was unexpectedly patched \
                     before loading all inputs. Log:\n{}",
