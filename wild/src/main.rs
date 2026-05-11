@@ -19,6 +19,10 @@ fn run() -> libwild::error::Result {
     #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::new_heap();
 
+    if handle_command()? {
+        return Ok(());
+    }
+
     libwild::init_timing()?;
 
     let mut args = libwild::Args::new(std::env::args)?;
@@ -37,4 +41,22 @@ fn run() -> libwild::error::Result {
 
         libwild::run(args)
     }
+}
+
+fn handle_command() -> libwild::error::Result<bool> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    let Some(command) = args.next() else {
+        return Ok(false);
+    };
+    if command != "log" {
+        return Ok(false);
+    }
+    if args.next().is_some() {
+        libwild::bail!("Usage: wild log");
+    }
+
+    let stdout = std::io::stdout();
+    libwild::print_incremental_log(stdout.lock())?;
+    Ok(true)
 }
