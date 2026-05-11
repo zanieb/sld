@@ -7,8 +7,8 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-relocation-target-moved-target.c.o
 //#TestIncrementalChangedCompArgs:-DINCREMENTAL_TARGET_MOVED=1
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:relocation target moved
+//#TestIncrementalChangedSection:.data.incremental_target_moved
+//#TestIncrementalChangedExpectPatch:true
 
 int incremental_relocation_target_ref_value(void);
 

@@ -3194,31 +3194,6 @@ fn apply_relocation<
         rel_info = A::relocation_from_raw(r_type)?;
     }
 
-    if let Some(source_section_index) = section_info.source_section_index {
-        let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
-        let target_name = layout
-            .symbol_db
-            .symbol_name(target_symbol_id)
-            .ok()
-            .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
-        let target = relocation_target_owner(layout, target_symbol_id)?;
-        let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
-            .context("Incremental relocation target symbol ID overflow")?;
-        incremental.record_relocation(
-            object_layout.input,
-            source_section_index,
-            target_symbol_id,
-            rel.offset(),
-            section_info.section_output_offset + offset_in_section,
-            relocation_record_size(&rel_info) as u64,
-            r_type,
-            addend,
-            resolution.raw_value,
-            target_name,
-            target,
-        );
-    }
-
     // Compute place to which IP-relative relocations will be relative. This is different to
     // `original_place` in that our `offset_in_section` may have been adjusted by a relaxation.
     let place = section_address + offset_in_section;
@@ -3619,6 +3594,32 @@ fn apply_relocation<
     )? {
         value = thunked_value;
     };
+
+    if let Some(source_section_index) = section_info.source_section_index {
+        let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
+        let target_name = layout
+            .symbol_db
+            .symbol_name(target_symbol_id)
+            .ok()
+            .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
+        let target = relocation_target_owner(layout, target_symbol_id)?;
+        let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
+            .context("Incremental relocation target symbol ID overflow")?;
+        incremental.record_relocation(
+            object_layout.input,
+            source_section_index,
+            target_symbol_id,
+            rel.offset(),
+            section_info.section_output_offset + offset_in_section as u64,
+            relocation_record_size(&rel_info) as u64,
+            r_type,
+            addend,
+            value,
+            resolution.raw_value,
+            target_name,
+            target,
+        );
+    }
 
     rel_info.write_to_buffer(value, &mut out[offset_in_section..])?;
 
