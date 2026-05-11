@@ -118,21 +118,24 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
 
         let mut bench_results = Vec::new();
         for batch_num in 0..args.num_batches {
-            for bin in bins {
-                let mut bin_results = Vec::new();
-                for _ in 0..args.batch_size {
+            let mut batch_runs = vec![Vec::new(); bins.len()];
+            for group in timed_run_groups(bins.len(), args.batch_size) {
+                mutate_inputs(bench)?;
+                for bin_index in group.bin_indexes {
+                    let bin = &bins[bin_index];
                     let extra_flags =
                         extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
-                    mutate_inputs(bench)?;
 
                     if let Some(run) = run_once(bin, bench, args, &extra_flags)? {
-                        bin_results.push(run);
+                        batch_runs[bin_index].push(run);
                     }
                     progress_bar.inc(1);
                 }
+            }
+            for (bin, runs) in bins.iter().zip(batch_runs) {
                 bench_results.push(BatchResult {
                     bin: bin.clone(),
-                    runs: bin_results,
+                    runs,
                 })
             }
         }
@@ -155,6 +158,19 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
     );
 
     Ok(Benchmarks { benchmarks: out })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TimedRunGroup {
+    bin_indexes: Vec<usize>,
+}
+
+fn timed_run_groups(num_bins: usize, batch_size: u32) -> Vec<TimedRunGroup> {
+    (0..batch_size)
+        .map(|_| TimedRunGroup {
+            bin_indexes: (0..num_bins).collect(),
+        })
+        .collect()
 }
 
 fn extra_flags_for_run(bin: &Bin, bench: &Benchmark, measure_memory: bool) -> Vec<String> {
@@ -499,6 +515,21 @@ mod tests {
         assert_eq!(
             output_path_for_bin(Path::new("/tmp/linker-benchmark-out"), &bin),
             PathBuf::from("/tmp/linker-benchmark-out.7")
+        );
+    }
+
+    #[test]
+    fn timed_run_groups_share_each_mutation_across_bins() {
+        assert_eq!(
+            super::timed_run_groups(3, 2),
+            [
+                super::TimedRunGroup {
+                    bin_indexes: vec![0, 1, 2]
+                },
+                super::TimedRunGroup {
+                    bin_indexes: vec![0, 1, 2]
+                },
+            ]
         );
     }
 }
