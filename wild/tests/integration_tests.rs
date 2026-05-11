@@ -2259,6 +2259,42 @@ impl ProgramInputs {
                 })?;
             }
 
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            let reuse_message = if cfg!(unix) {
+                "reused existing output before loading inputs"
+            } else {
+                "reused existing output"
+            };
+            let reuse_count_before = log.matches(reuse_message).count();
+            let link_output_5 =
+                Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+            let repeated_changed_content =
+                std::fs::read(&link_output_5.binary).with_context(|| {
+                    format!(
+                        "Failed to read repeated changed incremental output: {}",
+                        link_output_5.binary.display()
+                    )
+                })?;
+            if changed_content != repeated_changed_content {
+                bail!(
+                    "Incremental test failed for {}: repeated changed-input link changed output",
+                    self.name()
+                );
+            }
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if log.matches(reuse_message).count() <= reuse_count_before {
+                bail!(
+                    "Incremental test failed for {}: repeated changed-input link did not reuse \
+                    the updated incremental state. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+
             if config.test_incremental_changed_compare_full {
                 let link_output_4 = Linker::Wild.link(self.name(), inputs, config, cross_arch)?;
                 let full_content = std::fs::read(&link_output_4.binary).with_context(|| {
