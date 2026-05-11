@@ -57,13 +57,18 @@ pub(crate) const TEXT_SEGMENT: PartId = PartId(33);
 pub(crate) const DATA_SEGMENT: PartId = PartId(34);
 pub(crate) const LINK_EDIT_SEGMENT: PartId = PartId(35);
 pub(crate) const ENTRY_POINT: PartId = PartId(36);
-pub(crate) const DYLD_CHAINED_FIXUPS: PartId = PartId(37);
-pub(crate) const CHAINED_FIXUP_TABLE: PartId = PartId(38);
-pub(crate) const SYMTAB_COMMAND: PartId = PartId(39);
-pub(crate) const CODE_SIGNATURE_COMMAND: PartId = PartId(40);
-pub(crate) const CODE_SIGNATURE: PartId = PartId(41);
+pub(crate) const BUILD_VERSION: PartId = PartId(37);
+pub(crate) const DYLD_CHAINED_FIXUPS: PartId = PartId(38);
+pub(crate) const CHAINED_FIXUP_TABLE: PartId = PartId(39);
+pub(crate) const SYMTAB_COMMAND: PartId = PartId(40);
+pub(crate) const UUID_COMMAND: PartId = PartId(41);
+pub(crate) const LIBSYSTEM: PartId = PartId(42);
+pub(crate) const ID_DYLIB: PartId = PartId(43);
+pub(crate) const MACHO_UNWIND_INFO: PartId = PartId(44);
+pub(crate) const CODE_SIGNATURE_COMMAND: PartId = PartId(45);
+pub(crate) const CODE_SIGNATURE: PartId = PartId(46);
 
-pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 42;
+pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 47;
 
 #[cfg(test)]
 pub(crate) const NUM_BUILT_IN_PARTS: usize = NUM_SINGLE_PART_SECTIONS as usize

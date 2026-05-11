@@ -7,9 +7,9 @@ use crate::alignment;
 use crate::alignment::Alignment;
 use crate::alignment::MACHO_PAGE_ALIGNMENT;
 use crate::args::macho::MachOArgs;
-use crate::elf::ResolutionExt;
 use crate::ensure;
 use crate::error;
+use crate::error::Context as _;
 use crate::error::Result;
 use crate::file_writer::copy_section_data;
 use crate::layout;
@@ -19,6 +19,7 @@ use crate::layout::Resolution;
 use crate::layout::SymbolCopyInfo;
 use crate::layout_rules::SectionKind;
 use crate::layout_rules::SectionRule;
+use crate::layout_rules::SectionRuleOutcome;
 use crate::macho_writer;
 use crate::output_section_id;
 use crate::output_section_id::NUM_BUILT_IN_SECTIONS;
@@ -28,9 +29,15 @@ use crate::output_section_id::SectionName;
 use crate::output_section_id::SectionOutputInfo;
 use crate::part_id;
 use crate::platform;
+use crate::platform::Args as _;
 use crate::platform::ObjectFile;
+use crate::platform::SectionAttributes as _;
+use crate::platform::SectionHeader as _;
 use crate::platform::Symbol as _;
+use crate::symbol_db::SymbolDb;
+use crate::symbol_db::SymbolId;
 use crate::symbol_db::Visibility;
+use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use gimli::LittleEndian;
 use object::Endian;
@@ -53,6 +60,8 @@ use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
 use std::borrow::Cow;
+use std::num::NonZeroU64;
+use std::path::Path;
 use zerocopy::BigEndian;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -72,13 +81,59 @@ pub(crate) const MACHO_START_MEM_ADDRESS: u64 = 0x1_0000_0000;
 
 /// The command alignment is 8B for 64-bit platforms.
 pub(crate) const MACHO_COMMAND_ALIGNMENT: usize = 8;
+pub(crate) const MACHO_PAGE_SIZE: u64 = 0x4000;
+pub(crate) const MACHO_GOT_ENTRY_SIZE: u64 = 8;
+pub(crate) const MACHO_STUB_SIZE: u64 = 12;
+pub(crate) const MACHO_COMPACT_UNWIND_ENTRY_SIZE: usize = 32;
+pub(crate) const MACHO_UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
+pub(crate) const MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT: usize = 511;
 
 /// A path to the default dynamic linker.
 pub(crate) const DYLINKER_PATH: &[u8] = b"/usr/lib/dyld";
+pub(crate) const LIBSYSTEM_PATH: &[u8] = b"/usr/lib/libSystem.B.dylib";
+pub(crate) const DEFAULT_ID_DYLIB_PATH: &[u8] = b"@rpath/wild-linked.dylib";
 // TODO: optionality of __DATA and __CONST_DATA segments not respected
 pub(crate) const DEFAULT_SEGMENT_COUNT: usize = 4;
-pub(crate) const CHAINED_FIXUP_TABLE_SIZE: u64 =
-    (size_of::<ChainedFixupsHeader>() + size_of::<u32>() * (DEFAULT_SEGMENT_COUNT + 1 + 1)) as u64;
+const CHAINED_FIXUP_TABLE_HEADER_SIZE: u64 = 32;
+
+pub(crate) fn macho_unwind_info_allocation_size(entry_count: usize) -> u64 {
+    if entry_count == 0 {
+        return 0;
+    }
+
+    let page_count = (entry_count + MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT - 1)
+        / MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT;
+    let header_size = 7 * size_of::<u32>();
+    let common_encodings_array_size = 3 * size_of::<u32>();
+    let max_personality_array_size = 3 * size_of::<u32>();
+    let index_size = (page_count + 1) * 3 * size_of::<u32>();
+    let max_lsda_index_size = entry_count * 2 * size_of::<u32>();
+    let second_level_pages_size =
+        page_count * (size_of::<u32>() + 2 * size_of::<u16>()) + entry_count * 2 * size_of::<u32>();
+
+    (header_size
+        + common_encodings_array_size
+        + max_personality_array_size
+        + index_size
+        + max_lsda_index_size
+        + second_level_pages_size) as u64
+}
+
+pub(crate) fn load_dylib_paths<'a>(args: &'a MachOArgs) -> impl Iterator<Item = &'a [u8]> + 'a {
+    std::iter::once(LIBSYSTEM_PATH).chain(args.extra_dylib_paths.iter().map(Vec::as_slice))
+}
+
+pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
+    (size_of::<DylibCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
+}
+
+pub(crate) fn load_dylib_commands_size(args: &MachOArgs) -> usize {
+    load_dylib_paths(args).map(load_dylib_command_size).sum()
+}
+
+pub(crate) fn load_dylib_command_count(args: &MachOArgs) -> usize {
+    load_dylib_paths(args).count()
+}
 
 type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
@@ -86,10 +141,20 @@ type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHea
 type SymtabEntry = object::macho::Nlist64<Endianness>;
 type Relocation = object::macho::Relocation<Endianness>;
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct ResolutionExt {
+    pub(crate) got_address: Option<NonZeroU64>,
+    pub(crate) stub_address: Option<NonZeroU64>,
+    pub(crate) is_import: bool,
+}
+
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
 pub(crate) type SegmentCommand = object::macho::SegmentCommand64<Endianness>;
 pub(crate) type SectionEntry = object::macho::Section64<Endianness>;
 pub(crate) type EntryPointCommand = object::macho::EntryPointCommand<Endianness>;
+pub(crate) type BuildVersionCommand = object::macho::BuildVersionCommand<Endianness>;
+pub(crate) type UuidCommand = object::macho::UuidCommand<Endianness>;
+pub(crate) type DylibCommand = object::macho::DylibCommand<Endianness>;
 pub(crate) type DylinkerCommand = object::macho::DylinkerCommand<Endianness>;
 pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
@@ -389,7 +454,12 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         object::SectionIndex,
         &'data <Self::Platform as platform::Platform>::SectionHeader,
     )> {
-        todo!()
+        let name = name.as_bytes();
+        self.sections
+            .iter()
+            .enumerate()
+            .find(|(_, section)| section.name() == name)
+            .map(|(index, section)| (object::SectionIndex(index), section))
     }
 
     fn symbol_section(
@@ -406,7 +476,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn symbol_versions(&self) -> &[<Self::Platform as platform::Platform>::SymbolVersionIndex] {
-        todo!()
+        &[]
     }
 
     fn dynamic_symbol_used(
@@ -414,7 +484,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         symbol_index: object::SymbolIndex,
         state: &mut <Self::Platform as platform::Platform>::DynamicLayoutStateExt<'data>,
     ) -> crate::error::Result {
-        todo!()
+        Ok(())
     }
 
     fn finalise_sizes_dynamic(
@@ -423,7 +493,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         state: &mut <Self::Platform as platform::Platform>::DynamicLayoutStateExt<'data>,
         mem_sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> crate::error::Result {
-        todo!()
+        Ok(())
     }
 
     fn apply_non_addressable_indexes_dynamic(
@@ -432,7 +502,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         counts: &mut <Self::Platform as platform::Platform>::NonAddressableCounts,
         state: &mut <Self::Platform as platform::Platform>::DynamicLayoutStateExt<'data>,
     ) -> crate::error::Result {
-        todo!()
+        Ok(())
     }
 
     fn section_name(
@@ -446,7 +516,9 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         &self,
         section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        section
+            .data(LE, self.data)
+            .map_err(|_e| error!("cannot get section data"))
     }
 
     fn section_data(
@@ -455,14 +527,22 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         member: &bumpalo_herd::Member<'data>,
         loaded_metrics: &crate::resolution::LoadedMetrics,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        let data = self.raw_section_data(section)?;
+        loaded_metrics
+            .loaded_bytes
+            .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+        Ok(data)
     }
 
     fn copy_section_data(&self, section: &SectionHeader, out: &mut [u8]) -> Result {
         let data = section
             .data(LE, self.data)
             .map_err(|_e| error!("cannot get section data"))?;
-        copy_section_data(data, out);
+        if section.is_no_bits() {
+            out.fill(0);
+        } else {
+            copy_section_data(data, out);
+        }
 
         Ok(())
     }
@@ -471,7 +551,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         &self,
         section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<std::borrow::Cow<'data, [u8]>> {
-        todo!()
+        Ok(Cow::Borrowed(self.raw_section_data(section)?))
     }
 
     fn section_alignment(
@@ -502,7 +582,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn symbol_version_debug(&self, symbol_index: object::SymbolIndex) -> Option<String> {
-        todo!()
+        None
     }
 
     fn section_display_name(&self, index: object::SectionIndex) -> Cow<'data, str> {
@@ -523,7 +603,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     fn get_version_names(
         &self,
     ) -> crate::error::Result<<Self::Platform as platform::Platform>::VersionNames<'data>> {
-        todo!()
+        Ok(())
     }
 
     fn get_symbol_name_and_version(
@@ -532,14 +612,16 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         local_index: usize,
         version_names: &<Self::Platform as platform::Platform>::VersionNames<'data>,
     ) -> crate::error::Result<<Self::Platform as platform::Platform>::RawSymbolName<'data>> {
-        todo!()
+        Ok(RawSymbolName {
+            name: self.symbol_name(symbol)?,
+        })
     }
 
     fn should_enforce_undefined(
         &self,
         resources: &crate::layout::GraphResources<'data, '_, Self::Platform>,
     ) -> bool {
-        todo!()
+        false
     }
 
     fn verneed_table(
@@ -553,31 +635,39 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         state: &mut <Self::Platform as platform::Platform>::ObjectLayoutStateExt<'data>,
         section_index: object::SectionIndex,
     ) -> crate::error::Result {
-        todo!()
+        Ok(())
     }
 
     fn dynamic_tags(
         &self,
     ) -> crate::error::Result<&'data [<Self::Platform as platform::Platform>::DynamicEntry]> {
-        todo!()
+        Ok(&[])
     }
 }
 
 impl platform::SectionHeader for SectionHeader {
     fn is_alloc(&self) -> bool {
-        todo!()
+        !self.segname.starts_with(b"__DWARF") && self.flags.get(LE) & macho::S_ATTR_DEBUG == 0
     }
 
     fn is_writable(&self) -> bool {
-        todo!()
+        self.segname.starts_with(b"__DATA") && !self.segname.starts_with(b"__DATA_CONST")
     }
 
     fn is_executable(&self) -> bool {
-        self.sectname.starts_with(b"__text")
+        self.flags.get(LE) & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS)
+            != 0
     }
 
     fn is_tls(&self) -> bool {
-        todo!()
+        matches!(
+            self.section_type(LE),
+            macho::S_THREAD_LOCAL_REGULAR
+                | macho::S_THREAD_LOCAL_ZEROFILL
+                | macho::S_THREAD_LOCAL_VARIABLES
+                | macho::S_THREAD_LOCAL_VARIABLE_POINTERS
+                | macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+        )
     }
 
     fn is_merge_section(&self) -> bool {
@@ -586,12 +676,11 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_strings(&self) -> bool {
-        todo!()
+        self.flags.get(LE) & macho::SECTION_TYPE == macho::S_CSTRING_LITERALS
     }
 
     fn should_retain(&self) -> bool {
-        // TODO
-        false
+        self.flags.get(LE) & macho::S_ATTR_NO_DEAD_STRIP != 0
     }
 
     fn should_exclude(&self) -> bool {
@@ -600,7 +689,7 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_group(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_note(&self) -> bool {
@@ -608,11 +697,14 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_prog_bits(&self) -> bool {
-        todo!()
+        !self.is_no_bits()
     }
 
     fn is_no_bits(&self) -> bool {
-        todo!()
+        matches!(
+            self.section_type(LE),
+            macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
+        )
     }
 }
 
@@ -621,19 +713,19 @@ pub(crate) struct SectionType {}
 
 impl platform::SectionType for SectionType {
     fn is_rela(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_rel(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_symtab(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_strtab(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -666,12 +758,26 @@ impl platform::SectionFlags for SectionFlags {
 // Documentation link for Nlist64 type: https://leopard-adc.pepas.com/documentation/DeveloperTools/Conceptual/MachORuntime/Reference/reference.html
 impl platform::Symbol for SymtabEntry {
     fn as_common(&self) -> Option<platform::CommonSymbol> {
-        // TODO
-        None
+        if self.n_type & (N_TYPE | N_EXT) != N_EXT {
+            return None;
+        }
+        let size = self.n_value.get(LE);
+        if size == 0 {
+            return None;
+        }
+
+        let alignment_exponent = (self.n_desc.get(LE) >> 8) as u8;
+        let alignment = Alignment::new(1u64.checked_shl(alignment_exponent.into())?).ok()?;
+        let part_id = output_section_id::BSS.part_id_with_alignment(alignment);
+
+        Some(platform::CommonSymbol {
+            size: alignment.align_up(size),
+            part_id,
+        })
     }
 
     fn is_undefined(&self) -> bool {
-        Nlist::is_undefined(self)
+        Nlist::is_undefined(self) && self.as_common().is_none()
     }
 
     fn is_local(&self) -> bool {
@@ -699,8 +805,9 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn size(&self) -> u64 {
-        // TODO
-        0
+        self.as_common()
+            .map(|common| common.size)
+            .unwrap_or_default()
     }
 
     fn has_name(&self) -> bool {
@@ -755,13 +862,28 @@ impl platform::Symbol for SymtabEntry {
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct SectionAttributes {
     pub(crate) flags: SectionFlags,
+    pub(crate) alloc: bool,
+    pub(crate) writable: bool,
+    pub(crate) executable: bool,
+    pub(crate) tls: bool,
+    pub(crate) no_bits: bool,
 }
 
 impl platform::SectionAttributes for SectionAttributes {
     type Platform = MachO;
 
     fn merge(&mut self, rhs: Self) {
+        let was_unset = !self.alloc && self.flags.raw() == 0;
         self.flags = SectionFlags::from_u32(self.flags.raw() | rhs.flags.raw());
+        self.alloc |= rhs.alloc;
+        self.writable |= rhs.writable;
+        self.executable |= rhs.executable;
+        self.tls |= rhs.tls;
+        self.no_bits = if was_unset {
+            rhs.no_bits
+        } else {
+            self.no_bits && rhs.no_bits
+        };
     }
 
     fn apply(
@@ -769,6 +891,11 @@ impl platform::SectionAttributes for SectionAttributes {
         output_sections: &mut crate::output_section_id::OutputSections<Self::Platform>,
         section_id: crate::output_section_id::OutputSectionId,
     ) {
+        output_sections
+            .section_infos
+            .get_mut(section_id)
+            .section_attributes
+            .merge(*self);
     }
 
     fn is_null(&self) -> bool {
@@ -776,23 +903,23 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_alloc(&self) -> bool {
-        false
+        self.alloc
     }
 
     fn is_executable(&self) -> bool {
-        false
+        self.executable
     }
 
     fn is_tls(&self) -> bool {
-        false
+        self.tls
     }
 
     fn is_writable(&self) -> bool {
-        false
+        self.writable
     }
 
     fn is_no_bits(&self) -> bool {
-        false
+        self.no_bits
     }
 
     fn flags(&self) -> <Self::Platform as platform::Platform>::SectionFlags {
@@ -803,7 +930,10 @@ impl platform::SectionAttributes for SectionAttributes {
         SectionType {}
     }
 
-    fn set_to_default_type(&mut self) {}
+    fn set_to_default_type(&mut self) {
+        self.alloc = true;
+        self.flags = SectionFlags::from_u32(macho::S_REGULAR);
+    }
 }
 
 pub(crate) struct NonAddressableIndexes {}
@@ -891,16 +1021,41 @@ impl platform::ProgramSegmentDef for ProgramSegmentDef {
             | output_section_id::DATA_SEGMENT
             | output_section_id::LINK_EDIT_SEGMENT
             | output_section_id::ENTRY_POINT
+            | output_section_id::BUILD_VERSION
+            | output_section_id::UUID_COMMAND
+            | output_section_id::LIBSYSTEM
+            | output_section_id::ID_DYLIB
             | output_section_id::INTERP
             | output_section_id::DYLD_CHAINED_FIXUPS
             | output_section_id::SYMTAB_COMMAND
             | output_section_id::CODE_SIGNATURE_COMMAND => SegmentType::LoadCommands,
-            output_section_id::TEXT | output_section_id::CSTRING => SegmentType::TextSections,
-            output_section_id::DATA => SegmentType::DataSections,
+            output_section_id::TEXT
+            | output_section_id::PLT_GOT
+            | output_section_id::GCC_EXCEPT_TABLE
+            | output_section_id::MACHO_UNWIND_INFO
+            | output_section_id::EH_FRAME => SegmentType::TextSections,
+            output_section_id::GOT
+            | output_section_id::RODATA
+            | output_section_id::CSTRING
+            | output_section_id::RUSTC_METADATA
+            | output_section_id::DATA
+            | output_section_id::TDATA
+            | output_section_id::TBSS
+            | output_section_id::BSS
+            | output_section_id::MACHO_THREAD_VARS
+            | output_section_id::MACHO_THREAD_PTRS => SegmentType::DataSections,
             output_section_id::CHAINED_FIXUP_TABLE
+            | output_section_id::DYNSYM
             | output_section_id::SYMTAB_GLOBAL
             | output_section_id::STRTAB
             | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
+            _ if section_info.section_attributes.is_executable() => SegmentType::TextSections,
+            _ if section_info.section_attributes.is_alloc()
+                && !section_info.section_attributes.is_writable() =>
+            {
+                SegmentType::DataSections
+            }
+            _ if section_info.section_attributes.is_alloc() => SegmentType::DataSections,
             _ => SegmentType::Unused,
         };
 
@@ -945,7 +1100,7 @@ impl<'data> platform::RelocationList<'data> for RelocationList<'data> {
 
 impl<'data> platform::DynamicTagValues<'data> for DynamicTagValues<'data> {
     fn lib_name(&self, input: &crate::input_data::InputRef<'data>) -> &'data [u8] {
-        todo!()
+        &[]
     }
 }
 
@@ -976,7 +1131,7 @@ impl<'data> platform::RawSymbolName<'data> for RawSymbolName<'data> {
 
 impl std::fmt::Display for RawSymbolName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        write!(f, "{}", String::from_utf8_lossy(self.name))
     }
 }
 
@@ -987,7 +1142,7 @@ pub(crate) struct VerneedTable<'data> {
 
 impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
     fn version_name(&self, local_symbol_index: object::SymbolIndex) -> Option<&'data [u8]> {
-        todo!()
+        None
     }
 }
 
@@ -1012,7 +1167,7 @@ impl platform::Platform for MachO {
     type CommonGroupStateExt = ();
     type ArchIdentifier = ();
     type Args = MachOArgs;
-    type ResolutionExt = ();
+    type ResolutionExt = ResolutionExt;
     type SymtabShndxEntry = ();
     type SymbolVersionIndex = ();
     type LayoutExt = ();
@@ -1041,12 +1196,22 @@ impl platform::Platform for MachO {
         layout: &crate::layout::Layout<'data, Self>,
         _incremental: &crate::incremental::PreparedState,
     ) -> crate::error::Result {
-        output.write(layout, macho_writer::write::<A>)
+        output.write(layout, macho_writer::write::<A>)?;
+        if layout.args().should_adhoc_codesign && !layout.symbol_db.output_kind.is_partial_object()
+        {
+            ad_hoc_codesign(output.path())?;
+        }
+        Ok(())
     }
 
     fn section_attributes(header: &Self::SectionHeader) -> Self::SectionAttributes {
         Self::SectionAttributes {
-            ..Default::default()
+            flags: SectionFlags::from_u32(header.flags.get(LE)),
+            alloc: header.is_alloc(),
+            writable: header.is_writable(),
+            executable: header.is_executable(),
+            tls: header.is_tls(),
+            no_bits: header.is_no_bits(),
         }
     }
 
@@ -1059,7 +1224,7 @@ impl platform::Platform for MachO {
     fn is_zero_sized_section_content(
         section_id: crate::output_section_id::OutputSectionId,
     ) -> bool {
-        todo!()
+        false
     }
 
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails] {
@@ -1074,7 +1239,7 @@ impl platform::Platform for MachO {
     fn frame_data_base_address(
         memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> u64 {
-        todo!()
+        0
     }
 
     fn activate_dynamic<'data>(
@@ -1110,6 +1275,10 @@ impl platform::Platform for MachO {
     ) {
     }
 
+    fn file_thunk_config<'data>(file: &File<'data>) -> Option<crate::platform::ThunkConfig> {
+        <crate::macho_aarch64::MachOAArch64 as platform::Arch>::thunk_config()
+    }
+
     fn finalise_layout_dynamic<'data>(
         state: &mut crate::layout::DynamicLayoutState<'data, Self>,
         memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
@@ -1125,14 +1294,19 @@ impl platform::Platform for MachO {
             crate::layout::OutputRecordLayout,
         >,
     ) -> crate::error::Result<u32> {
-        todo!()
+        let index = ((memory_offsets.get(part_id::DYNSYM)
+            - section_layouts.get(output_section_id::DYNSYM).mem_offset)
+            / size_of::<SymtabEntry>() as u64)
+            .try_into()
+            .context("Too many Mach-O dynamic symbols")?;
+        memory_offsets.increment(part_id::DYNSYM, size_of::<SymtabEntry>() as u64);
+        Ok(index)
     }
 
     fn compute_object_addresses<'data>(
         object: &crate::layout::ObjectLayoutState<'data, Self>,
         memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
-        todo!()
     }
 
     fn layout_resources_ext<'data>(
@@ -1150,8 +1324,20 @@ impl platform::Platform for MachO {
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
         // TODO
+        let section_part_id =
+            state.section_part_id(section_index, &resources.symbol_db.section_part_ids);
         for rel in state.relocations(section_index)?.relocations {
-            process_relocation::<A>(state, common, rel, section, resources, queue, false, scope)?;
+            process_relocation::<A>(
+                state,
+                common,
+                rel,
+                section_part_id,
+                resources,
+                queue,
+                false,
+                ValueFlags::empty(),
+                scope,
+            )?;
         }
         Ok(())
     }
@@ -1160,7 +1346,11 @@ impl platform::Platform for MachO {
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         symbol_id: crate::symbol_db::SymbolId,
     ) -> crate::error::Result<crate::layout::DynamicSymbolDefinition<'data, Self>> {
-        todo!()
+        Ok(crate::layout::DynamicSymbolDefinition {
+            symbol_id,
+            name: symbol_db.symbol_name(symbol_id)?.bytes(),
+            format_specific: (),
+        })
     }
 
     fn update_segment_keep_list(
@@ -1183,6 +1373,18 @@ impl platform::Platform for MachO {
         output_kind: crate::output_kind::OutputKind,
         args: &Self::Args,
     ) {
+        // Mach-O symbol tables don't reserve symbol index 0, but wild reserves SymbolId 0 as the
+        // undefined symbol. Keep the prelude sentinel so real input symbols start after it.
+        symbols
+            .add_symbol(crate::parsing::InternalSymDefInfo::new(
+                crate::parsing::SymbolPlacement::Undefined,
+                b"",
+            ))
+            .hide();
+
+        symbols
+            .section_start(output_section_id::FILE_HEADER, "___dso_handle")
+            .hide();
     }
 
     fn built_in_section_infos<'data>()
@@ -1192,6 +1394,8 @@ impl platform::Platform for MachO {
             .map(|d| SectionOutputInfo {
                 section_attributes: SectionAttributes {
                     flags: d.section_flags,
+                    no_bits: section_flags_are_no_bits(d.section_flags),
+                    ..Default::default()
                 },
                 kind: d.kind,
                 min_alignment: d.min_alignment,
@@ -1216,12 +1420,65 @@ impl platform::Platform for MachO {
     fn load_exception_frame_data<'data, 'scope, A: platform::Arch<Platform = Self>>(
         object: &mut crate::layout::ObjectLayoutState<'data, Self>,
         common: &mut crate::layout::CommonGroupState<'data, Self>,
-        eh_frame_section_index: object::SectionIndex,
+        compact_unwind_section_index: object::SectionIndex,
         resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
         queue: &mut crate::layout::LocalWorkQueue,
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        todo!()
+        let section = object.object.section(compact_unwind_section_index)?;
+        let name = object.object.section_name(section)?;
+        if name != b"__compact_unwind" {
+            return Ok(());
+        }
+
+        let data = object.object.raw_section_data(section)?;
+        ensure!(
+            data.len() % MACHO_COMPACT_UNWIND_ENTRY_SIZE == 0,
+            "__compact_unwind size must be a multiple of {MACHO_COMPACT_UNWIND_ENTRY_SIZE}"
+        );
+        common.allocate(
+            part_id::MACHO_UNWIND_INFO,
+            macho_unwind_info_allocation_size(data.len() / MACHO_COMPACT_UNWIND_ENTRY_SIZE),
+        );
+
+        for rel in object
+            .relocations(compact_unwind_section_index)?
+            .relocations
+        {
+            let rel_info = rel.info(LE);
+            if rel_info.r_type == macho::ARM64_RELOC_ADDEND {
+                continue;
+            }
+
+            let offset = rel_info.r_address as usize;
+            ensure!(
+                offset < data.len(),
+                "Mach-O __compact_unwind relocation at invalid offset {offset:#x}"
+            );
+            let field_offset = offset % MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+            ensure!(
+                matches!(field_offset, 0 | 16 | 24),
+                "Unsupported Mach-O __compact_unwind relocation field offset {field_offset:#x}"
+            );
+
+            let extra_flags = if rel_info.r_extern && field_offset == 16 {
+                ValueFlags::GOT
+            } else {
+                ValueFlags::empty()
+            };
+            process_relocation::<A>(
+                object,
+                common,
+                rel,
+                part_id::MACHO_UNWIND_INFO,
+                resources,
+                queue,
+                true,
+                extra_flags,
+                scope,
+            )?;
+        }
+        Ok(())
     }
 
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1264,6 +1521,12 @@ impl platform::Platform for MachO {
         properties: &Self::LayoutExt,
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) {
+        if symbol_db.output_kind.needs_dynsym() {
+            mem_sizes.increment(
+                part_id::DYNSYM,
+                dynamic_symbol_definitions.len() as u64 * size_of::<SymtabEntry>() as u64,
+            );
+        }
     }
 
     fn finalise_sizes_all<'data>(
@@ -1290,6 +1553,10 @@ impl platform::Platform for MachO {
         dynsym_start_index: u32,
         dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
     ) -> crate::error::Result {
+        memory_offsets.increment(
+            part_id::DYNSYM,
+            dynamic_symbol_defs.len() as u64 * size_of::<SymtabEntry>() as u64,
+        );
         Ok(())
     }
 
@@ -1307,11 +1574,49 @@ impl platform::Platform for MachO {
         true
     }
 
+    fn allow_duplicate_definition<'data>(
+        args: &Self::Args,
+        symbol_db: &SymbolDb<'data, Self>,
+        existing: SymbolId,
+        duplicate: SymbolId,
+    ) -> bool {
+        if !args.dead_strip {
+            return false;
+        }
+
+        if symbol_db.input_symbol_visibility(existing) != Visibility::Hidden
+            || symbol_db.input_symbol_visibility(duplicate) != Visibility::Hidden
+        {
+            return false;
+        }
+
+        let is_archive_entry = |symbol_id| {
+            let file_id = symbol_db.file_id_for_symbol(symbol_id);
+            match symbol_db.file(file_id) {
+                crate::grouping::SequencedInput::Object(obj) => {
+                    obj.parsed.input.has_archive_semantics()
+                }
+                _ => false,
+            }
+        };
+
+        is_archive_entry(existing) && is_archive_entry(duplicate)
+    }
+
+    fn has_data_in_file(section_attributes: Self::SectionAttributes) -> bool {
+        // Mach-O segments are page-mapped by the kernel. If a zero-fill output section has no
+        // backing file space, later file contents can be observed in the zero-fill virtual range
+        // when another segment starts at the same file offset.
+        !section_attributes.is_no_bits() || section_flags_are_no_bits(section_attributes.flags)
+    }
+
     fn allocate_header_sizes(
-        prelude: &mut crate::layout::PreludeLayoutState<Self>,
+        _prelude: &mut crate::layout::PreludeLayoutState<Self>,
         sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         header_info: &crate::layout::HeaderInfo,
         output_sections: &crate::output_section_id::OutputSections<Self>,
+        args: &Self::Args,
+        _output_kind: OutputKind,
     ) {
         sizes.increment(part_id::FILE_HEADER, size_of::<FileHeader>() as u64);
         sizes.increment(
@@ -1340,12 +1645,27 @@ impl platform::Platform for MachO {
             part_id::LINK_EDIT_SEGMENT,
             size_of::<SegmentCommand>() as u64,
         );
-        sizes.increment(part_id::ENTRY_POINT, size_of::<EntryPointCommand>() as u64);
         sizes.increment(
-            part_id::INTERP,
-            ((size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
-                .next_multiple_of(MACHO_COMMAND_ALIGNMENT)) as u64,
+            part_id::BUILD_VERSION,
+            size_of::<BuildVersionCommand>() as u64,
         );
+        sizes.increment(part_id::UUID_COMMAND, size_of::<UuidCommand>() as u64);
+        sizes.increment(part_id::LIBSYSTEM, load_dylib_commands_size(args) as u64);
+        if !args.is_dynamiclib {
+            sizes.increment(part_id::ENTRY_POINT, size_of::<EntryPointCommand>() as u64);
+            sizes.increment(
+                part_id::INTERP,
+                ((size_of::<DylinkerCommand>() + DYLINKER_PATH.len() + 1)
+                    .next_multiple_of(MACHO_COMMAND_ALIGNMENT)) as u64,
+            );
+        }
+        if args.is_dynamiclib {
+            sizes.increment(
+                part_id::ID_DYLIB,
+                ((size_of::<DylibCommand>() + DEFAULT_ID_DYLIB_PATH.len() + 1)
+                    .next_multiple_of(MACHO_COMMAND_ALIGNMENT)) as u64,
+            );
+        }
         sizes.increment(
             part_id::DYLD_CHAINED_FIXUPS,
             size_of::<DyldChainedFixupsCommand>() as u64,
@@ -1372,6 +1692,12 @@ impl platform::Platform for MachO {
         output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
+        if flags.needs_got() {
+            mem_sizes.increment(part_id::GOT, MACHO_GOT_ENTRY_SIZE);
+        }
+        if flags.needs_plt() {
+            mem_sizes.increment(part_id::PLT_GOT, MACHO_STUB_SIZE);
+        }
     }
 
     fn allocate_object_symtab_space<'data>(
@@ -1414,17 +1740,27 @@ impl platform::Platform for MachO {
         sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         symbol_db: &crate::symbol_db::SymbolDb<Self>,
     ) -> crate::error::Result {
-        todo!()
+        sizes.increment(part_id::SYMTAB_GLOBAL, size_of::<SymtabEntry>() as u64);
+        let symbol_name = symbol_db.symbol_name(symbol_id)?;
+        sizes.increment(part_id::STRTAB, symbol_name.bytes().len() as u64 + 1);
+
+        Ok(())
     }
 
     fn allocate_prelude(
         common: &mut crate::layout::CommonGroupState<Self>,
         symbol_db: &crate::symbol_db::SymbolDb<Self>,
     ) {
+        if symbol_db.output_kind.needs_dynsym() {
+            common.allocate(part_id::DYNSYM, size_of::<SymtabEntry>() as u64);
+        }
         // Allocate one extra character as n_strx == 0 is treated as unnamed.
         common.allocate(part_id::STRTAB, 1);
-        common.allocate(part_id::CHAINED_FIXUP_TABLE, CHAINED_FIXUP_TABLE_SIZE);
         common.allocate(part_id::CODE_SIGNATURE, CS_HEADERS_WITH_FILENAME_SIZE);
+        common.allocate(
+            part_id::CHAINED_FIXUP_TABLE,
+            chained_fixup_table_allocation_size(common, symbol_db),
+        );
     }
 
     fn finalise_prelude_layout<'data>(
@@ -1432,6 +1768,9 @@ impl platform::Platform for MachO {
         memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         resources: &crate::layout::FinaliseLayoutResources<'_, 'data, Self>,
     ) -> crate::error::Result<Self::PreludeLayoutExt> {
+        if resources.symbol_db.output_kind.needs_dynsym() {
+            MachO::take_dynsym_index(memory_offsets, resources.section_layouts)?;
+        }
         Ok(())
     }
 
@@ -1441,10 +1780,26 @@ impl platform::Platform for MachO {
         dynamic_symbol_index: Option<std::num::NonZeroU32>,
         memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> crate::layout::Resolution<Self> {
+        let got_address = flags.needs_got().then(|| {
+            let address = NonZeroU64::new(*memory_offsets.get(part_id::GOT))
+                .expect("Mach-O GOT address must never be zero");
+            memory_offsets.increment(part_id::GOT, MACHO_GOT_ENTRY_SIZE);
+            address
+        });
+        let stub_address = flags.needs_plt().then(|| {
+            let address = NonZeroU64::new(*memory_offsets.get(part_id::PLT_GOT))
+                .expect("Mach-O stub address must never be zero");
+            memory_offsets.increment(part_id::PLT_GOT, MACHO_STUB_SIZE);
+            address
+        });
         Resolution {
             raw_value,
             dynamic_symbol_index,
-            format_specific: (),
+            format_specific: ResolutionExt {
+                got_address,
+                stub_address,
+                is_import: flags.is_absolute() && got_address.is_some(),
+            },
             flags,
         }
     }
@@ -1481,16 +1836,37 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::DATA_SEGMENT);
         builder.add_section(output_section_id::LINK_EDIT_SEGMENT);
         builder.add_section(output_section_id::ENTRY_POINT);
+        builder.add_section(output_section_id::BUILD_VERSION);
+        builder.add_section(output_section_id::UUID_COMMAND);
+        builder.add_section(output_section_id::LIBSYSTEM);
+        builder.add_section(output_section_id::ID_DYLIB);
         builder.add_section(output_section_id::INTERP); // DYLINKER
         builder.add_section(output_section_id::DYLD_CHAINED_FIXUPS);
         builder.add_section(output_section_id::SYMTAB_COMMAND);
         builder.add_section(output_section_id::CODE_SIGNATURE_COMMAND);
         // Content of the sections (e.g. __text, __data).
+        builder.add_section(output_section_id::PLT_GOT);
+        builder.add_sections(&custom.exec);
         builder.add_section(output_section_id::TEXT);
+        builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
+        builder.add_section(output_section_id::MACHO_UNWIND_INFO);
+        builder.add_section(output_section_id::EH_FRAME);
+        builder.add_section(output_section_id::RODATA);
         builder.add_section(output_section_id::CSTRING);
+        builder.add_sections(&custom.ro);
+        builder.add_section(output_section_id::GOT);
+        builder.add_section(output_section_id::RUSTC_METADATA);
         builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::MACHO_THREAD_VARS);
+        builder.add_section(output_section_id::MACHO_THREAD_PTRS);
+        builder.add_section(output_section_id::TDATA);
+        builder.add_section(output_section_id::TBSS);
+        builder.add_section(output_section_id::BSS);
+        builder.add_sections(&custom.data);
+        builder.add_sections(&custom.bss);
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
+        builder.add_section(output_section_id::DYNSYM);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
         builder.add_section(output_section_id::STRTAB);
         builder.add_section(output_section_id::CODE_SIGNATURE);
@@ -1545,6 +1921,70 @@ impl platform::Platform for MachO {
     }
 }
 
+fn ad_hoc_codesign(path: &Path) -> Result {
+    #[cfg(target_os = "macos")]
+    {
+        timing_phase!("Ad-hoc code sign Mach-O output");
+
+        let output = std::process::Command::new("codesign")
+            .arg("-s")
+            .arg("-")
+            .arg("-f")
+            .arg(path)
+            .output()
+            .with_context(|| format!("Failed to run codesign for `{}`", path.display()))?;
+
+        ensure!(
+            output.status.success(),
+            "codesign failed for `{}`:\n{}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+fn section_flags_are_no_bits(flags: SectionFlags) -> bool {
+    matches!(
+        flags.raw() & macho::SECTION_TYPE,
+        macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
+    )
+}
+
+fn chained_fixup_table_allocation_size(
+    common: &crate::layout::CommonGroupState<MachO>,
+    symbol_db: &crate::symbol_db::SymbolDb<MachO>,
+) -> u64 {
+    let total_mem_size = common.total_mem_size().max(64 << 20);
+    let page_count = total_mem_size.div_ceil(MACHO_PAGE_SIZE).max(1);
+    let starts_in_image_size = (size_of::<u32>() * (DEFAULT_SEGMENT_COUNT + 1)) as u64;
+    let starts_in_segment_size = size_of::<u32>() as u64
+        + size_of::<u16>() as u64
+        + size_of::<u16>() as u64
+        + size_of::<u64>() as u64
+        + size_of::<u32>() as u64
+        + size_of::<u16>() as u64
+        + size_of::<u16>() as u64 * page_count;
+
+    let mut symbol_strings_size = 1;
+    for group in &symbol_db.groups {
+        for symbol_id in group.symbol_id_range() {
+            if let Ok(name) = symbol_db.symbol_name(symbol_id) {
+                symbol_strings_size += name.bytes().len() as u64 + 1;
+            }
+        }
+    }
+
+    (CHAINED_FIXUP_TABLE_HEADER_SIZE
+        + starts_in_image_size.next_multiple_of(8)
+        + starts_in_segment_size.next_multiple_of(8)
+        + symbol_db.num_symbols() as u64 * size_of::<u32>() as u64
+        + symbol_strings_size)
+        .next_multiple_of(8)
+}
+
 const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     let mut defs: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] =
         [DEFAULT_DEFS; NUM_BUILT_IN_SECTIONS];
@@ -1583,6 +2023,26 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         target_segment_type: Some(SegmentType::LoadCommands),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::BUILD_VERSION.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"LC_BUILD_VERSION")),
+        target_segment_type: Some(SegmentType::LoadCommands),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::UUID_COMMAND.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"LC_UUID")),
+        target_segment_type: Some(SegmentType::LoadCommands),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::LIBSYSTEM.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"LC_LOAD_DYLIB")),
+        target_segment_type: Some(SegmentType::LoadCommands),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::ID_DYLIB.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"LC_ID_DYLIB")),
+        target_segment_type: Some(SegmentType::LoadCommands),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::INTERP.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"LC_LOAD_DYLINKER")),
         target_segment_type: Some(SegmentType::LoadCommands),
@@ -1606,11 +2066,19 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::CHAINED_FIXUP_TABLE.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"DYLD_CHAINED_FIXUPS_TABLE")),
         target_segment_type: Some(SegmentType::LinkeditSections),
+        min_alignment: alignment::GOT_ENTRY,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::DYNSYM.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"DYNSYM")),
+        target_segment_type: Some(SegmentType::LinkeditSections),
+        min_alignment: alignment::SYMTAB_ENTRY,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::SYMTAB_GLOBAL.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"SYMTAB")),
         target_segment_type: Some(SegmentType::LinkeditSections),
+        min_alignment: alignment::SYMTAB_ENTRY,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::STRTAB.as_usize()] = BuiltInSectionDetails {
@@ -1635,14 +2103,90 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         ),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::PLT_GOT.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__stubs")),
+        section_flags: SectionFlags::from_u32(
+            macho::S_SYMBOL_STUBS
+                | macho::S_ATTR_PURE_INSTRUCTIONS
+                | macho::S_ATTR_SOME_INSTRUCTIONS,
+        ),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::GCC_EXCEPT_TABLE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__gcc_except_tab")),
+        section_flags: SectionFlags::from_u32(macho::S_REGULAR),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::MACHO_UNWIND_INFO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__unwind_info")),
+        section_flags: SectionFlags::from_u32(macho::S_REGULAR),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::EH_FRAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__eh_frame")),
+        section_flags: SectionFlags::from_u32(
+            macho::S_COALESCED
+                | macho::S_ATTR_NO_TOC
+                | macho::S_ATTR_STRIP_STATIC_SYMS
+                | macho::S_ATTR_LIVE_SUPPORT,
+        ),
+        min_alignment: Alignment { exponent: 3 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::RODATA.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__const")),
+        section_flags: SectionFlags::from_u32(macho::S_REGULAR),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::CSTRING.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__cstring")),
         section_flags: SectionFlags::from_u32(macho::S_CSTRING_LITERALS),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::RUSTC_METADATA.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b".rustc")),
+        section_flags: SectionFlags::from_u32(macho::S_REGULAR),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::DATA.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__data")),
         section_flags: SectionFlags::from_u32(macho::S_REGULAR),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::MACHO_THREAD_VARS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_vars")),
+        section_flags: SectionFlags::from_u32(macho::S_THREAD_LOCAL_VARIABLES),
+        min_alignment: alignment::GOT_ENTRY,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::MACHO_THREAD_PTRS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_ptrs")),
+        section_flags: SectionFlags::from_u32(macho::S_THREAD_LOCAL_VARIABLE_POINTERS),
+        min_alignment: alignment::GOT_ENTRY,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TDATA.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_data")),
+        section_flags: SectionFlags::from_u32(macho::S_THREAD_LOCAL_REGULAR),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TBSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_bss")),
+        section_flags: SectionFlags::from_u32(macho::S_THREAD_LOCAL_ZEROFILL),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::GOT.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__got")),
+        section_flags: SectionFlags::from_u32(macho::S_NON_LAZY_SYMBOL_POINTERS),
+        min_alignment: alignment::GOT_ENTRY,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::BSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__bss")),
+        section_flags: SectionFlags::from_u32(macho::S_ZEROFILL),
         ..DEFAULT_DEFS
     };
 
@@ -1652,8 +2196,28 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
+    SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::EH_FRAME),
+    SectionRule::exact_section_keep(
+        b"__gcc_except_tab",
+        crate::output_section_id::GCC_EXCEPT_TABLE,
+    ),
+    SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
+    SectionRule::exact_section_keep(b"__const", crate::output_section_id::RODATA),
     SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
+    SectionRule::exact_section_keep(b".rustc", crate::output_section_id::RUSTC_METADATA),
     SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
+    SectionRule::exact_section_keep(
+        b"__thread_vars",
+        crate::output_section_id::MACHO_THREAD_VARS,
+    ),
+    SectionRule::exact_section_keep(
+        b"__thread_ptrs",
+        crate::output_section_id::MACHO_THREAD_PTRS,
+    ),
+    SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
+    SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
+    SectionRule::exact_section_keep(b"__bss", crate::output_section_id::BSS),
+    SectionRule::exact_section_keep(b"__common", crate::output_section_id::BSS),
     // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
 ];
 
@@ -1694,7 +2258,8 @@ fn count_sections_for_segment_type(
     output_sections
         .ids_with_info()
         .filter(|(section_id, _)| {
-            output_sections.should_include_in_segment(*section_id, segment_def)
+            output_sections.will_emit_section(*section_id)
+                && output_sections.should_include_in_segment(*section_id, segment_def)
         })
         .count()
 }
@@ -1728,6 +2293,15 @@ pub(crate) fn get_segment_sections<'data>(
                 break;
             }
             OrderEvent::Section(section_id) if in_matching_segment => {
+                if matches!(
+                    segment_type,
+                    SegmentType::TextSections
+                        | SegmentType::DataSections
+                        | SegmentType::DataConstSections
+                ) && !layout.output_sections.will_emit_section(section_id)
+                {
+                    continue;
+                }
                 let sizes = *layout.section_layouts.get(section_id);
                 sections.push((
                     sizes,
@@ -1758,14 +2332,42 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
     object: &layout::ObjectLayoutState<'data, MachO>,
     common: &layout::CommonGroupState<'data, MachO>,
     rel: &Relocation,
-    section: layout::Section,
+    section_part_id: part_id::PartId,
     resources: &'scope layout::GraphResources<'data, '_, MachO>,
     queue: &mut layout::LocalWorkQueue,
     is_debug_section: bool,
+    extra_flags: ValueFlags,
     scope: &rayon::Scope<'scope>,
 ) -> Result {
     let rel_info = rel.info(LE);
-    // r_extern == true if the reference points to a symbol
+    if rel_info.r_type == object::macho::ARM64_RELOC_ADDEND {
+        return Ok(());
+    }
+    if rel_info.r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
+        if rel_info.r_extern {
+            let local_sym_index = SymbolIndex(rel_info.r_symbolnum as usize);
+            let sym = object.object.symbol(local_sym_index)?;
+            if let Some(section_index) = object.object.symbol_section(sym, local_sym_index)? {
+                queue.send_section_request::<A>(object.file_id, section_index, resources, scope);
+            }
+        } else if rel_info.r_symbolnum > 0 {
+            // Non-extern Mach-O relocations use a one-based section ordinal.
+            let section_index = rel_info.r_symbolnum as usize - 1;
+            ensure!(
+                section_index < object.sections.len(),
+                "Mach-O relocation references invalid section ordinal {} in {}",
+                rel_info.r_symbolnum,
+                object.input,
+            );
+            queue.send_section_request::<A>(
+                object.file_id,
+                object::SectionIndex(section_index),
+                resources,
+                scope,
+            );
+        }
+        return Ok(());
+    }
     if rel_info.r_extern {
         let local_sym_index = SymbolIndex(rel_info.r_symbolnum as usize);
         let symbol_db = resources.symbol_db;
@@ -1776,7 +2378,20 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let rel_offset = rel_info.r_address;
 
         let rel_info = A::relocation_from_raw(rel_info)?;
-        let mut flags_to_add = layout::resolution_flags(rel_info.kind);
+        let mut flags_to_add = layout::resolution_flags(rel_info.kind) | extra_flags;
+        if symbol_db.is_undefined(symbol_id) {
+            match rel.info(LE).r_type {
+                macho::ARM64_RELOC_BRANCH26 => {
+                    flags_to_add |= ValueFlags::PLT | ValueFlags::GOT;
+                }
+                macho::ARM64_RELOC_GOT_LOAD_PAGE21
+                | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                | macho::ARM64_RELOC_POINTER_TO_GOT => {
+                    flags_to_add |= ValueFlags::GOT;
+                }
+                _ => {}
+            }
+        }
 
         let atomic_flags = &resources.per_symbol_flags.get_atomic(symbol_id);
         let previous_flags = atomic_flags.fetch_or(flags_to_add);
@@ -1784,6 +2399,31 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         if !previous_flags.has_resolution() {
             queue.send_symbol_request::<A>(symbol_id, resources, scope);
         }
+
+        if !is_debug_section {
+            crate::thunks::handle_thunk_extensions_for_relocation::<A>(
+                section_part_id,
+                resources,
+                local_symbol_id,
+                symbol_id,
+                rel.info(LE),
+            );
+        }
+    } else if rel_info.r_symbolnum > 0 {
+        // Non-extern Mach-O relocations use a one-based section ordinal instead of a symbol index.
+        let section_index = rel_info.r_symbolnum as usize - 1;
+        ensure!(
+            section_index < object.sections.len(),
+            "Mach-O relocation references invalid section ordinal {} in {}",
+            rel_info.r_symbolnum,
+            object.input,
+        );
+        queue.send_section_request::<A>(
+            object.file_id,
+            object::SectionIndex(section_index),
+            resources,
+            scope,
+        );
     }
 
     Ok(())

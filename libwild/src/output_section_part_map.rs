@@ -244,8 +244,8 @@ fn test_merge_parts() {
         },
     );
 
-    // Subtract the Mach-O specific sections.
-    let num_regular_sections = output_sections.num_regular_sections() - 1;
+    // Subtract the regular sections that aren't part of the ELF test output order.
+    let num_regular_sections = output_sections.num_regular_sections() - 4;
     let mut num_sections_with_17 = 0;
     let sum_of_1s: OutputSectionMap<u32> = all_1.merge_parts(|_, values| values.iter().sum());
 
@@ -255,9 +255,17 @@ fn test_merge_parts() {
         output_section_id::TEXT_SEGMENT,
         output_section_id::DATA_SEGMENT,
         output_section_id::CSTRING,
+        output_section_id::MACHO_THREAD_VARS,
+        output_section_id::MACHO_THREAD_PTRS,
+        output_section_id::RUSTC_METADATA,
         output_section_id::ENTRY_POINT,
         output_section_id::LINK_EDIT_SEGMENT,
         output_section_id::ENTRY_POINT,
+        output_section_id::BUILD_VERSION,
+        output_section_id::UUID_COMMAND,
+        output_section_id::LIBSYSTEM,
+        output_section_id::ID_DYLIB,
+        output_section_id::MACHO_UNWIND_INFO,
         output_section_id::DYLD_CHAINED_FIXUPS,
         output_section_id::CHAINED_FIXUP_TABLE,
         output_section_id::SYMTAB_COMMAND,

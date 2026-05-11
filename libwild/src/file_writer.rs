@@ -194,6 +194,10 @@ impl Output {
         }
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn write<'data, 'layout, P: Platform>(
         &self,
         layout: &'layout Layout<'data, P>,

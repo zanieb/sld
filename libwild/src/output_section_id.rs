@@ -106,11 +106,17 @@ pub(crate) const DATA_SEGMENT: OutputSectionId = part_id::DATA_SEGMENT.output_se
 pub(crate) const LINK_EDIT_SEGMENT: OutputSectionId =
     part_id::LINK_EDIT_SEGMENT.output_section_id();
 pub(crate) const ENTRY_POINT: OutputSectionId = part_id::ENTRY_POINT.output_section_id();
+pub(crate) const BUILD_VERSION: OutputSectionId = part_id::BUILD_VERSION.output_section_id();
 pub(crate) const DYLD_CHAINED_FIXUPS: OutputSectionId =
     part_id::DYLD_CHAINED_FIXUPS.output_section_id();
 pub(crate) const CHAINED_FIXUP_TABLE: OutputSectionId =
     part_id::CHAINED_FIXUP_TABLE.output_section_id();
 pub(crate) const SYMTAB_COMMAND: OutputSectionId = part_id::SYMTAB_COMMAND.output_section_id();
+pub(crate) const UUID_COMMAND: OutputSectionId = part_id::UUID_COMMAND.output_section_id();
+pub(crate) const LIBSYSTEM: OutputSectionId = part_id::LIBSYSTEM.output_section_id();
+pub(crate) const ID_DYLIB: OutputSectionId = part_id::ID_DYLIB.output_section_id();
+pub(crate) const MACHO_UNWIND_INFO: OutputSectionId =
+    part_id::MACHO_UNWIND_INFO.output_section_id();
 pub(crate) const CODE_SIGNATURE_COMMAND: OutputSectionId =
     part_id::CODE_SIGNATURE_COMMAND.output_section_id();
 pub(crate) const CODE_SIGNATURE: OutputSectionId = part_id::CODE_SIGNATURE.output_section_id();
@@ -133,8 +139,11 @@ pub(crate) const NOTE_ABI_TAG: OutputSectionId = OutputSectionId::regular(13);
 pub(crate) const DATA_REL_RO: OutputSectionId = OutputSectionId::regular(14);
 // Mach-O specific sections
 pub(crate) const CSTRING: OutputSectionId = OutputSectionId::regular(15);
+pub(crate) const MACHO_THREAD_VARS: OutputSectionId = OutputSectionId::regular(16);
+pub(crate) const MACHO_THREAD_PTRS: OutputSectionId = OutputSectionId::regular(17);
+pub(crate) const RUSTC_METADATA: OutputSectionId = OutputSectionId::regular(18);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 16;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 19;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {
@@ -737,12 +746,8 @@ impl<'data, P: Platform> OutputSections<'data, P> {
     }
 
     pub(crate) fn has_data_in_file(&self, section_id: OutputSectionId) -> bool {
-        // Note, we treat TLS sections (e.g. .tbss) as having data in the file, even if they're
-        // NOBITS. This allows us to more easily place .tbss before other PROGBITS sections.
-        // Effectively .tbss is NOBITS, but we put zero padding of the same size in the file. GNU ld
-        // doesn't do this. It instead puts .tbss and the subsequent section at the same address.
         let attributes = self.output_info(section_id).section_attributes;
-        !attributes.is_no_bits() || attributes.is_tls()
+        P::has_data_in_file(attributes)
     }
 
     pub(crate) fn output_info(&self, id: OutputSectionId) -> &SectionOutputInfo<'data, P> {

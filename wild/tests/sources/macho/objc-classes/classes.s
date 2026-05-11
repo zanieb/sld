@@ -1,0 +1,9 @@
+.section __DATA,__data
+.p2align 3
+.quad _OBJC_CLASS_$_NSThread
+.quad _OBJC_CLASS_$_NSArray
+.quad _OBJC_CLASS_$_NSScreen
+.quad _NSPasteboardTypeHTML
+.quad "_objc_msgSend$initWithPrimary:fallback:"
+.quad __NSConcreteGlobalBlock
+.quad __NSConcreteStackBlock

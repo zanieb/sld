@@ -1315,6 +1315,7 @@ fn select_symbol<'data, P: Platform>(
             // are defined in COMDAT group sections.
             if (!symbol_db.is_in_comdat_group(existing, resolved)
                 || !symbol_db.is_in_comdat_group(id, resolved))
+                && !symbol_db.allow_duplicate_definition(existing, id)
                 && !symbol_db.db.args.allow_multiple_definitions()
             {
                 bail!(
@@ -2128,6 +2129,10 @@ impl<'data, 'db, P: Platform> AtomicSymbolDb<'data, 'db, P> {
         resolved: &[ResolvedGroup<'data, P>],
     ) -> bool {
         self.db.is_in_comdat_group(symbol_id, resolved)
+    }
+
+    fn allow_duplicate_definition(&self, existing: SymbolId, duplicate: SymbolId) -> bool {
+        P::allow_duplicate_definition(self.db.args, self.db, existing, duplicate)
     }
 
     fn symbol_name_for_display(&self, symbol_id: SymbolId) -> SymbolNameDisplay<'data> {

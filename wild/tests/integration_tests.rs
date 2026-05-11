@@ -70,6 +70,9 @@
 //! ExpectSectionBytes:{section_name}=0x{hex_bytes} Checks that the specified section contains
 //! exactly the given bytes.
 //!
+//! ExpectMachOBuildVersion:{platform} {min-os} {sdk} Checks that the output Mach-O contains an
+//! LC_BUILD_VERSION load command with the specified values.
+//!
 //! Mode:{mode} Set linking mode to static (default), dynamic or unspecified. Cannot be used
 //! together with LinkerDriver.
 //!
@@ -1266,6 +1269,7 @@ struct Assertions {
     expected_dynamic_entries: Vec<String>,
     absent_dynamic_entries: Vec<String>,
     expected_section_bytes: Vec<ExpectedSectionBytes>,
+    expected_macho_build_version: Option<ExpectedMachOBuildVersion>,
     output_file_matches: Vec<OutputFileMatch>,
     max_thunks: u64,
     expected_program_headers: Vec<ProgramHeaderType>,
@@ -1282,6 +1286,97 @@ struct ExpectedSectionBytes {
 struct ExpectedSymbolBytes {
     symbol_name: String,
     expected_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedMachOBuildVersion {
+    platform: u32,
+    platform_name: String,
+    minimum_os: u32,
+    minimum_os_name: String,
+    sdk: u32,
+    sdk_name: String,
+}
+
+impl ExpectedMachOBuildVersion {
+    fn parse(arg: &str) -> Result<Self> {
+        let mut fields = arg.split_whitespace();
+        let platform_name = fields
+            .next()
+            .context("ExpectMachOBuildVersion requires a platform")?;
+        let minimum_os_name = fields
+            .next()
+            .context("ExpectMachOBuildVersion requires a minimum OS version")?;
+        let sdk_name = fields
+            .next()
+            .context("ExpectMachOBuildVersion requires an SDK version")?;
+        ensure!(
+            fields.next().is_none(),
+            "ExpectMachOBuildVersion accepts exactly three fields: platform min-os sdk"
+        );
+
+        Ok(Self {
+            platform: parse_macho_platform(platform_name)?,
+            platform_name: platform_name.to_owned(),
+            minimum_os: parse_macho_version(minimum_os_name)?,
+            minimum_os_name: minimum_os_name.to_owned(),
+            sdk: parse_macho_version(sdk_name)?,
+            sdk_name: sdk_name.to_owned(),
+        })
+    }
+}
+
+fn parse_macho_platform(platform: &str) -> Result<u32> {
+    match platform {
+        "macos" => Ok(object::macho::PLATFORM_MACOS),
+        other => bail!("Unsupported Mach-O platform `{other}`"),
+    }
+}
+
+fn macho_platform_name(platform: u32) -> String {
+    match platform {
+        object::macho::PLATFORM_MACOS => "macos".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_macho_version(version: &str) -> Result<u32> {
+    let mut components = version.split('.');
+    let major = parse_macho_version_component(version, components.next(), u16::MAX.into())?;
+    let minor = parse_macho_version_component(version, components.next(), u8::MAX.into())?;
+    let patch = parse_macho_version_component(version, components.next(), u8::MAX.into())?;
+    ensure!(
+        components.next().is_none(),
+        "Mach-O version `{version}` has too many components"
+    );
+    Ok(encode_macho_version(major, minor, patch))
+}
+
+fn parse_macho_version_component(version: &str, component: Option<&str>, max: u32) -> Result<u32> {
+    let Some(component) = component else {
+        return Ok(0);
+    };
+    let value = component
+        .parse::<u32>()
+        .with_context(|| format!("Invalid Mach-O version `{version}`"))?;
+    ensure!(
+        value <= max,
+        "Mach-O version `{version}` component `{component}` is too large"
+    );
+    Ok(value)
+}
+
+fn encode_macho_version(major: u32, minor: u32, patch: u32) -> u32 {
+    (major << 16) | (minor << 8) | patch
+}
+
+fn macho_version_name(version: u32) -> String {
+    format!(
+        "{}.{}.{}",
+        version >> 16,
+        (version >> 8) & 0xff,
+        version & 0xff
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1674,6 +1769,10 @@ fn process_directive(
                     section_name,
                     expected_bytes,
                 });
+        }
+        "ExpectMachOBuildVersion" => {
+            config.assertions.expected_macho_build_version =
+                Some(ExpectedMachOBuildVersion::parse(arg.trim())?);
         }
         "ExpectDynamic" => config
             .assertions
@@ -3318,7 +3417,13 @@ impl Debug for SectionDiff {
 /// milliseconds, however when running lots of testing parallel there can be quite a bit of load on
 /// the system, which can mean that the test binaries take longer to start, so we need to be
 /// somewhat generous here to avoid flakes.
-const TEST_BINARY_TIMEOUT: Duration = std::time::Duration::from_millis(2000);
+fn test_binary_timeout() -> Duration {
+    if cfg!(target_os = "macos") {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_millis(2000)
+    }
+}
 const EXIT_SUCCESS: i32 = 42;
 
 impl Program<'_> {
@@ -3366,7 +3471,7 @@ impl Program<'_> {
                 let _ = recv.read_to_end(&mut output);
             });
 
-            match child.wait_timeout(TEST_BINARY_TIMEOUT)? {
+            match child.wait_timeout(test_binary_timeout())? {
                 Some(s) => Ok(s),
                 None => {
                     child.kill()?;
@@ -4871,7 +4976,8 @@ impl Assertions {
                 self.verify_symbols_absent(&self.no_dynsym, elf_obj.dynamic_symbols(), "dynsym")?;
                 self.verify_program_headers(&elf_obj)?;
             }
-            object::File::MachO64(_) => {
+            object::File::MachO64(macho_obj) => {
+                self.verify_macho_build_version(&macho_obj)?;
                 if !self.expected_comments.is_empty() {
                     bail!("ExpectComment is not supported for MachO",);
                 }
@@ -4900,6 +5006,43 @@ impl Assertions {
         if linker_used.is_wild() {
             self.verify_max_thunks(path)?;
         }
+        Ok(())
+    }
+
+    fn verify_macho_build_version<'data>(
+        &self,
+        obj: &object::read::macho::MachOFile64<'data>,
+    ) -> Result {
+        let Some(expected) = &self.expected_macho_build_version else {
+            return Ok(());
+        };
+
+        let build_version = obj
+            .build_version()?
+            .context("Expected LC_BUILD_VERSION, but it was not present")?;
+        let endian = obj.endian();
+        let platform = build_version.platform.get(endian);
+        let minimum_os = build_version.minos.get(endian);
+        let sdk = build_version.sdk.get(endian);
+
+        ensure!(
+            platform == expected.platform,
+            "Expected Mach-O platform {}, but got {}",
+            expected.platform_name,
+            macho_platform_name(platform),
+        );
+        ensure!(
+            minimum_os == expected.minimum_os,
+            "Expected Mach-O minimum OS {}, but got {}",
+            expected.minimum_os_name,
+            macho_version_name(minimum_os),
+        );
+        ensure!(
+            sdk == expected.sdk,
+            "Expected Mach-O SDK {}, but got {}",
+            expected.sdk_name,
+            macho_version_name(sdk),
+        );
         Ok(())
     }
 
