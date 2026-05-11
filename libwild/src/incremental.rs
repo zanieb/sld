@@ -373,23 +373,30 @@ fn patch_changed_inputs(
                 path.display()
             )
         })?;
-        let matched_sections = match match_patch_sections(state_dir, input, &bytes, &sections)? {
-            Some(matched_sections) => matched_sections,
-            None if sections
-                .iter()
-                .any(|section| section.section_name.is_none()) =>
-            {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "could not match anonymous patch sections in `{}`",
-                    path.display()
-                )));
-            }
-            None => sections
-                .iter()
-                .cloned()
-                .map(MatchedPatchSection::same)
-                .collect(),
-        };
+        let (matched_sections, matched_changed_sections) =
+            match match_patch_sections(state_dir, input, &bytes, &sections)? {
+                Some(matched_sections) => (
+                    matched_sections.sections,
+                    Some(matched_sections.changed_sections),
+                ),
+                None if sections
+                    .iter()
+                    .any(|section| section.section_name.is_none()) =>
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "could not match anonymous patch sections in `{}`",
+                        path.display()
+                    )));
+                }
+                None => (
+                    sections
+                        .iter()
+                        .cloned()
+                        .map(MatchedPatchSection::same)
+                        .collect(),
+                    None,
+                ),
+            };
         let current_sections = matched_sections
             .iter()
             .map(|section| section.current.clone())
@@ -407,8 +414,12 @@ fn patch_changed_inputs(
             )));
         }
 
-        let patch_sections = changed_patch_sections(state_dir, input, &bytes, &matched_sections)?
-            .unwrap_or_else(|| current_sections.clone());
+        let patch_sections = if let Some(changed_sections) = matched_changed_sections {
+            changed_sections
+        } else {
+            changed_patch_sections(state_dir, input, &bytes, &matched_sections)?
+                .unwrap_or_else(|| current_sections.clone())
+        };
         patched_section_count += patch_sections.len();
 
         input_files[*input_index].content = FileContentState::from_path_identity_only(path)
@@ -602,6 +613,11 @@ struct PatchSection {
 struct MatchedPatchSection {
     previous: PatchSection,
     current: PatchSection,
+}
+
+struct MatchedPatchSections {
+    sections: Vec<MatchedPatchSection>,
+    changed_sections: Vec<PatchSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1634,7 +1650,7 @@ fn match_patch_sections(
     previous_input: &FileState,
     current_bytes: &[u8],
     sections: &[PatchSection],
-) -> Result<Option<Vec<MatchedPatchSection>>> {
+) -> Result<Option<MatchedPatchSections>> {
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
         .content
@@ -1659,6 +1675,7 @@ fn match_patch_sections(
     }
 
     let mut matched_sections = vec![None; sections.len()];
+    let mut changed_sections = Vec::new();
     for (input_ref, sections) in sections_by_input {
         let Some(previous_input_bytes) =
             patch_input_bytes(&previous_bytes, previous_input.path.as_str(), input_ref)?
@@ -1696,16 +1713,34 @@ fn match_patch_sections(
             previous.section_index = previous_index.0 as u32;
             let mut current = section.clone();
             current.section_index = current_index.0 as u32;
+
+            let previous_section = previous_file
+                .section_by_index(previous_index)
+                .context("Missing previous incremental patch section")?;
+            let current_section = current_file
+                .section_by_index(current_index)
+                .context("Missing current incremental patch section")?;
+            let previous_data = previous_section
+                .data()
+                .context("Failed to read previous incremental patch section data")?;
+            let current_data = current_section
+                .data()
+                .context("Failed to read current incremental patch section data")?;
+            if previous_data != current_data {
+                changed_sections.push(current.clone());
+            }
+
             matched_sections[matched_index] = Some(MatchedPatchSection { previous, current });
         }
     }
 
-    Ok(Some(
-        matched_sections
+    Ok(Some(MatchedPatchSections {
+        sections: matched_sections
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("Missing matched incremental patch section")?,
-    ))
+        changed_sections,
+    }))
 }
 
 fn match_current_patch_section_index(
@@ -3337,6 +3372,62 @@ mod tests {
             .unwrap()
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn match_patch_sections_identifies_changed_section() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&current_exe) else {
+            return;
+        };
+        let Ok(object) = object::File::parse(&*bytes) else {
+            return;
+        };
+        let Some(section) = object.section_by_name(".data") else {
+            return;
+        };
+        let Some((offset, size)) = section.file_range() else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, &bytes).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            patch: None,
+        };
+        let input_ref = encode_path(&input);
+        let mut current = bytes.clone();
+        current[offset as usize] ^= 1;
+        let patch_section = PatchSection {
+            input: input_ref,
+            section_index: section.index().0 as u32,
+            section_name: section.name().ok().map(str::to_owned),
+            input_size: size,
+            output_offset: 64,
+            output_size: size,
+        };
+
+        let matched = match_patch_sections(&state_dir, &previous, &current, &[patch_section])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(matched.sections.len(), 1);
+        assert_eq!(matched.changed_sections.len(), 1);
+        assert_eq!(
+            matched.changed_sections[0].section_index,
+            section.index().0 as u32
         );
     }
 
