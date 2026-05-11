@@ -126,6 +126,7 @@ pub(crate) fn clear_ignored(expected: &mut OutputSectionPartMap<u64>) {
         part_id::BUILD_VERSION,
         part_id::UUID_COMMAND,
         part_id::LIBSYSTEM,
+        part_id::ID_DYLIB,
         part_id::MACHO_UNWIND_INFO,
         part_id::DYLD_CHAINED_FIXUPS,
         part_id::CHAINED_FIXUP_TABLE,
