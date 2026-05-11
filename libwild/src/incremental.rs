@@ -294,7 +294,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !rewritten_inputs.is_empty() {
-        previous.write_index(&state_dir)?;
+        previous.write_metadata_update(&state_dir)?;
         append_log(
             &state_dir,
             &format!(
@@ -497,7 +497,7 @@ fn patch_changed_inputs(
         sections: previous.sections.clone(),
         sections_file: previous.sections_file.clone(),
     }
-    .write_index(state_dir)?;
+    .write_metadata_update(state_dir)?;
 
     append_log(
         state_dir,
@@ -926,6 +926,14 @@ impl PersistedState {
     fn write(&self, state_dir: &Path) -> Result {
         self.write_sections(state_dir)?;
         self.write_index(state_dir)
+    }
+
+    fn write_metadata_update(&self, state_dir: &Path) -> Result {
+        if self.sections_file.is_some() {
+            self.write_index(state_dir)
+        } else {
+            self.write(state_dir)
+        }
     }
 
     fn write_index(&self, state_dir: &Path) -> Result {
@@ -3112,6 +3120,22 @@ mod tests {
         assert!(rendered.contains("\nsection\t0\t1\t100\t12\n"));
         assert!(rendered.contains("\nsection\t0\t2\t112\t8\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn metadata_update_writes_sections_for_inline_legacy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        assert!(state.sections_file.is_none());
+
+        state.write_metadata_update(dir.path()).unwrap();
+
+        assert!(dir.path().join(SECTIONS_FILE).exists());
+        assert_eq!(
+            PersistedState::read(dir.path()).unwrap().unwrap().sections,
+            state.sections
+        );
     }
 
     #[test]
