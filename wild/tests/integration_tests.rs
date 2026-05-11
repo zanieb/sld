@@ -2899,7 +2899,7 @@ impl ProgramInputs {
                 )
             })?;
             let link_output_added_full =
-                Linker::Wild.link(self.name(), &added_inputs, config, cross_arch)?;
+                Linker::Wild.link(self.name(), &added_inputs, &full_compare_config, cross_arch)?;
             let added_full_content =
                 std::fs::read(&link_output_added_full.binary).with_context(|| {
                     format!(
@@ -2972,8 +2972,12 @@ impl ProgramInputs {
                         link_output_removed.binary.display()
                     )
                 })?;
-            let link_output_removed_full =
-                Linker::Wild.link(self.name(), &removed_inputs, config, cross_arch)?;
+            let link_output_removed_full = Linker::Wild.link(
+                self.name(),
+                &removed_inputs,
+                &full_compare_config,
+                cross_arch,
+            )?;
             let removed_full_content = std::fs::read(&link_output_removed_full.binary)
                 .with_context(|| {
                     format!(
@@ -3029,8 +3033,12 @@ impl ProgramInputs {
                         link_output_reordered.binary.display()
                     )
                 })?;
-            let link_output_reordered_full =
-                Linker::Wild.link(self.name(), &reordered_inputs, config, cross_arch)?;
+            let link_output_reordered_full = Linker::Wild.link(
+                self.name(),
+                &reordered_inputs,
+                &full_compare_config,
+                cross_arch,
+            )?;
             let reordered_full_content = std::fs::read(&link_output_reordered_full.binary)
                 .with_context(|| {
                     format!(
