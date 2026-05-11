@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::platform;
 use crate::save_dir::SaveDir;
 use jobserver::Client;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -44,6 +45,20 @@ impl Default for MachOArgs {
             relocation_model: RelocationModel::NonRelocatable,
             output: Arc::from(Path::new("a.out")),
         }
+    }
+}
+
+struct MachOIncrementalLinkOptions<'a>(&'a MachOArgs);
+
+impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args = self.0;
+        let common = args.common.incremental_link_options();
+        f.debug_struct("MachOArgs")
+            .field("common", &common)
+            .field("output", &args.output)
+            .field("relocation_model", &args.relocation_model)
+            .finish()
     }
 }
 
@@ -83,6 +98,10 @@ impl platform::Args for MachOArgs {
 
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs {
         &mut self.common
+    }
+
+    fn incremental_link_options(&self) -> String {
+        format!("{:?}", MachOIncrementalLinkOptions(self))
     }
 
     fn should_export_all_dynamic_symbols(&self) -> bool {

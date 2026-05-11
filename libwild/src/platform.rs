@@ -1201,6 +1201,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs;
 
+    fn incremental_link_options(&self) -> String {
+        format!("{self:?}")
+    }
+
     fn sysroot(&self) -> Option<&Path> {
         None
     }

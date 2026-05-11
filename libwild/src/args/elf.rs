@@ -33,6 +33,7 @@ use object::elf::GNU_PROPERTY_X86_ISA_1_V2;
 use object::elf::GNU_PROPERTY_X86_ISA_1_V3;
 use object::elf::GNU_PROPERTY_X86_ISA_1_V4;
 use std::ffi::CString;
+use std::fmt;
 use std::num::NonZero;
 use std::num::NonZeroU32;
 use std::num::NonZeroU64;
@@ -1871,6 +1872,93 @@ fn add_default_flags(parser: &mut ArgumentParser<ElfArgs>) {
     }
 }
 
+struct ElfIncrementalLinkOptions<'a>(&'a ElfArgs);
+
+impl fmt::Debug for ElfIncrementalLinkOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args = self.0;
+        let common = args.common.incremental_link_options();
+        f.debug_struct("ElfArgs")
+            .field("common", &common)
+            .field("arch", &args.arch)
+            .field("lib_search_path", &args.lib_search_path)
+            .field("output", &args.output)
+            .field("dynamic_linker", &args.dynamic_linker)
+            .field("strip", &args.strip)
+            .field("merge_sections", &args.merge_sections)
+            .field("version_script_path", &args.version_script_path)
+            .field("debug_address", &args.debug_address)
+            .field("should_write_eh_frame_hdr", &args.should_write_eh_frame_hdr)
+            .field("wrap", &args.wrap)
+            .field("rpath", &args.rpath)
+            .field("soname", &args.soname)
+            .field("exclude_libs", &args.exclude_libs)
+            .field("gc_sections", &args.gc_sections)
+            .field("build_id", &args.build_id)
+            .field("no_undefined", &args.no_undefined)
+            .field("allow_shlib_undefined", &args.allow_shlib_undefined)
+            .field("needs_origin_handling", &args.needs_origin_handling)
+            .field("needs_nodelete_handling", &args.needs_nodelete_handling)
+            .field("copy_relocations", &args.copy_relocations)
+            .field("sysroot", &args.sysroot)
+            .field("undefined", &args.undefined)
+            .field("relro", &args.relro)
+            .field("entry", &args.entry)
+            .field(
+                "export_all_dynamic_symbols",
+                &args.export_all_dynamic_symbols,
+            )
+            .field("export_list", &args.export_list)
+            .field("export_list_path", &args.export_list_path)
+            .field("auxiliary", &args.auxiliary)
+            .field("enable_new_dtags", &args.enable_new_dtags)
+            .field("plugin_path", &args.plugin_path)
+            .field("plugin_args", &args.plugin_args)
+            .field("defsym", &args.defsym)
+            .field("section_start", &args.section_start)
+            .field("ttext", &args.ttext)
+            .field("tdata", &args.tdata)
+            .field("tbss", &args.tbss)
+            .field("write_gc_stats", &args.write_gc_stats)
+            .field("gc_stats_ignore", &args.gc_stats_ignore)
+            .field("verbose_gc_stats", &args.verbose_gc_stats)
+            .field("dependency_file", &args.dependency_file)
+            .field("execstack", &args.execstack)
+            .field("got_plt_syms", &args.got_plt_syms)
+            .field("b_symbolic", &args.b_symbolic)
+            .field("relax", &args.relax)
+            .field(
+                "should_write_linker_identity",
+                &args.should_write_linker_identity,
+            )
+            .field("hash_style", &args.hash_style)
+            .field("unresolved_symbols", &args.unresolved_symbols)
+            .field("error_unresolved_symbols", &args.error_unresolved_symbols)
+            .field(
+                "allow_multiple_definitions",
+                &args.allow_multiple_definitions,
+            )
+            .field("z_interpose", &args.z_interpose)
+            .field("z_isa", &args.z_isa)
+            .field("z_stack_size", &args.z_stack_size)
+            .field("z_pack_relative_relocs", &args.z_pack_relative_relocs)
+            .field("max_page_size", &args.max_page_size)
+            .field("trace", &args.trace)
+            .field("pack_dyn_relocs", &args.pack_dyn_relocs)
+            .field("use_android_relr_tags", &args.use_android_relr_tags)
+            .field("relocation_model", &args.relocation_model)
+            .field("should_output_executable", &args.should_output_executable)
+            .field(
+                "should_output_partial_object",
+                &args.should_output_partial_object,
+            )
+            .field("rpath_set", &args.rpath_set)
+            .field("experimental_sframe", &args.experimental_sframe)
+            .field("debug_compression_kind", &args.debug_compression_kind)
+            .finish()
+    }
+}
+
 impl platform::Args for ElfArgs {
     fn parse<S, I>(&mut self, input: I) -> Result
     where
@@ -1898,6 +1986,10 @@ impl platform::Args for ElfArgs {
 
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs {
         &mut self.common
+    }
+
+    fn incremental_link_options(&self) -> String {
+        format!("{:?}", ElfIncrementalLinkOptions(self))
     }
 
     fn output(&self) -> &Arc<Path> {
@@ -2358,6 +2450,32 @@ mod tests {
         args.parse(inline_options.iter())
             .expect("Recursive @file options should parse correctly but be ignored");
         input1_assertions(&args);
+    }
+
+    #[test]
+    fn incremental_link_options_exclude_input_list() {
+        let mut first = ElfArgs::new().unwrap();
+        first
+            .parse(["wild", "--incremental", "a.o"].into_iter())
+            .unwrap();
+        let mut second = ElfArgs::new().unwrap();
+        second
+            .parse(["wild", "--incremental", "a.o", "b.o"].into_iter())
+            .unwrap();
+        let mut changed_option = ElfArgs::new().unwrap();
+        changed_option
+            .parse(["wild", "--incremental", "--no-string-merge", "a.o"].into_iter())
+            .unwrap();
+
+        assert_ne!(format!("{first:?}"), format!("{second:?}"));
+        assert_eq!(
+            first.incremental_link_options(),
+            second.incremental_link_options()
+        );
+        assert_ne!(
+            first.incremental_link_options(),
+            changed_option.incremental_link_options()
+        );
     }
 
     #[test]
