@@ -200,7 +200,13 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
         let path = save_dir.join(relative_path);
         match mutation {
             Mutation::AppendZero(_) => append_zero(&path)?,
-            Mutation::ElfSectionByte { section, .. } => mutate_elf_section_byte(&path, section)?,
+            Mutation::ElfSection { section, grow, .. } => {
+                if *grow == 0 {
+                    mutate_elf_section_byte(&path, section)?;
+                } else {
+                    grow_elf_section(&path, section, *grow)?;
+                }
+            }
         }
     }
 
@@ -247,6 +253,193 @@ fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
     std::fs::write(path, bytes)
         .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
     Ok(())
+}
+
+fn grow_elf_section(path: &Path, section_name: &str, growth: u64) -> Result {
+    if growth == 0 {
+        bail!("ELF section growth mutation must grow by at least one byte");
+    }
+
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let (offset, size, limit, size_field) = {
+        let object = object::File::parse(&*bytes)
+            .with_context(|| format!("Failed to parse ELF mutation input `{}`", path.display()))?;
+        let section = object.section_by_name(section_name).with_context(|| {
+            format!(
+                "Mutation input `{}` does not contain section `{section_name}`",
+                path.display()
+            )
+        })?;
+        let (offset, size) = section.file_range().with_context(|| {
+            format!(
+                "Mutation section `{section_name}` in `{}` has no file range",
+                path.display()
+            )
+        })?;
+        let section_index = section.index().0;
+        let size_field = elf_section_size_field(&bytes, section_index).with_context(|| {
+            format!(
+                "Mutation section `{section_name}` in `{}` has no ELF size field",
+                path.display()
+            )
+        })?;
+        let limit = section_growth_limit(&object, section_index, offset, bytes.len());
+        (offset, size, limit, size_field)
+    };
+
+    let new_size = size
+        .checked_add(growth)
+        .context("ELF section growth mutation overflowed section size")?;
+    let new_end_offset = offset
+        .checked_add(new_size)
+        .context("ELF section growth mutation overflowed file offset")?;
+    if new_end_offset > limit {
+        bail!(
+            "Mutation section `{section_name}` in `{}` cannot grow by {growth} bytes without moving later object data",
+            path.display()
+        );
+    }
+
+    let start = usize::try_from(offset).context("ELF section offset is too large")?;
+    let old_end = start
+        .checked_add(usize::try_from(size).context("ELF section size is too large")?)
+        .context("ELF section end offset overflowed")?;
+    let new_end = start
+        .checked_add(usize::try_from(new_size).context("ELF section size is too large")?)
+        .context("ELF section end offset overflowed")?;
+    for (index, byte) in bytes[old_end..new_end].iter_mut().enumerate() {
+        *byte = 0x80_u8.wrapping_add(index as u8);
+    }
+    size_field.write(&mut bytes, new_size)?;
+
+    std::fs::write(path, bytes)
+        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ElfSizeField {
+    range: std::ops::Range<usize>,
+    width: usize,
+}
+
+impl ElfSizeField {
+    fn write(self, bytes: &mut [u8], value: u64) -> Result {
+        match self.width {
+            4 => {
+                let value = u32::try_from(value).context("ELF32 section size overflow")?;
+                bytes[self.range].copy_from_slice(&value.to_le_bytes());
+            }
+            8 => bytes[self.range].copy_from_slice(&value.to_le_bytes()),
+            _ => bail!("Unsupported ELF section size width {}", self.width),
+        }
+        Ok(())
+    }
+}
+
+fn section_growth_limit(
+    object: &object::File<'_>,
+    section_index: usize,
+    offset: u64,
+    file_len: usize,
+) -> u64 {
+    let mut limit = elf_section_table_offset(object).unwrap_or(file_len as u64);
+    for section in object.sections() {
+        if section.index().0 == section_index {
+            continue;
+        }
+        let Some((next_offset, _)) = section.file_range() else {
+            continue;
+        };
+        if next_offset > offset {
+            limit = limit.min(next_offset);
+        }
+    }
+    limit
+}
+
+fn elf_section_table_offset(object: &object::File<'_>) -> Option<u64> {
+    match object {
+        object::File::Elf32(file) => Some(u64::from(file.elf_header().e_shoff.get(file.endian()))),
+        object::File::Elf64(file) => Some(file.elf_header().e_shoff.get(file.endian())),
+        _ => None,
+    }
+}
+
+fn elf_section_size_field(bytes: &[u8], section_index: usize) -> Option<ElfSizeField> {
+    if bytes.len() < 0x34 || bytes.get(0..4)? != b"\x7fELF" || *bytes.get(5)? != 1 {
+        return None;
+    }
+
+    match *bytes.get(4)? {
+        1 => {
+            let section_header_offset = read_u32_le(bytes.get(0x20..0x24)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x2e..0x30)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x30..0x32)?)? as usize;
+            elf_section_header_field(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x14,
+                4,
+            )
+        }
+        2 => {
+            if bytes.len() < 0x40 {
+                return None;
+            }
+            let section_header_offset = read_u64_le(bytes.get(0x28..0x30)?)? as usize;
+            let section_header_size = read_u16_le(bytes.get(0x3a..0x3c)?)? as usize;
+            let section_count = read_u16_le(bytes.get(0x3c..0x3e)?)? as usize;
+            elf_section_header_field(
+                bytes,
+                section_index,
+                section_header_offset,
+                section_header_size,
+                section_count,
+                0x20,
+                8,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn elf_section_header_field(
+    bytes: &[u8],
+    section_index: usize,
+    section_header_offset: usize,
+    section_header_size: usize,
+    section_count: usize,
+    field_offset: usize,
+    field_size: usize,
+) -> Option<ElfSizeField> {
+    if section_index >= section_count || section_header_size < field_offset + field_size {
+        return None;
+    }
+    let section_start =
+        section_header_offset.checked_add(section_index.checked_mul(section_header_size)?)?;
+    let field_start = section_start.checked_add(field_offset)?;
+    let field_end = field_start.checked_add(field_size)?;
+    (field_end <= bytes.len()).then_some(ElfSizeField {
+        range: field_start..field_end,
+        width: field_size,
+    })
+}
+
+fn read_u16_le(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u32_le(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u64_le(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn ensure_relative_path(path: &str) -> Result {
@@ -433,6 +626,7 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
 #[cfg(test)]
 mod tests {
     use super::ensure_relative_path;
+    use super::grow_elf_section;
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
     use super::output_path_for_bin;
@@ -443,6 +637,7 @@ mod tests {
     use crate::config::BenchConfig;
     use crate::config::Mutation;
     use object::Object as _;
+    use object::ObjectSection as _;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -499,6 +694,50 @@ mod tests {
     }
 
     #[test]
+    fn elf_section_growth_mutation_grows_section_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growable.o");
+        std::fs::write(&path, growable_data_elf()).unwrap();
+
+        grow_elf_section(&path, ".data", 1).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        let data = object.section_by_name(".data").unwrap().data().unwrap();
+        assert_eq!(data, &[1, 2, 3, 4, 0x80]);
+    }
+
+    #[test]
+    fn elf_section_growth_mutation_changes_configured_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let input = save_dir.join("changed.o");
+        std::fs::write(&input, growable_data_elf()).unwrap();
+        let bench = Benchmark {
+            name: "grow".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::ElfSection {
+                    path: "changed.o".to_owned(),
+                    section: ".data".to_owned(),
+                    grow: 1,
+                }],
+                ..BenchConfig::default()
+            },
+        };
+
+        mutate_inputs(&bench).unwrap();
+
+        let bytes = std::fs::read(&input).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[1, 2, 3, 4, 0x80]
+        );
+    }
+
+    #[test]
     fn benchmark_output_paths_are_isolated_by_linker() {
         let bin = Bin {
             index: 7,
@@ -531,5 +770,42 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn growable_data_elf() -> Vec<u8> {
+        let mut bytes = vec![0; 0x140];
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0x80_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&3_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        bytes[0x40..0x44].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[0x48..0x59].copy_from_slice(b"\0.data\0.shstrtab\0");
+
+        let data_header = 0x80 + 64;
+        bytes[data_header..data_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 4..data_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 8..data_header + 16].copy_from_slice(&3_u64.to_le_bytes());
+        bytes[data_header + 24..data_header + 32].copy_from_slice(&0x40_u64.to_le_bytes());
+        bytes[data_header + 32..data_header + 40].copy_from_slice(&4_u64.to_le_bytes());
+        bytes[data_header + 48..data_header + 56].copy_from_slice(&8_u64.to_le_bytes());
+
+        let shstrtab_header = 0x80 + 128;
+        bytes[shstrtab_header..shstrtab_header + 4].copy_from_slice(&7_u32.to_le_bytes());
+        bytes[shstrtab_header + 4..shstrtab_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0x48_u64.to_le_bytes());
+        bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&17_u64.to_le_bytes());
+        bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
     }
 }
