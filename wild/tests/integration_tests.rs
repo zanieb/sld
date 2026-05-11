@@ -1183,6 +1183,30 @@ impl Config {
         out
     }
 
+    fn full_link_config_equivalent_to_incremental(&self) -> Config {
+        let mut out = self.clone();
+        if self.platform == PlatformKind::Elf {
+            // ELF incremental mode currently disables section GC, so compare against a full Wild
+            // link with the same effective section reachability.
+            let no_gc_sections = match self.linker_driver {
+                LinkerDriver::Compiler(_) => "-Wl,--no-gc-sections",
+                LinkerDriver::Direct(_) => "--no-gc-sections",
+            };
+            let already_no_gc = out
+                .linker_args
+                .args
+                .iter()
+                .chain(out.wild_extra_linker_args.args.iter())
+                .any(|arg| arg == no_gc_sections);
+            if !already_no_gc {
+                out.wild_extra_linker_args
+                    .args
+                    .push(no_gc_sections.to_owned());
+            }
+        }
+        out
+    }
+
     fn can_use_wild_in_process(&self) -> bool {
         self.expect_stderr.is_empty() && self.expect_stdout.is_empty()
     }
@@ -2265,11 +2289,14 @@ impl ProgramInputs {
             }
         }
 
+        let full_compare_config = config.full_link_config_equivalent_to_incremental();
         let incremental_output = Linker::Wild.output_path(self.name(), &incremental_config);
-        let baseline_content = std::fs::read(&incremental_output).with_context(|| {
+        let baseline_output =
+            Linker::Wild.link(self.name(), inputs, &full_compare_config, cross_arch)?;
+        let baseline_content = std::fs::read(&baseline_output.binary).with_context(|| {
             format!(
                 "Failed to read full link output before incremental test: {}",
-                incremental_output.display()
+                baseline_output.binary.display()
             )
         })?;
         let _ = std::fs::remove_file(&incremental_output);
@@ -2650,7 +2677,8 @@ impl ProgramInputs {
             }
 
             if config.test_incremental_changed_compare_full {
-                let link_output_4 = Linker::Wild.link(self.name(), inputs, config, cross_arch)?;
+                let link_output_4 =
+                    Linker::Wild.link(self.name(), inputs, &full_compare_config, cross_arch)?;
                 let full_content = std::fs::read(&link_output_4.binary).with_context(|| {
                     format!(
                         "Failed to read full relink output: {}",
