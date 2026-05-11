@@ -2023,12 +2023,17 @@ impl ProgramInputs {
             );
         }
 
-        let rewritten_input = inputs.last().with_context(|| {
-            format!(
-                "Incremental rewritten-input test for {} needs at least one input",
-                self.name()
-            )
-        })?;
+        let rewritten_input = inputs
+            .iter()
+            .rev()
+            .find(|input| !input.path.extension().is_some_and(|ext| ext == "a"))
+            .or_else(|| inputs.last())
+            .with_context(|| {
+                format!(
+                    "Incremental rewritten-input test for {} needs at least one input",
+                    self.name()
+                )
+            })?;
         rewrite_file_with_same_contents(&rewritten_input.path)?;
         let link_output_rewritten =
             Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -2059,7 +2064,7 @@ impl ProgramInputs {
         if config.test_incremental_changed {
             let changed_input =
                 if let Some(expected_name) = config.test_incremental_changed_input.as_deref() {
-                    inputs
+                    let input_path = inputs
                         .iter()
                         .find(|input| {
                             input
@@ -2067,15 +2072,21 @@ impl ProgramInputs {
                                 .file_name()
                                 .is_some_and(|name| name == expected_name)
                         })
+                        .map(|input| input.path.clone())
+                        .or_else(|| {
+                            let path = config.build_dir().join(expected_name);
+                            path.exists().then_some(path)
+                        })
                         .with_context(|| {
                             format!(
                                 "Incremental changed-input test for {} could not find input `{}`",
                                 self.name(),
                                 expected_name
                             )
-                        })?
+                        })?;
+                    LinkerInput::new(input_path)
                 } else {
-                    inputs.last().with_context(|| {
+                    inputs.last().cloned().with_context(|| {
                         format!(
                             "Incremental changed-input test for {} needs at least one input",
                             self.name()
