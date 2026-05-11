@@ -1,7 +1,12 @@
 //#Config:incremental
+//#Object:incremental-value.c
 //#RunEnabled:false
 //#TestIncremental:true
+//#TestIncrementalChanged:true
+//#TestIncrementalChangedSection:__data
 
-int value(void) { return 42; }
+extern int value(void);
 
-int main(void) { return value(); }
+volatile int unchanged_value = 7;
+
+int main(void) { return value() + unchanged_value; }
