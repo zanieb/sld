@@ -124,7 +124,9 @@ expect_output_change = true
 
 The checked-in `benchmarks/incremental-linux.toml` file uses that automatic input discovery for
 `ruff`, `ty`, and `uv`, and leaves `bfd`, `lld`, and `mold` enabled so the same changed-input run can
-show Wild incremental speedup against the default linker and mold.
+show Wild incremental speedup against the default linker and mold. When `report --print-stats` sees
+paired full and incremental benchmarks, it also prints the incremental speedup over the full Wild
+link for the same project.
 
 `expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
 that seeds incremental state, it fails timed Wild runs whose incremental log doesn't contain the
