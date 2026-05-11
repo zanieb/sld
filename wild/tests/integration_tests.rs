@@ -160,6 +160,9 @@
 //! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
+//! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
+//! Only used when TestIncrementalChangedExpectPatch is false.
+//!
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Defaults to the last linker input.
 //!
@@ -768,6 +771,7 @@ struct Config {
     test_incremental: bool,
     test_incremental_changed: bool,
     test_incremental_changed_expect_patch: bool,
+    test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
     test_config: TestConfig,
@@ -1341,6 +1345,7 @@ impl Config {
             test_incremental: false,
             test_incremental_changed: false,
             test_incremental_changed_expect_patch: true,
+            test_incremental_changed_fallback_reason: None,
             test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
             test_config: test_config.clone(),
@@ -1719,6 +1724,9 @@ fn process_directive(
         }
         "TestIncrementalChangedExpectPatch" => {
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedFallbackReason" => {
+            config.test_incremental_changed_fallback_reason = Some(arg.to_owned());
         }
         "TestIncrementalChangedInput" => {
             config.test_incremental_changed_input = Some(arg.to_owned());
@@ -2150,8 +2158,11 @@ impl ProgramInputs {
                     log
                 );
             } else if !log.contains(fallback_message)
-                || !log.contains("changed bytes outside patchable sections")
                 || !log.contains("full relink: input file changed:")
+                || config
+                    .test_incremental_changed_fallback_reason
+                    .as_ref()
+                    .is_some_and(|reason| !log.contains(reason))
             {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not record the \

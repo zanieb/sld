@@ -1415,6 +1415,7 @@ fn section_allows_direct_patching<'data>(section: &impl object::ObjectSection<'d
             .name()
             .ok()
             .is_none_or(section_name_allows_direct_patching)
+        && section.relocations().next().is_none()
 }
 
 fn section_name_allows_direct_patching(name: &str) -> bool {
