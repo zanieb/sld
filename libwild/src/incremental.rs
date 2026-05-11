@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v25";
+const STATE_VERSION: &str = "wild-incremental-state-v26";
+const STATE_VERSION_V25: &str = "wild-incremental-state-v25";
 const STATE_VERSION_V24: &str = "wild-incremental-state-v24";
 const STATE_VERSION_V23: &str = "wild-incremental-state-v23";
 const STATE_VERSION_V22: &str = "wild-incremental-state-v22";
@@ -193,6 +194,7 @@ pub(crate) struct SectionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationRecord {
     target_symbol_id: u32,
+    written_value: Option<u64>,
     target_value: u64,
     target_name: Option<String>,
     target: Option<RelocationTargetRecord>,
@@ -476,19 +478,22 @@ enum ChangedInputPatchResult {
     Unsupported(String),
 }
 
-fn changed_relocation_target_reason(
-    relocations: &[RelocationRecord],
+fn relocation_target_patches_for_input(
+    relocations: &mut [RelocationRecord],
     input: &FileState,
     bytes: &[u8],
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<RelocationTargetPatches, String>> {
+    let mut input_ranges = Vec::new();
+    let mut output_patches = Vec::new();
+    let mut output_symbols = Vec::new();
     for relocation in relocations {
-        let Some(target) = &relocation.target else {
+        let Some(target) = relocation.target.as_mut() else {
             continue;
         };
         if target.input_file != input.path {
             continue;
         }
-        let Some(target_name) = &relocation.target_name else {
+        let Some(target_name) = relocation.target_name.as_deref() else {
             continue;
         };
         let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &target.input)?
@@ -497,27 +502,101 @@ fn changed_relocation_target_reason(
         };
         let file = object::File::parse(input_bytes.bytes)
             .context("Failed to parse changed relocation target input")?;
-        let Some((current_section, current_offset)) =
-            symbol_section_offset_by_name(&file, target_name)?
+        let Some(current) = symbol_position_by_name(
+            input_bytes.bytes,
+            input_bytes.file_offset,
+            &file,
+            target_name,
+        )?
         else {
             continue;
         };
-        if current_section.0 as u32 != target.section_index
-            || current_offset != target.section_offset
+        if let Some(value_range) = current.value_range {
+            input_ranges.push(value_range);
+        }
+        if current.section_index.0 as u32 == target.section_index
+            && current.section_offset == target.section_offset
         {
-            return Ok(Some(format!(
+            continue;
+        }
+        if current.section_index.0 as u32 != target.section_index {
+            return Ok(Err(format!(
                 "relocation target moved in {}",
                 display_hex_path(&input.path)
             )));
         }
+
+        let Some(written_value) = relocation.written_value else {
+            return Ok(Err(format!(
+                "missing written relocation value for target in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        if relocation.size != 8 {
+            return Ok(Err(format!(
+                "unsupported relocation target patch size in {}",
+                display_hex_path(&input.path)
+            )));
+        }
+
+        let delta = i128::from(current.section_offset) - i128::from(target.section_offset);
+        let Some(written_value) = add_signed_delta_u64(written_value, delta) else {
+            return Ok(Err(format!(
+                "relocation target patch overflowed in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(target_value) = add_signed_delta_u64(relocation.target_value, delta) else {
+            return Ok(Err(format!(
+                "relocation target value overflowed in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        output_patches.push(SectionPatch {
+            output_offset: relocation.output_offset,
+            size: relocation.size,
+            data: written_value.to_le_bytes().to_vec(),
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        relocation.written_value = Some(written_value);
+        relocation.target_value = target_value;
+        target.section_offset = current.section_offset;
+        output_symbols.push(RelocationTargetSymbolPatch {
+            target_name: target_name.to_owned(),
+            target_value,
+        });
     }
-    Ok(None)
+    dedup_ranges(&mut input_ranges);
+    Ok(Ok(RelocationTargetPatches {
+        input_ranges,
+        output_patches,
+        output_symbols,
+    }))
 }
 
-fn symbol_section_offset_by_name(
+fn dedup_ranges(ranges: &mut Vec<std::ops::Range<usize>>) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup_by(|left, right| left.start == right.start && left.end == right.end);
+}
+
+fn add_signed_delta_u64(value: u64, delta: i128) -> Option<u64> {
+    let adjusted = i128::from(value).checked_add(delta)?;
+    u64::try_from(adjusted).ok()
+}
+
+struct SymbolPosition {
+    section_index: object::SectionIndex,
+    section_offset: u64,
+    value_range: Option<std::ops::Range<usize>>,
+}
+
+fn symbol_position_by_name(
+    bytes: &[u8],
+    file_offset: usize,
     file: &object::File<'_>,
     encoded_name: &str,
-) -> Result<Option<(object::SectionIndex, u64)>> {
+) -> Result<Option<SymbolPosition>> {
     let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
     for symbol in file.symbols() {
         if symbol.name_bytes()? != name {
@@ -526,9 +605,77 @@ fn symbol_section_offset_by_name(
         let Some(section_index) = symbol.section_index() else {
             return Ok(None);
         };
-        return Ok(Some((section_index, symbol.address())));
+        let value_range = elf_symbol_value_field_range(bytes, symbol.index())
+            .map(|range| file_offset + range.start..file_offset + range.end);
+        return Ok(Some(SymbolPosition {
+            section_index,
+            section_offset: symbol.address(),
+            value_range,
+        }));
     }
     Ok(None)
+}
+
+fn output_symbol_value_patches(
+    output: &[u8],
+    symbols: &[RelocationTargetSymbolPatch],
+) -> Result<std::result::Result<Vec<SectionPatch>, String>> {
+    if symbols.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+
+    let file = object::File::parse(output)
+        .context("Failed to parse output for incremental symbol value patching")?;
+    let mut values_by_name = HashMap::<&str, u64>::new();
+    for symbol in symbols {
+        if let Some(previous) =
+            values_by_name.insert(symbol.target_name.as_str(), symbol.target_value)
+            && previous != symbol.target_value
+        {
+            return Ok(Err(
+                "conflicting incremental symbol value patches".to_owned()
+            ));
+        }
+    }
+
+    let mut patches = Vec::with_capacity(values_by_name.len());
+    for (target_name, target_value) in values_by_name {
+        let Some(symbol) = symbol_position_by_name(output, 0, &file, target_name)? else {
+            return Ok(Err(
+                "missing output symbol for incremental value patch".to_owned()
+            ));
+        };
+        let Some(value_range) = symbol.value_range else {
+            return Ok(Err(
+                "missing output symbol value range for incremental patch".to_owned(),
+            ));
+        };
+        let data = match value_range.len() {
+            4 => {
+                let Ok(value) = u32::try_from(target_value) else {
+                    return Ok(Err(
+                        "incremental output symbol value patch overflowed".to_owned()
+                    ));
+                };
+                value.to_le_bytes().to_vec()
+            }
+            8 => target_value.to_le_bytes().to_vec(),
+            _ => {
+                return Ok(Err(
+                    "unsupported output symbol value size for incremental patch".to_owned(),
+                ));
+            }
+        };
+        patches.push(SectionPatch {
+            output_offset: value_range.start as u64,
+            size: value_range.len() as u64,
+            data,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+
+    Ok(Ok(patches))
 }
 
 fn patch_changed_inputs(
@@ -541,6 +688,7 @@ fn patch_changed_inputs(
 
     let mut previous = previous;
     let mut patches = Vec::new();
+    let mut output_symbol_patches = Vec::new();
     let mut eh_frame_hdr_deltas = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut patched_section_count = 0;
@@ -581,11 +729,15 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             }
-            if let Some(reason) =
-                changed_relocation_target_reason(&previous.relocations, input, &bytes)?
-            {
-                return Ok(ChangedInputPatchResult::Unsupported(reason));
-            }
+            let relocation_target_patches = match relocation_target_patches_for_input(
+                &mut previous.relocations,
+                input,
+                &bytes,
+            )? {
+                Ok(patches) => patches,
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            };
+            output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
 
             let matched_patch_sections = if let Some(matched) =
                 match_patch_sections_from_current_hashes(
@@ -668,6 +820,7 @@ fn patch_changed_inputs(
                 dynamic_relocation_patches
                     .iter()
                     .map(|patch| patch.input_range.clone())
+                    .chain(relocation_target_patches.input_ranges.iter().cloned())
                     .chain(
                         eh_frame_patches
                             .iter()
@@ -747,6 +900,7 @@ fn patch_changed_inputs(
                             .into_iter()
                             .map(|relocation| relocation.patch),
                     )
+                    .chain(relocation_target_patches.output_patches)
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_deltas,
@@ -809,6 +963,10 @@ fn patch_changed_inputs(
             args.output().display()
         )
     })?;
+    match output_symbol_value_patches(&output, &output_symbol_patches)? {
+        Ok(symbol_patches) => patches.extend(symbol_patches),
+        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+    }
     match eh_frame_hdr_patches_for_fde_deltas(&output, &eh_frame_hdr_deltas)? {
         Ok(header_patches) => patches.extend(header_patches),
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -1024,6 +1182,18 @@ struct ResolvedSectionPatch {
 struct DynamicRelocationPatch {
     input_range: std::ops::Range<usize>,
     patch: SectionPatch,
+}
+
+struct RelocationTargetPatches {
+    input_ranges: Vec<std::ops::Range<usize>>,
+    output_patches: Vec<SectionPatch>,
+    output_symbols: Vec<RelocationTargetSymbolPatch>,
+}
+
+#[derive(Clone)]
+struct RelocationTargetSymbolPatch {
+    target_name: String,
+    target_value: u64,
 }
 
 struct FdeRelocationPatch {
@@ -1391,6 +1561,7 @@ impl PreparedState {
         size: u64,
         kind: u32,
         addend: i64,
+        written_value: u64,
         target_value: u64,
         target_name: Option<String>,
         target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
@@ -1410,6 +1581,7 @@ impl PreparedState {
                 size,
                 kind,
                 addend,
+                written_value,
                 target_value,
                 target_name,
                 target,
@@ -1494,6 +1666,7 @@ impl PreparedState {
             &mut input_files,
             file_loader,
             &sections,
+            &relocations,
             &fdes,
             &dynamic_relocations,
             &mut output_bytes,
@@ -1719,6 +1892,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V25
             && version != STATE_VERSION_V24
             && version != STATE_VERSION_V23
             && version != STATE_VERSION_V22
@@ -1812,6 +1986,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V25
             || version == STATE_VERSION_V24
             || version == STATE_VERSION_V23
             || version == STATE_VERSION_V22
@@ -2106,7 +2281,7 @@ impl PersistedState {
                     ));
             writeln!(
                 &mut out,
-                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
                 relocation.target_symbol_id,
@@ -2115,6 +2290,10 @@ impl PersistedState {
                 relocation.size,
                 relocation.kind,
                 relocation.addend,
+                relocation
+                    .written_value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| ABSENT_FIELD.to_owned()),
                 relocation.target_value,
                 relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
                 target_input_file,
@@ -2245,12 +2424,14 @@ impl RelocationRecord {
         size: u64,
         kind: u32,
         addend: i64,
+        written_value: u64,
         target_value: u64,
         target_name: Option<String>,
         target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
     ) -> Self {
         Self {
             target_symbol_id,
+            written_value: Some(written_value),
             target_value,
             target_name,
             target: target.map(|(input, section_index, section_offset)| {
@@ -2541,6 +2722,7 @@ fn record_patch_fingerprints<F>(
     input_files: &mut [FileState],
     file_loader: &FileLoader<'_>,
     sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
     fdes: &[FdeRecord],
     dynamic_relocations: &[DynamicRelocationRecord],
     output: &mut LazyOutputBytes<F>,
@@ -2564,6 +2746,16 @@ where
             .push(relocation);
     }
 
+    let mut relocation_targets_by_file = HashMap::<&str, Vec<&RelocationRecord>>::new();
+    for relocation in relocations {
+        if let Some(target) = &relocation.target {
+            relocation_targets_by_file
+                .entry(target.input_file.as_str())
+                .or_default()
+                .push(relocation);
+        }
+    }
+
     let mut fdes_by_file = HashMap::<&str, Vec<&FdeRecord>>::new();
     for fde in fdes {
         fdes_by_file
@@ -2573,6 +2765,7 @@ where
     }
 
     if sections_by_file.is_empty()
+        && relocation_targets_by_file.is_empty()
         && dynamic_relocations_by_file.is_empty()
         && fdes_by_file.is_empty()
     {
@@ -2591,6 +2784,7 @@ where
             continue;
         };
         let input_dynamic_relocations = dynamic_relocations_by_file.get(input.path.as_str());
+        let input_relocation_targets = relocation_targets_by_file.get(input.path.as_str());
         let input_fdes = fdes_by_file.get(input.path.as_str());
         if input_dynamic_relocations.is_none()
             && input_fdes.is_none()
@@ -2618,6 +2812,13 @@ where
                 .into_iter()
                 .flat_map(|relocations| relocations.iter().copied()),
         )?;
+        let relocation_target_ranges = relocation_target_ranges_for_input(
+            input_file.data(),
+            input.path.as_str(),
+            input_relocation_targets
+                .into_iter()
+                .flat_map(|relocations| relocations.iter().copied()),
+        )?;
         let fde_relocation_ranges = fde_patch_input_ranges_for_input(
             input_file.data(),
             input.path.as_str(),
@@ -2632,6 +2833,7 @@ where
             dynamic_relocation_patches
                 .iter()
                 .map(|patch| patch.input_range.clone())
+                .chain(relocation_target_ranges.into_iter())
                 .chain(fde_relocation_ranges.into_iter()),
         )?
         .map(|fingerprint| FilePatchState {
@@ -3512,6 +3714,56 @@ fn dynamic_relocation_patches_for_input<'a>(
     Ok(patches)
 }
 
+fn relocation_target_ranges_for_input<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a RelocationRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut records_by_input = HashMap::<&str, Vec<&RelocationRecord>>::new();
+    for record in records {
+        let Some(target) = &record.target else {
+            continue;
+        };
+        records_by_input
+            .entry(target.input.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    for (input_ref, records) in records_by_input {
+        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+            continue;
+        };
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse incremental relocation target input")?;
+        let mut seen_names = HashSet::new();
+        for record in records {
+            let Some(target_name) = record.target_name.as_deref() else {
+                continue;
+            };
+            if !seen_names.insert(target_name) {
+                continue;
+            }
+            let Some(symbol) = symbol_position_by_name(
+                input_bytes.bytes,
+                input_bytes.file_offset,
+                &file,
+                target_name,
+            )?
+            else {
+                continue;
+            };
+            if let Some(value_range) = symbol.value_range {
+                ranges.push(value_range);
+            }
+        }
+    }
+
+    dedup_ranges(&mut ranges);
+    Ok(ranges)
+}
+
 fn dynamic_relocation_patches_for_input_bytes(
     bytes: &[u8],
     file_offset: usize,
@@ -4131,6 +4383,40 @@ fn elf_section_headers(bytes: &[u8]) -> Option<Vec<ElfSectionHeader>> {
         sections.push(section);
     }
     Some(sections)
+}
+
+fn elf_symbol_value_field_range(
+    bytes: &[u8],
+    symbol_index: object::SymbolIndex,
+) -> Option<std::ops::Range<usize>> {
+    if bytes.len() < 0x34 || bytes.get(0..4)? != b"\x7fELF" || *bytes.get(5)? != 1 {
+        return None;
+    }
+
+    let (entry_size, value_offset, value_size) = match *bytes.get(4)? {
+        1 => (16usize, 4usize, 4usize),
+        2 => (24usize, 8usize, 8usize),
+        _ => return None,
+    };
+    let symbol_offset = symbol_index.0.checked_mul(entry_size)?;
+    let symbol_end = symbol_offset.checked_add(entry_size)?;
+    for section in elf_section_headers(bytes)? {
+        if section.sh_type != u64::from(object::elf::SHT_SYMTAB)
+            || section.sh_entsize != entry_size as u64
+            || symbol_end > usize::try_from(section.sh_size).ok()?
+        {
+            continue;
+        }
+        let section_start = usize::try_from(section.sh_offset).ok()?;
+        let field_start = section_start
+            .checked_add(symbol_offset)?
+            .checked_add(value_offset)?;
+        let field_end = field_start.checked_add(value_size)?;
+        if field_end <= bytes.len() {
+            return Some(field_start..field_end);
+        }
+    }
+    None
 }
 
 fn patch_ranges(
@@ -5149,14 +5435,14 @@ fn parse_compact_relocation_line(
         .context("Malformed incremental relocation addend")?
         .parse()
         .context("Invalid incremental relocation addend")?;
-    let (target_value, target_name, target) = match parts.len() {
-        8 => (0, None, None),
+    let (written_value, target_value, target_name, target) = match parts.len() {
+        8 => (None, 0, None, None),
         10 => {
             let target_value = parts[8]
                 .parse()
                 .context("Invalid incremental relocation target value")?;
             let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
-            (target_value, target_name, None)
+            (None, target_value, target_name, None)
         }
         14 => {
             let target_value = parts[8]
@@ -5181,7 +5467,39 @@ fn parse_compact_relocation_line(
                         .context("Invalid incremental relocation target section offset")?,
                 })
             };
-            (target_value, target_name, target)
+            (None, target_value, target_name, target)
+        }
+        15 => {
+            let written_value = (parts[8] != ABSENT_FIELD)
+                .then(|| {
+                    parts[8]
+                        .parse()
+                        .context("Invalid incremental written relocation value")
+                })
+                .transpose()?;
+            let target_value = parts[9]
+                .parse()
+                .context("Invalid incremental relocation target value")?;
+            let target_name = (parts[10] != ABSENT_FIELD).then(|| parts[10].to_owned());
+            let target = if parts[11] == ABSENT_FIELD
+                && parts[12] == ABSENT_FIELD
+                && parts[13] == ABSENT_FIELD
+                && parts[14] == ABSENT_FIELD
+            {
+                None
+            } else {
+                Some(RelocationTargetRecord {
+                    input_file: parts[11].to_owned(),
+                    input: parts[12].to_owned(),
+                    section_index: parts[13]
+                        .parse()
+                        .context("Invalid incremental relocation target section index")?,
+                    section_offset: parts[14]
+                        .parse()
+                        .context("Invalid incremental relocation target section offset")?,
+                })
+            };
+            (written_value, target_value, target_name, target)
         }
         _ => return Err(crate::error!("Malformed incremental relocation record")),
     };
@@ -5190,6 +5508,7 @@ fn parse_compact_relocation_line(
         .context("Incremental relocation input index out of bounds")?;
     Ok(RelocationRecord {
         target_symbol_id,
+        written_value,
         target_value,
         target_name,
         target,
@@ -5841,6 +6160,7 @@ mod tests {
         input: &str,
         section_index: u32,
         target_symbol_id: u32,
+        written_value: Option<u64>,
         target_value: u64,
         target_name: Option<&str>,
         target: Option<(&str, u32, u64)>,
@@ -5852,6 +6172,7 @@ mod tests {
     ) -> RelocationRecord {
         RelocationRecord {
             target_symbol_id,
+            written_value,
             target_value,
             target_name: target_name.map(hex::encode),
             target: target.map(
@@ -5870,6 +6191,20 @@ mod tests {
             size,
             kind,
             addend,
+        }
+    }
+
+    fn drop_written_relocation_value_from_line(line: &str) -> String {
+        if let Some(rest) = line.strip_prefix("reloc\t") {
+            let fields = rest
+                .split('\t')
+                .enumerate()
+                .filter_map(|(index, field)| (index != 8).then_some(field))
+                .collect::<Vec<_>>()
+                .join("\t");
+            format!("reloc\t{fields}")
+        } else {
+            line.to_owned()
         }
     }
 
@@ -7656,6 +7991,7 @@ mod tests {
             "a.o",
             1,
             42,
+            Some(0x5678),
             0x1234,
             Some("target"),
             Some(("a.o", 2, 16)),
@@ -7670,9 +8006,56 @@ mod tests {
 
         assert!(rendered.contains("\nrelocs\t1\n"));
         assert!(rendered.contains(
-            "\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t4660\t746172676574\t612e6f\t612e6f\t2\t16\n"
+            "\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t22136\t4660\t746172676574\t612e6f\t612e6f\t2\t16\n"
         ));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v25_state_version_is_accepted_without_written_relocation_value() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            42,
+            Some(0x5678),
+            0x1234,
+            Some("target"),
+            Some(("a.o", 2, 16)),
+            8,
+            300,
+            8,
+            1,
+            -4,
+        ));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V25, 1)
+            .lines()
+            .map(drop_written_relocation_value_from_line)
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.relocations.len(), 1);
+        assert_eq!(parsed.relocations[0].written_value, None);
+        assert_eq!(parsed.relocations[0].target_value, 0x1234);
+        assert_eq!(
+            parsed.relocations[0].target_name,
+            Some(hex::encode("target"))
+        );
+        assert_eq!(
+            parsed.relocations[0].target,
+            Some(RelocationTargetRecord {
+                input_file: hex::encode("a.o"),
+                input: hex::encode("a.o"),
+                section_index: 2,
+                section_offset: 16,
+            })
+        );
     }
 
     #[test]
@@ -7682,6 +8065,7 @@ mod tests {
             "a.o",
             1,
             42,
+            Some(0x5678),
             0x1234,
             Some("target"),
             Some(("a.o", 2, 16)),
@@ -7697,7 +8081,12 @@ mod tests {
             .lines()
             .map(|line| {
                 if let Some(rest) = line.strip_prefix("reloc\t") {
-                    let fields = rest.split('\t').take(10).collect::<Vec<_>>().join("\t");
+                    let fields = rest
+                        .split('\t')
+                        .enumerate()
+                        .filter_map(|(index, field)| (index != 8 && index < 11).then_some(field))
+                        .collect::<Vec<_>>()
+                        .join("\t");
                     format!("reloc\t{fields}")
                 } else {
                     line.to_owned()
@@ -7711,6 +8100,7 @@ mod tests {
         let parsed = PersistedState::parse(&rendered).unwrap();
 
         assert_eq!(parsed.relocations.len(), 1);
+        assert_eq!(parsed.relocations[0].written_value, None);
         assert_eq!(parsed.relocations[0].target_value, 0x1234);
         assert_eq!(
             parsed.relocations[0].target_name,
@@ -7726,6 +8116,7 @@ mod tests {
             "a.o",
             1,
             42,
+            Some(0x5678),
             0x1234,
             Some("target"),
             Some(("a.o", 2, 16)),
@@ -7755,6 +8146,7 @@ mod tests {
         let parsed = PersistedState::parse(&rendered).unwrap();
 
         assert_eq!(parsed.relocations.len(), 1);
+        assert_eq!(parsed.relocations[0].written_value, None);
         assert_eq!(parsed.relocations[0].target_value, 0);
         assert_eq!(parsed.relocations[0].target_name, None);
     }
@@ -7913,6 +8305,7 @@ mod tests {
             &sections,
             &[],
             &[],
+            &[],
             &mut output,
         )
         .unwrap();
@@ -7951,6 +8344,7 @@ mod tests {
             &mut input_files,
             &file_loader,
             &sections,
+            &[],
             &[],
             &[],
             &mut output,
@@ -9289,6 +9683,7 @@ mod tests {
             4,
             2,
             -16,
+            0x5678,
             0x1234,
             Some(hex::encode("target")),
             Some((input, object::SectionIndex(7), 32)),
@@ -9301,6 +9696,7 @@ mod tests {
             280,
             0,
             2,
+            0,
             0,
             0x5678,
             None,
@@ -9318,6 +9714,7 @@ mod tests {
                 4,
                 2,
                 -16,
+                0x5678,
                 0x1234,
                 Some(hex::encode("target")),
                 Some((input, object::SectionIndex(7), 32))
