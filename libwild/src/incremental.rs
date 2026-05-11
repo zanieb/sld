@@ -450,6 +450,7 @@ fn patch_changed_inputs(
 
     let mut previous = previous;
     let mut patches = Vec::new();
+    let mut eh_frame_hdr_deltas = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut patched_section_count = 0;
     for (input_index, path) in changed_inputs {
@@ -475,7 +476,13 @@ fn patch_changed_inputs(
         };
         expected_changed_inputs.push(ExpectedInputContent::from_bytes(path, &bytes));
 
-        let (fingerprint, matched_sections, current_sections, resolved_patches) = {
+        let (
+            fingerprint,
+            matched_sections,
+            current_sections,
+            resolved_patches,
+            fde_eh_frame_hdr_deltas,
+        ) = {
             let input = &previous.input_files[*input_index];
             if !archive_members_match_snapshot(state_dir, input, &bytes)? {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
@@ -627,6 +634,10 @@ fn patch_changed_inputs(
                 .iter()
                 .filter(|patch| patch.patch.is_some())
                 .count();
+            let eh_frame_hdr_deltas = eh_frame_patches
+                .iter()
+                .filter_map(|patch| patch.eh_frame_hdr_delta.clone())
+                .collect::<Vec<_>>();
 
             (
                 fingerprint,
@@ -642,6 +653,7 @@ fn patch_changed_inputs(
                     )
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
+                eh_frame_hdr_deltas,
             )
         };
 
@@ -670,6 +682,7 @@ fn patch_changed_inputs(
                 .collect(),
         });
         patches.extend(resolved_patches);
+        eh_frame_hdr_deltas.extend(fde_eh_frame_hdr_deltas);
     }
 
     if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
@@ -700,6 +713,13 @@ fn patch_changed_inputs(
             args.output().display()
         )
     })?;
+    match eh_frame_hdr_patches_for_fde_deltas(&output, &eh_frame_hdr_deltas)? {
+        Ok(header_patches) => patches.extend(header_patches),
+        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+    }
+    if let Some(reason) = patch_output_range_rejection_reason(&patches) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
 
     let build_id_range = build_id_note_range(&output)?;
     if build_id_range.is_some() && !args.has_incremental_fast_build_id() {
@@ -912,6 +932,13 @@ struct DynamicRelocationPatch {
 struct FdeRelocationPatch {
     input_ranges: Vec<std::ops::Range<usize>>,
     patch: Option<SectionPatch>,
+    eh_frame_hdr_delta: Option<EhFrameHdrDelta>,
+}
+
+#[derive(Clone)]
+struct EhFrameHdrDelta {
+    fde_output_offset: u64,
+    frame_ptr_delta: i64,
 }
 
 const GENERATED_SECTION_INPUT_FILE: &str = "generated";
@@ -3423,15 +3450,18 @@ fn fde_relocation_patches_for_input_bytes(
 
         let mut input_ranges = Vec::new();
         let mut adjustments = Vec::new();
+        let mut eh_frame_hdr_delta = None;
         for (current, previous) in current_entries.iter().zip(&previous_entries) {
             if current.offset != previous.offset || current.info != previous.info {
                 input_ranges.clear();
                 adjustments.clear();
+                eh_frame_hdr_delta = None;
                 break;
             }
             let Some(field_size) = relocation_sizes.get(&current.offset).copied() else {
                 input_ranges.clear();
                 adjustments.clear();
+                eh_frame_hdr_delta = None;
                 break;
             };
             input_ranges.push(
@@ -3441,6 +3471,7 @@ fn fde_relocation_patches_for_input_bytes(
             let Some(addend_delta) = current.addend.checked_sub(previous.addend) else {
                 input_ranges.clear();
                 adjustments.clear();
+                eh_frame_hdr_delta = None;
                 break;
             };
             if addend_delta == 0 {
@@ -3454,7 +3485,14 @@ fn fde_relocation_patches_for_input_bytes(
             if field_end > record.size as usize {
                 input_ranges.clear();
                 adjustments.clear();
+                eh_frame_hdr_delta = None;
                 break;
+            }
+            if field_start == crate::elf::FDE_PC_BEGIN_OFFSET {
+                eh_frame_hdr_delta = Some(EhFrameHdrDelta {
+                    fde_output_offset: record.output_offset,
+                    frame_ptr_delta: addend_delta,
+                });
             }
             adjustments.push(PatchAdjustment {
                 range: field_start..field_end,
@@ -3470,9 +3508,144 @@ fn fde_relocation_patches_for_input_bytes(
                 preserve_ranges: vec![0..record.size as usize],
                 adjustments,
             }),
+            eh_frame_hdr_delta,
         });
     }
     Ok(patches)
+}
+
+fn eh_frame_hdr_patches_for_fde_deltas(
+    output: &[u8],
+    deltas: &[EhFrameHdrDelta],
+) -> Result<std::result::Result<Vec<SectionPatch>, String>> {
+    if deltas.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+
+    let file = object::File::parse(output)
+        .context("Failed to parse output for incremental .eh_frame_hdr patching")?;
+    let Some(eh_frame_hdr) = file.section_by_name(".eh_frame_hdr") else {
+        return Ok(Ok(Vec::new()));
+    };
+    let Some(eh_frame) = file.section_by_name(".eh_frame") else {
+        return Ok(Err(
+            "output has .eh_frame_hdr but no .eh_frame section".to_owned()
+        ));
+    };
+    let Some((eh_frame_offset, eh_frame_size)) = eh_frame.file_range() else {
+        return Ok(Err("output .eh_frame has no file range".to_owned()));
+    };
+    let Some((eh_frame_hdr_offset, eh_frame_hdr_size)) = eh_frame_hdr.file_range() else {
+        return Ok(Err("output .eh_frame_hdr has no file range".to_owned()));
+    };
+
+    let header_size = std::mem::size_of::<crate::elf::EhFrameHdr>();
+    let entry_size = std::mem::size_of::<crate::elf::EhFrameHdrEntry>();
+    let Ok(eh_frame_hdr_start) = usize::try_from(eh_frame_hdr_offset) else {
+        return Ok(Err("output .eh_frame_hdr offset is too large".to_owned()));
+    };
+    let Ok(eh_frame_hdr_size) = usize::try_from(eh_frame_hdr_size) else {
+        return Ok(Err("output .eh_frame_hdr size is too large".to_owned()));
+    };
+    if eh_frame_hdr_size < header_size || (eh_frame_hdr_size - header_size) % entry_size != 0 {
+        return Ok(Err("output .eh_frame_hdr has an invalid size".to_owned()));
+    }
+    let Some(eh_frame_hdr_end) = eh_frame_hdr_start.checked_add(eh_frame_hdr_size) else {
+        return Ok(Err("output .eh_frame_hdr range overflowed".to_owned()));
+    };
+    let Some(eh_frame_hdr_bytes) = output.get(eh_frame_hdr_start..eh_frame_hdr_end) else {
+        return Ok(Err("output .eh_frame_hdr range is out of bounds".to_owned()));
+    };
+
+    let mut entries = eh_frame_hdr_bytes[header_size..]
+        .chunks_exact(entry_size)
+        .map(|entry| {
+            let frame_ptr = read_i32_le(&entry[0..4])
+                .ok_or_else(|| "output .eh_frame_hdr entry is truncated".to_owned())?;
+            let frame_info_ptr = read_i32_le(&entry[4..8])
+                .ok_or_else(|| "output .eh_frame_hdr entry is truncated".to_owned())?;
+            Ok(EhFrameHdrEntryPatch {
+                frame_ptr,
+                frame_info_ptr,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+
+    let mut changed_indices = Vec::new();
+    for delta in deltas {
+        let Some(fde_offset_in_section) = delta.fde_output_offset.checked_sub(eh_frame_offset)
+        else {
+            return Ok(Err(
+                "incremental FDE output offset is outside .eh_frame".to_owned()
+            ));
+        };
+        if fde_offset_in_section >= eh_frame_size {
+            return Ok(Err(
+                "incremental FDE output offset is outside .eh_frame".to_owned()
+            ));
+        }
+        let Some(fde_address) = eh_frame.address().checked_add(fde_offset_in_section) else {
+            return Ok(Err("incremental FDE address overflowed".to_owned()));
+        };
+        let Ok(frame_info_ptr) =
+            i32::try_from(i128::from(fde_address) - i128::from(eh_frame_hdr.address()))
+        else {
+            return Ok(Err(
+                "incremental .eh_frame_hdr frame-info pointer overflowed".to_owned(),
+            ));
+        };
+        let mut matching_indices = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry.frame_info_ptr == frame_info_ptr).then_some(index));
+        let Some(index) = matching_indices.next() else {
+            return Ok(Err(
+                "could not find .eh_frame_hdr entry for changed FDE".to_owned()
+            ));
+        };
+        if matching_indices.next().is_some() {
+            return Ok(Err(
+                "found multiple .eh_frame_hdr entries for changed FDE".to_owned()
+            ));
+        }
+        let Some(adjusted) = i64::from(entries[index].frame_ptr)
+            .checked_add(delta.frame_ptr_delta)
+            .and_then(|value| i32::try_from(value).ok())
+        else {
+            return Ok(Err(
+                "changed .eh_frame_hdr frame pointer overflowed".to_owned()
+            ));
+        };
+        entries[index].frame_ptr = adjusted;
+        changed_indices.push(index);
+    }
+
+    if !entries
+        .windows(2)
+        .all(|window| window[0].frame_ptr <= window[1].frame_ptr)
+    {
+        return Ok(Err(
+            "changed .eh_frame_hdr entries would no longer be sorted".to_owned(),
+        ));
+    }
+
+    changed_indices.sort_unstable();
+    changed_indices.dedup();
+    Ok(Ok(changed_indices
+        .into_iter()
+        .map(|index| SectionPatch {
+            output_offset: (eh_frame_hdr_start + header_size + index * entry_size) as u64,
+            size: 4,
+            data: entries[index].frame_ptr.to_le_bytes().to_vec(),
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        })
+        .collect()))
+}
+
+struct EhFrameHdrEntryPatch {
+    frame_ptr: i32,
+    frame_info_ptr: i32,
 }
 
 fn eh_frame_relocation_sizes(
@@ -3811,6 +3984,10 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
 
 fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_i32_le(bytes: &[u8]) -> Option<i32> {
+    Some(i32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn read_i64_le(bytes: &[u8]) -> Option<i64> {
@@ -6234,6 +6411,66 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_hdr_patch_updates_matching_fde_entry() {
+        let output = eh_frame_hdr_output_elf(&[(-48, 0x50), (-16, 0x60)]);
+        let patches = eh_frame_hdr_patches_for_fde_deltas(
+            &output,
+            &[EhFrameHdrDelta {
+                fde_output_offset: 0x50,
+                frame_ptr_delta: 6,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].output_offset,
+            (0x80 + std::mem::size_of::<crate::elf::EhFrameHdr>()) as u64
+        );
+        assert_eq!(patches[0].size, 4);
+        assert_eq!(patches[0].data, (-42_i32).to_le_bytes());
+        assert!(patches[0].preserve_ranges.is_empty());
+        assert!(patches[0].adjustments.is_empty());
+    }
+
+    #[test]
+    fn eh_frame_hdr_patch_rejects_unsorted_result() {
+        let output = eh_frame_hdr_output_elf(&[(-48, 0x50), (-16, 0x60)]);
+        let result = eh_frame_hdr_patches_for_fde_deltas(
+            &output,
+            &[EhFrameHdrDelta {
+                fde_output_offset: 0x50,
+                frame_ptr_delta: 40,
+            }],
+        )
+        .unwrap();
+        let Err(error) = result else {
+            panic!("expected .eh_frame_hdr patch to be rejected");
+        };
+
+        assert!(error.contains("would no longer be sorted"));
+    }
+
+    #[test]
+    fn eh_frame_hdr_patch_rejects_missing_fde_entry() {
+        let output = eh_frame_hdr_output_elf(&[(-48, 0x50), (-16, 0x60)]);
+        let result = eh_frame_hdr_patches_for_fde_deltas(
+            &output,
+            &[EhFrameHdrDelta {
+                fde_output_offset: 0x70,
+                frame_ptr_delta: 6,
+            }],
+        )
+        .unwrap();
+        let Err(error) = result else {
+            panic!("expected .eh_frame_hdr patch to be rejected");
+        };
+
+        assert!(error.contains("could not find .eh_frame_hdr entry"));
+    }
+
+    #[test]
     fn resolve_current_patch_sections_updates_section_size_after_growth() {
         let mut bytes = growable_data_elf();
         bytes[0x44] = 5;
@@ -6342,6 +6579,106 @@ mod tests {
         bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0xa0_u64.to_le_bytes());
         bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&28_u64.to_le_bytes());
         bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
+    }
+
+    fn eh_frame_hdr_output_elf(entries: &[(i32, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0; 0x220];
+        let shstrtab = b"\0.eh_frame\0.eh_frame_hdr\0.shstrtab\0";
+        let shstrtab_offset = 0xd0;
+        let eh_frame_offset = 0x40_u64;
+        let eh_frame_size = 0x40_u64;
+        let eh_frame_address = 0x400040_u64;
+        let eh_frame_hdr_offset = 0x80_u64;
+        let eh_frame_hdr_address = 0x400080_u64;
+        let eh_frame_hdr_size = std::mem::size_of::<crate::elf::EhFrameHdr>() + entries.len() * 8;
+        bytes[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
+        bytes[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0x100_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&4_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&3_u16.to_le_bytes());
+
+        let entry_start =
+            eh_frame_hdr_offset as usize + std::mem::size_of::<crate::elf::EhFrameHdr>();
+        for (index, (frame_ptr, fde_output_offset)) in entries.iter().copied().enumerate() {
+            let offset = entry_start + index * 8;
+            let fde_offset_in_section = fde_output_offset - eh_frame_offset;
+            let frame_info_ptr = i32::try_from(
+                i128::from(eh_frame_address + fde_offset_in_section)
+                    - i128::from(eh_frame_hdr_address),
+            )
+            .unwrap();
+            bytes[offset..offset + 4].copy_from_slice(&frame_ptr.to_le_bytes());
+            bytes[offset + 4..offset + 8].copy_from_slice(&frame_info_ptr.to_le_bytes());
+        }
+
+        let name_offset = |name: &[u8]| -> u32 {
+            shstrtab
+                .windows(name.len())
+                .position(|window| window == name)
+                .unwrap() as u32
+        };
+        let write_section = |bytes: &mut [u8],
+                             index: usize,
+                             name: &[u8],
+                             ty: u32,
+                             flags: u64,
+                             address: u64,
+                             offset: u64,
+                             size: u64,
+                             align: u64| {
+            let header = 0x100 + index * 64;
+            bytes[header..header + 4].copy_from_slice(&name_offset(name).to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&ty.to_le_bytes());
+            bytes[header + 8..header + 16].copy_from_slice(&flags.to_le_bytes());
+            bytes[header + 16..header + 24].copy_from_slice(&address.to_le_bytes());
+            bytes[header + 24..header + 32].copy_from_slice(&offset.to_le_bytes());
+            bytes[header + 32..header + 40].copy_from_slice(&size.to_le_bytes());
+            bytes[header + 48..header + 56].copy_from_slice(&align.to_le_bytes());
+        };
+        write_section(
+            &mut bytes,
+            1,
+            b".eh_frame",
+            object::elf::SHT_PROGBITS,
+            u64::from(object::elf::SHF_ALLOC),
+            eh_frame_address,
+            eh_frame_offset,
+            eh_frame_size,
+            8,
+        );
+        write_section(
+            &mut bytes,
+            2,
+            b".eh_frame_hdr",
+            object::elf::SHT_PROGBITS,
+            u64::from(object::elf::SHF_ALLOC),
+            eh_frame_hdr_address,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_size as u64,
+            4,
+        );
+        write_section(
+            &mut bytes,
+            3,
+            b".shstrtab",
+            object::elf::SHT_STRTAB,
+            0,
+            0,
+            shstrtab_offset as u64,
+            shstrtab.len() as u64,
+            1,
+        );
 
         bytes
     }
