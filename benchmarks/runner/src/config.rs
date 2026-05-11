@@ -32,7 +32,7 @@ pub(crate) struct BenchConfig {
     /// Paths relative to the save-dir to mutate before each timed run.
     #[serde(default)]
     pub(crate) mutate_files: Vec<Mutation>,
-    /// Strings that must appear in Wild's incremental log after each Wild run.
+    /// Strings that must appear in Wild's incremental log after each timed Wild run.
     #[serde(default)]
     pub(crate) expect_wild_log: Vec<String>,
 }

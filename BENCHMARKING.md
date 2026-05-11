@@ -106,9 +106,9 @@ mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
 expect_wild_log = ["patched ", "changed input file before loading inputs"]
 ```
 
-`expect_wild_log` is optional, but useful when benchmarking incremental mode: it fails the benchmark
-if Wild's incremental log doesn't contain the expected fast-path message, so you don't accidentally
-measure a full fallback relink.
+`expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
+that seeds incremental state, it fails timed Wild runs whose incremental log doesn't contain the
+expected fast-path message, so you don't accidentally measure a full fallback relink.
 
 ### Run benchmark with hyperfine
 
