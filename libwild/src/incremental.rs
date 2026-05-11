@@ -722,6 +722,7 @@ fn patch_changed_inputs(
             current_sections,
             resolved_patches,
             fde_eh_frame_hdr_deltas,
+            removed_dynamic_relocations,
         ) = {
             let input = &previous.input_files[*input_index];
             if !archive_members_match_snapshot(state_dir, input, &bytes)? {
@@ -730,6 +731,16 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             }
+            let previous_snapshot = input_snapshot_path_for_encoded_path(state_dir, &input.path);
+            let previous_snapshot_bytes = if input
+                .content
+                .identity_matches_snapshot_path(&previous_snapshot)
+                .unwrap_or(false)
+            {
+                Some(std::fs::read(&previous_snapshot)?)
+            } else {
+                None
+            };
             let relocation_target_patches = match relocation_target_patches_for_input(
                 &mut previous.relocations,
                 input,
@@ -743,6 +754,7 @@ fn patch_changed_inputs(
                 &mut previous.relocations,
                 input,
                 &bytes,
+                previous_snapshot_bytes.as_deref(),
             )? {
                 Ok(patches) => patches,
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -798,16 +810,6 @@ fn patch_changed_inputs(
                     .iter()
                     .filter(|record| record.input_file == input.path),
             )?;
-            let previous_snapshot = input_snapshot_path_for_encoded_path(state_dir, &input.path);
-            let previous_snapshot_bytes = if input
-                .content
-                .identity_matches_snapshot_path(&previous_snapshot)
-                .unwrap_or(false)
-            {
-                Some(std::fs::read(&previous_snapshot)?)
-            } else {
-                None
-            };
             let eh_frame_patches = if let Some(previous_bytes) = previous_snapshot_bytes.as_deref()
             {
                 fde_relocation_patches_for_input(
@@ -828,7 +830,7 @@ fn patch_changed_inputs(
                 current_sections.iter().cloned(),
                 dynamic_relocation_patches
                     .iter()
-                    .map(|patch| patch.input_range.clone())
+                    .filter_map(|patch| patch.input_range.clone())
                     .chain(relocation_addend_patches.input_ranges.iter().cloned())
                     .chain(relocation_target_patches.input_ranges.iter().cloned())
                     .chain(
@@ -844,10 +846,30 @@ fn patch_changed_inputs(
                 )));
             };
             if fingerprint != previous_patch.fingerprint {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "changed bytes outside patchable sections in `{}`",
-                    path.display()
-                )));
+                let dynamic_relocation_removed = dynamic_relocation_patches
+                    .iter()
+                    .any(|patch| patch.input_range.is_none());
+                let allows_dynamic_relocation_removal = if dynamic_relocation_removed {
+                    if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                        object_diff_allows_dynamic_relocation_removal(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            &dynamic_relocation_patches,
+                        )?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !allows_dynamic_relocation_removal {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "changed bytes outside patchable sections in `{}`",
+                        path.display()
+                    )));
+                }
             }
 
             let patch_sections = if let Some(changed_sections) = matched_changed_sections {
@@ -859,7 +881,12 @@ fn patch_changed_inputs(
             patched_section_count += patch_sections.len();
 
             let Some(resolved_patches) =
-                resolved_patch_sections_for_input(&bytes, input.path.as_str(), patch_sections)?
+                resolved_patch_sections_for_input_with_dynamic_relocations(
+                    &bytes,
+                    input.path.as_str(),
+                    patch_sections,
+                    dynamic_relocation_patches.iter().map(|patch| &patch.record),
+                )?
             else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed patchable section size in `{}`",
@@ -877,6 +904,7 @@ fn patch_changed_inputs(
                         &bytes,
                         input.path.as_str(),
                         current_sections.iter().cloned(),
+                        dynamic_relocation_patches.iter().map(|patch| &patch.record),
                     )?
                     else {
                         return Ok(ChangedInputPatchResult::Unsupported(format!(
@@ -898,6 +926,10 @@ fn patch_changed_inputs(
                 .iter()
                 .filter_map(|patch| patch.eh_frame_hdr_delta.clone())
                 .collect::<Vec<_>>();
+            let removed_dynamic_relocations = dynamic_relocation_patches
+                .iter()
+                .filter_map(|patch| patch.input_range.is_none().then_some(patch.record.clone()))
+                .collect::<HashSet<_>>();
 
             (
                 fingerprint,
@@ -916,6 +948,7 @@ fn patch_changed_inputs(
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_deltas,
+                removed_dynamic_relocations,
             )
         };
 
@@ -925,6 +958,12 @@ fn patch_changed_inputs(
             &mut previous.sections,
         );
         if sections_changed {
+            previous.sections_file = None;
+        }
+        if !removed_dynamic_relocations.is_empty() {
+            previous
+                .dynamic_relocations
+                .retain(|record| !removed_dynamic_relocations.contains(record));
             previous.sections_file = None;
         }
         previous.input_files[*input_index].content = input_content;
@@ -1192,7 +1231,8 @@ struct ResolvedSectionPatch {
 }
 
 struct DynamicRelocationPatch {
-    input_range: std::ops::Range<usize>,
+    record: DynamicRelocationRecord,
+    input_range: Option<std::ops::Range<usize>>,
     patch: SectionPatch,
 }
 
@@ -2831,6 +2871,9 @@ where
             input.path.as_str(),
             output.get()?,
             sections,
+            input_dynamic_relocations
+                .into_iter()
+                .flat_map(|relocations| relocations.iter().copied()),
         )?;
         let dynamic_relocation_patches = dynamic_relocation_patches_for_input(
             input_file.data(),
@@ -2866,7 +2909,7 @@ where
             patch_sections.iter().cloned(),
             dynamic_relocation_patches
                 .iter()
-                .map(|patch| patch.input_range.clone())
+                .filter_map(|patch| patch.input_range.clone())
                 .chain(relocation_addend_ranges.into_iter())
                 .chain(relocation_target_ranges.into_iter())
                 .chain(fde_relocation_ranges.into_iter()),
@@ -2934,8 +2977,11 @@ fn direct_copy_patch_sections<'a>(
     input_file_path: &str,
     output: &[u8],
     sections: &[&'a SectionRecord],
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
 ) -> Result<Vec<PatchSection>> {
     let mut patch_sections = Vec::new();
+    let dynamic_relocation_offsets =
+        dynamic_relocation_offsets_by_input_section(dynamic_relocations);
 
     let mut sections_by_input = HashMap::<&str, Vec<&SectionRecord>>::new();
     for record in sections {
@@ -2958,7 +3004,10 @@ fn direct_copy_patch_sections<'a>(
             let data = section
                 .data()
                 .context("Failed to read incremental patch candidate section data")?;
-            let Some(preserve_ranges) = section_direct_patch_preserve_ranges(&section, data.len())
+            let dynamic_relocations =
+                dynamic_relocation_offsets.get(&(input_ref, record.section_index));
+            let Some(preserve_ranges) =
+                section_direct_patch_preserve_ranges(&section, data.len(), dynamic_relocations)
             else {
                 continue;
             };
@@ -2991,6 +3040,19 @@ fn direct_copy_patch_sections<'a>(
     Ok(patch_sections)
 }
 
+fn dynamic_relocation_offsets_by_input_section<'a>(
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+) -> HashMap<(&'a str, u32), HashSet<u64>> {
+    let mut offsets = HashMap::<(&str, u32), HashSet<u64>>::new();
+    for relocation in dynamic_relocations {
+        offsets
+            .entry((relocation.input.as_str(), relocation.section_index))
+            .or_default()
+            .insert(relocation.relocation_offset);
+    }
+    offsets
+}
+
 fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let object::SectionFlags::Elf { sh_flags } = flags else {
         return false;
@@ -3018,6 +3080,7 @@ pub(crate) fn section_name_allows_incremental_padding(name: &[u8]) -> bool {
 fn section_direct_patch_preserve_ranges<'data>(
     section: &impl object::ObjectSection<'data>,
     section_data_len: usize,
+    dynamic_relocation_offsets: Option<&HashSet<u64>>,
 ) -> Option<Vec<std::ops::Range<usize>>> {
     if !section_flags_allow_patching(section.flags())
         || !section
@@ -3028,23 +3091,28 @@ fn section_direct_patch_preserve_ranges<'data>(
         return None;
     }
 
-    relocation_preserve_ranges(section, section_data_len)
+    relocation_preserve_ranges(section, section_data_len, dynamic_relocation_offsets)
 }
 
 fn relocation_preserve_ranges<'data>(
     section: &impl object::ObjectSection<'data>,
     section_data_len: usize,
+    dynamic_relocation_offsets: Option<&HashSet<u64>>,
 ) -> Option<Vec<std::ops::Range<usize>>> {
     let mut ranges = Vec::<std::ops::Range<usize>>::new();
     for (offset, relocation) in section.relocations() {
         if relocation.kind() == object::RelocationKind::None {
             continue;
         }
-        if relocation.has_implicit_addend()
-            || relocation.kind() != object::RelocationKind::Absolute
-            || relocation.encoding() != object::RelocationEncoding::Generic
-            || relocation.size() == 0
-            || relocation.size() % 8 != 0
+        let is_recorded_dynamic_relocation =
+            dynamic_relocation_offsets.is_some_and(|offsets| offsets.contains(&offset));
+        let generic_explicit_relocation = !relocation.has_implicit_addend()
+            && relocation.encoding() == object::RelocationEncoding::Generic
+            && relocation.size() != 0
+            && relocation.size() % 8 == 0;
+        if !generic_explicit_relocation
+            || (!is_recorded_dynamic_relocation
+                && relocation.kind() != object::RelocationKind::Absolute)
         {
             return None;
         }
@@ -3287,6 +3355,7 @@ fn patch_fingerprint_with_extra_ranges(
         return Ok(None);
     };
     ranges.extend(extra_ranges);
+    dedup_ranges(&mut ranges);
     let Some(ranges) = normalize_patch_ranges(ranges, bytes.len()) else {
         return Ok(None);
     };
@@ -3331,8 +3400,12 @@ fn match_patch_sections_from_current_hashes(
         return Ok(None);
     }
 
-    let Some(current_sections) =
-        resolve_current_patch_sections(current_bytes, input_file_path, sections.iter().cloned())?
+    let Some(current_sections) = resolve_current_patch_sections(
+        current_bytes,
+        input_file_path,
+        sections.iter().cloned(),
+        std::iter::empty(),
+    )?
     else {
         return Ok(None);
     };
@@ -3640,27 +3713,49 @@ fn patch_sections_for_input(
     )
 }
 
-fn resolve_current_patch_sections(
+fn resolve_current_patch_sections<'a>(
     bytes: &[u8],
     input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
 ) -> Result<Option<Vec<PatchSection>>> {
-    Ok(
-        resolved_patch_sections_for_input(bytes, input_file_path, sections)?.map(|patches| {
-            patches
-                .into_iter()
-                .map(|resolved| resolved.section)
-                .collect()
-        }),
-    )
+    Ok(resolved_patch_sections_for_input_with_dynamic_relocations(
+        bytes,
+        input_file_path,
+        sections,
+        dynamic_relocations,
+    )?
+    .map(|patches| {
+        patches
+            .into_iter()
+            .map(|resolved| resolved.section)
+            .collect()
+    }))
 }
 
+#[cfg(test)]
 fn resolved_patch_sections_for_input(
     bytes: &[u8],
     input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
 ) -> Result<Option<Vec<ResolvedSectionPatch>>> {
+    resolved_patch_sections_for_input_with_dynamic_relocations(
+        bytes,
+        input_file_path,
+        sections,
+        std::iter::empty(),
+    )
+}
+
+fn resolved_patch_sections_for_input_with_dynamic_relocations<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+) -> Result<Option<Vec<ResolvedSectionPatch>>> {
     let sections = sections.into_iter().collect::<Vec<_>>();
+    let dynamic_relocation_offsets =
+        dynamic_relocation_offsets_by_input_section(dynamic_relocations);
     let mut patches = std::iter::repeat_with(|| None)
         .take(sections.len())
         .collect::<Vec<_>>();
@@ -3689,7 +3784,10 @@ fn resolved_patch_sections_for_input(
             let data = section
                 .data()
                 .context("Failed to read changed incremental input section data")?;
-            let Some(preserve_ranges) = section_direct_patch_preserve_ranges(&section, data.len())
+            let dynamic_relocations =
+                dynamic_relocation_offsets.get(&(input_ref, patch_section.section_index));
+            let Some(preserve_ranges) =
+                section_direct_patch_preserve_ranges(&section, data.len(), dynamic_relocations)
             else {
                 return Ok(None);
             };
@@ -3753,6 +3851,7 @@ fn relocation_addend_patches_for_input(
     relocations: &mut [RelocationRecord],
     input: &FileState,
     bytes: &[u8],
+    previous_bytes: Option<&[u8]>,
 ) -> Result<std::result::Result<RelocationAddendPatches, String>> {
     let mut input_ranges = Vec::new();
     let mut output_patches = Vec::new();
@@ -3770,10 +3869,19 @@ fn relocation_addend_patches_for_input(
         let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &input_ref)? else {
             continue;
         };
+        let previous_input_bytes = if let Some(previous_bytes) = previous_bytes {
+            patch_input_bytes(previous_bytes, input.path.as_str(), &input_ref)?
+        } else {
+            None
+        };
         let Some(section_headers) = elf_section_headers(input_bytes.bytes) else {
             continue;
         };
+        let previous_section_headers = previous_input_bytes
+            .as_ref()
+            .and_then(|input_bytes| elf_section_headers(input_bytes.bytes));
         let mut entries_by_section = HashMap::<u32, Vec<RelaPatchEntry>>::new();
+        let mut previous_entries_by_section = HashMap::<u32, Vec<RelaPatchEntry>>::new();
         for relocation_index in relocation_indices {
             let section_index = relocations[relocation_index].section_index;
             let relocation_offset = relocations[relocation_index].relocation_offset;
@@ -3793,6 +3901,28 @@ fn relocation_addend_patches_for_input(
             );
             let relocation = &mut relocations[relocation_index];
             if entry.addend == relocation.addend {
+                continue;
+            }
+            let raw_addend_unchanged = previous_input_bytes
+                .as_ref()
+                .zip(previous_section_headers.as_ref())
+                .is_some_and(|(previous_input_bytes, previous_section_headers)| {
+                    let previous_entries = previous_entries_by_section
+                        .entry(section_index)
+                        .or_insert_with(|| {
+                            rela_entries_for_section(
+                                previous_input_bytes.bytes,
+                                previous_section_headers,
+                                section_index,
+                            )
+                            .unwrap_or_default()
+                        });
+                    previous_entries
+                        .iter()
+                        .find(|previous_entry| previous_entry.offset == relocation_offset)
+                        .is_some_and(|previous_entry| previous_entry.addend == entry.addend)
+                });
+            if raw_addend_unchanged {
                 continue;
             }
             let Some(written_value) = relocation.written_value else {
@@ -3948,6 +4078,17 @@ fn dynamic_relocation_patches_for_input_bytes(
         }
         let Some(entry_range) = dynamic_relocation_entry_range(bytes, &section_headers, record)?
         else {
+            patches.push(DynamicRelocationPatch {
+                record: record.clone(),
+                input_range: None,
+                patch: SectionPatch {
+                    output_offset: record.output_offset,
+                    size: record.size,
+                    data: vec![0; record.size as usize],
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                },
+            });
             continue;
         };
         let addend_start = entry_range.start + 16;
@@ -3958,7 +4099,8 @@ fn dynamic_relocation_patches_for_input_bytes(
         let mut data = vec![0; record.size as usize];
         data[16..24].copy_from_slice(addend);
         patches.push(DynamicRelocationPatch {
-            input_range: file_offset + addend_start..file_offset + addend_end,
+            record: record.clone(),
+            input_range: Some(file_offset + addend_start..file_offset + addend_end),
             patch: SectionPatch {
                 output_offset: record.output_offset,
                 size: record.size,
@@ -3969,6 +4111,119 @@ fn dynamic_relocation_patches_for_input_bytes(
         });
     }
     Ok(patches)
+}
+
+fn object_diff_allows_dynamic_relocation_removal(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    dynamic_relocation_patches: &[DynamicRelocationPatch],
+) -> Result<bool> {
+    if dynamic_relocation_patches.is_empty()
+        || dynamic_relocation_patches
+            .iter()
+            .all(|patch| patch.input_range.is_some())
+        || dynamic_relocation_patches.iter().any(|patch| {
+            patch.record.input_file != input_file_path || patch.record.input != input_file_path
+        })
+        || matched_sections.iter().any(|section| {
+            section.previous.input != input_file_path || section.current.input != input_file_path
+        })
+    {
+        return Ok(false);
+    }
+
+    let Some(current_section_headers) = elf_section_headers(current_bytes) else {
+        return Ok(false);
+    };
+    let mut kept_offsets_by_section = HashMap::<u32, HashSet<u64>>::new();
+    let mut section_indices = HashSet::new();
+    for patch in dynamic_relocation_patches {
+        section_indices.insert(patch.record.section_index);
+        if patch.input_range.is_some() {
+            kept_offsets_by_section
+                .entry(patch.record.section_index)
+                .or_default()
+                .insert(patch.record.relocation_offset);
+        }
+    }
+    for section_index in section_indices {
+        let kept_offsets = kept_offsets_by_section
+            .get(&section_index)
+            .cloned()
+            .unwrap_or_default();
+        let current_entries =
+            rela_entries_for_section(current_bytes, &current_section_headers, section_index)
+                .unwrap_or_default();
+        if current_entries
+            .iter()
+            .any(|entry| !kept_offsets.contains(&entry.offset))
+        {
+            return Ok(false);
+        }
+    }
+
+    let previous_file = object::File::parse(previous_bytes)
+        .context("Failed to parse previous dynamic relocation removal input")?;
+    let current_file = object::File::parse(current_bytes)
+        .context("Failed to parse current dynamic relocation removal input")?;
+    let previous_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.previous.section_index as usize))
+        .collect::<HashSet<_>>();
+    let current_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.current.section_index as usize))
+        .collect::<HashSet<_>>();
+
+    let mut previous_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in previous_file.sections() {
+        if previous_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_dynamic_relocation_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read previous dynamic relocation removal section data")?;
+        previous_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    let mut current_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in current_file.sections() {
+        if current_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_dynamic_relocation_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read current dynamic relocation removal section data")?;
+        current_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    Ok(previous_sections_by_name == current_sections_by_name)
+}
+
+fn section_name_is_metadata_for_dynamic_relocation_removal(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with(".rela")
+        || name.starts_with(".rel")
+        || matches!(
+            name,
+            ".symtab" | ".strtab" | ".shstrtab" | ".comment" | ".note.GNU-stack" | ".llvm_addrsig"
+        )
 }
 
 fn fde_patch_input_ranges_for_input<'a>(
@@ -7132,6 +7387,31 @@ mod tests {
     }
 
     #[test]
+    fn patch_fingerprint_allows_duplicate_extra_ranges() {
+        let bytes = growable_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+
+        let fingerprint = patch_fingerprint_with_extra_ranges(
+            &bytes,
+            &input_ref,
+            [patch_section],
+            [0x40..0x44, 0x40..0x44],
+        )
+        .unwrap();
+
+        assert!(fingerprint.is_some());
+    }
+
+    #[test]
     fn patch_fingerprint_allows_dynamic_relocation_addend_changes() {
         let bytes = relocated_data_elf();
         let input_ref = encode_path(Path::new("input.o"));
@@ -7153,7 +7433,7 @@ mod tests {
             [patch_section.clone()],
             previous_patches
                 .iter()
-                .map(|patch| patch.input_range.clone()),
+                .filter_map(|patch| patch.input_range.clone()),
         )
         .unwrap()
         .unwrap();
@@ -7171,14 +7451,14 @@ mod tests {
                 [patch_section],
                 current_patches
                     .iter()
-                    .map(|patch| patch.input_range.clone()),
+                    .filter_map(|patch| patch.input_range.clone()),
             )
             .unwrap()
             .unwrap(),
             previous_fingerprint
         );
         assert_eq!(current_patches.len(), 1);
-        assert_eq!(current_patches[0].input_range, 0x90..0x98);
+        assert_eq!(current_patches[0].input_range, Some(0x90..0x98));
         assert_eq!(current_patches[0].patch.output_offset, 300);
         assert_eq!(current_patches[0].patch.size, 24);
         assert_eq!(current_patches[0].patch.preserve_ranges, vec![0..16]);
@@ -7210,7 +7490,7 @@ mod tests {
             [patch_section.clone()],
             previous_patches
                 .iter()
-                .map(|patch| patch.input_range.clone()),
+                .filter_map(|patch| patch.input_range.clone()),
         )
         .unwrap()
         .unwrap();
@@ -7228,12 +7508,30 @@ mod tests {
                 [patch_section],
                 current_patches
                     .iter()
-                    .map(|patch| patch.input_range.clone()),
+                    .filter_map(|patch| patch.input_range.clone()),
             )
             .unwrap()
             .unwrap(),
             previous_fingerprint
         );
+    }
+
+    #[test]
+    fn dynamic_relocation_patch_tombstones_missing_relocation_entry() {
+        let bytes = growable_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let relocation = dynamic_relocation_record("input.o", 1, 4, 300, 24);
+
+        let patches =
+            dynamic_relocation_patches_for_input(&bytes, &input_ref, [&relocation]).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].record, relocation);
+        assert_eq!(patches[0].input_range, None);
+        assert_eq!(patches[0].patch.output_offset, 300);
+        assert_eq!(patches[0].patch.size, 24);
+        assert_eq!(patches[0].patch.data, vec![0; 24]);
+        assert!(patches[0].patch.preserve_ranges.is_empty());
     }
 
     #[test]
@@ -7280,7 +7578,7 @@ mod tests {
         let input = state.input_files.remove(0);
         let mut relocations = vec![relocation];
         let patches =
-            relocation_addend_patches_for_input(&mut relocations, &input, &addend_changed)
+            relocation_addend_patches_for_input(&mut relocations, &input, &addend_changed, None)
                 .unwrap()
                 .unwrap();
 
@@ -7305,6 +7603,55 @@ mod tests {
         );
         assert_eq!(relocations[0].addend, 5);
         assert_eq!(relocations[0].written_value, Some(0x1003));
+    }
+
+    #[test]
+    fn relocation_addend_patch_ignores_unchanged_raw_addends_for_unsupported_sizes() {
+        let mut previous = relocated_data_elf();
+        previous[0x88..0x90]
+            .copy_from_slice(&u64::from(object::elf::R_X86_64_GOTPCREL).to_le_bytes());
+        previous[0x90..0x98].copy_from_slice(&(-4_i64).to_le_bytes());
+        let current = previous.clone();
+        let mut state = state("args", b"output", &[("input.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x1000,
+            None,
+            None,
+            4,
+            300,
+            4,
+            42,
+            0,
+        );
+
+        let mut relocations = vec![relocation.clone()];
+        let patches = relocation_addend_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.input_ranges, vec![0x90..0x98]);
+        assert!(patches.output_patches.is_empty());
+        assert_eq!(relocations[0].addend, 0);
+
+        let mut relocations = vec![relocation];
+        let err =
+            match relocation_addend_patches_for_input(&mut relocations, &input, &current, None)
+                .unwrap()
+            {
+                Ok(_) => panic!("unsupported relocation addend unexpectedly patched"),
+                Err(err) => err,
+            };
+        assert!(err.contains("unsupported relocation addend patch size"));
     }
 
     #[test]
@@ -7581,9 +7928,10 @@ mod tests {
             data_hash: None,
         };
 
-        let resolved = resolve_current_patch_sections(&bytes, &input_ref, [patch_section])
-            .unwrap()
-            .unwrap();
+        let resolved =
+            resolve_current_patch_sections(&bytes, &input_ref, [patch_section], std::iter::empty())
+                .unwrap()
+                .unwrap();
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].section_index, 1);
@@ -7949,7 +8297,7 @@ mod tests {
                 continue;
             };
             if size == 0
-                || section_direct_patch_preserve_ranges(&section, data.len()).is_none()
+                || section_direct_patch_preserve_ranges(&section, data.len(), None).is_none()
                 || object
                     .sections()
                     .filter(|s| s.name().ok() == Some(name))
