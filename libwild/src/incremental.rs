@@ -5170,6 +5170,28 @@ mod tests {
     }
 
     #[test]
+    fn changed_output_forces_initial_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"changed").unwrap();
+        let previous = state("args", b"output", &[("a.o", b"a")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "output file changed since previous link"
+        ));
+    }
+
+    #[test]
     fn reusable_inputs_only_include_unchanged_files() {
         let previous = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
         let current = state("args", b"output", &[("a.o", b"a"), ("b.o", b"changed")]);

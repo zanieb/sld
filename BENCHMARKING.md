@@ -78,7 +78,9 @@ with `grow` increases the ELF section size by that many bytes, provided there is
 next object structure. To let the linked output absorb grown sections instead of relying only on
 alignment padding, pass `--incremental-padding-percent=N` in `wild_extra_flags`. The warmup run is
 not mutated, so it seeds the initial incremental state; each timed run then measures a real
-changed-input relink. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
+changed-input relink. Use `expect_output_change = true` with section mutations when you want the
+runner to assert that the benchmarked mutation changes the linked output, not just the input file
+metadata. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
 
 ```toml
 [bench.ripgrep-incremental-changed]
@@ -95,6 +97,7 @@ skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental"]
 mutate_files = [{ path = "path/to/input.o", section = ".data" }]
 expect_wild_log = ["patched ", "changed input file before loading inputs"]
+expect_output_change = true
 ```
 
 ```toml
@@ -104,6 +107,7 @@ skip_linkers = ["bfd", "lld", "mold"]
 wild_extra_flags = ["--incremental", "--incremental-padding-percent=25"]
 mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
 expect_wild_log = ["patched ", "changed input file before loading inputs"]
+expect_output_change = true
 ```
 
 `expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
