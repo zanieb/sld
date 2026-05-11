@@ -1,0 +1,28 @@
+name = "incremental-linux"
+
+[bench.ruff]
+
+[bench.ruff-incremental-changed]
+save = "ruff"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".text.*" }]
+expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_output_change = true
+
+[bench.ty]
+
+[bench.ty-incremental-changed]
+save = "ty"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".text.*" }]
+expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_output_change = true
+
+[bench.uv]
+
+[bench.uv-incremental-changed]
+save = "uv"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".text.*" }]
+expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_output_change = true

@@ -81,6 +81,9 @@ not mutated, so it seeds the initial incremental state; each timed run then meas
 changed-input relink. Use `expect_output_change = true` with section mutations when you want the
 runner to assert that the benchmarked mutation changes the linked output, not just the input file
 metadata. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
+When a table entry has `section` but no `path`, the runner finds the first relocatable ELF input
+with a matching section at runtime. A trailing `*` makes the section name a prefix match, which is
+useful for Rust objects with names like `.text._ZN...`.
 
 ```toml
 [bench.ripgrep-incremental-changed]
@@ -109,6 +112,19 @@ mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
 expect_wild_log = ["patched ", "changed input file before loading inputs"]
 expect_output_change = true
 ```
+
+```toml
+[bench.ripgrep-incremental-changed-text]
+save = "ripgrep"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ section = ".text.*" }]
+expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_output_change = true
+```
+
+The checked-in `benchmarks/incremental-linux.toml` file uses that automatic input discovery for
+`ruff`, `ty`, and `uv`, and leaves `bfd`, `lld`, and `mold` enabled so the same changed-input run can
+show Wild incremental speedup against the default linker and mold.
 
 `expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
 that seeds incremental state, it fails timed Wild runs whose incremental log doesn't contain the
