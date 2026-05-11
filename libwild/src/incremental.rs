@@ -279,8 +279,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !changed_inputs.is_empty() {
-        if patch_changed_inputs(args, &state_dir, previous, &changed_inputs)? {
-            return Ok(true);
+        match patch_changed_inputs(args, &state_dir, previous, &changed_inputs)? {
+            ChangedInputPatchResult::Patched => return Ok(true),
+            ChangedInputPatchResult::Unsupported(reason) => {
+                append_log(
+                    &state_dir,
+                    &format!("changed-input patch unavailable before loading inputs: {reason}"),
+                )?;
+            }
         }
         return Ok(false);
     }
@@ -300,12 +306,17 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     Ok(true)
 }
 
+enum ChangedInputPatchResult {
+    Patched,
+    Unsupported(String),
+}
+
 fn patch_changed_inputs(
     args: &impl platform::Args,
     state_dir: &Path,
     previous: PersistedState,
     changed_inputs: &[(usize, PathBuf)],
-) -> Result<bool> {
+) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
 
     let mut patches = Vec::new();
@@ -314,10 +325,16 @@ fn patch_changed_inputs(
     for (input_index, path) in changed_inputs {
         let input = &previous.input_files[*input_index];
         let Some(previous_patch) = input.patch.as_ref() else {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "missing patch metadata for `{}`",
+                path.display()
+            )));
         };
         if previous_patch.sections.is_empty() {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "no patchable sections recorded for `{}`",
+                path.display()
+            )));
         }
         let patch_section_indexes = previous_patch
             .sections
@@ -325,7 +342,10 @@ fn patch_changed_inputs(
             .map(|section| section.section_index)
             .collect::<HashSet<_>>();
         if patch_section_indexes.len() != previous_patch.sections.len() {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "duplicate patchable section metadata for `{}`",
+                path.display()
+            )));
         }
         let sections = previous_patch
             .sections
@@ -346,7 +366,10 @@ fn patch_changed_inputs(
         })?;
         let fingerprint = patch_fingerprint(&bytes, sections.iter().copied())?;
         if fingerprint.as_deref() != Some(previous_patch.fingerprint.as_str()) {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "changed bytes outside patchable sections in `{}`",
+                path.display()
+            )));
         }
 
         let patch_sections = changed_patch_sections(state_dir, input, &bytes, &sections)?
@@ -362,10 +385,15 @@ fn patch_changed_inputs(
             })?;
         input_files[*input_index].patch = Some(previous_patch.clone());
 
-        patches.extend(patch_sections_for_input(
-            &bytes,
-            patch_sections.iter().copied(),
-        )?);
+        let Some(section_patches) =
+            patch_sections_for_input(&bytes, patch_sections.iter().copied())?
+        else {
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "changed patchable section size in `{}`",
+                path.display()
+            )));
+        };
+        patches.extend(section_patches);
     }
 
     let file = OpenOptions::new()
@@ -387,16 +415,22 @@ fn patch_changed_inputs(
 
     let build_id_range = build_id_note_range(&output)?;
     if build_id_range.is_some() && !args.has_incremental_fast_build_id() {
-        return Ok(false);
+        return Ok(ChangedInputPatchResult::Unsupported(
+            "output has a build ID that cannot be updated incrementally".to_owned(),
+        ));
     }
     let mut build_id_tree = None;
     let mut build_id_hashes = None;
     if build_id_range.is_some() {
         let Some(previous_hashes) = previous.build_id_hashes.as_ref() else {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "missing build ID hash state".to_owned(),
+            ));
         };
         let Ok(tree) = read_build_id_hash_tree(state_dir, previous_hashes) else {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "could not read build ID hash state".to_owned(),
+            ));
         };
         build_id_tree = Some(tree);
         build_id_hashes = Some(previous_hashes.clone());
@@ -408,11 +442,15 @@ fn patch_changed_inputs(
         let end = start
             .checked_add(patch.size as usize)
             .context("Incremental patch output range overflow")?;
-        let output_range = output
-            .get_mut(start..end)
-            .context("Incremental patch output range out of bounds")?;
+        let Some(output_range) = output.get_mut(start..end) else {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "changed patch output range is out of bounds".to_owned(),
+            ));
+        };
         if patch.data.len() > output_range.len() {
-            return Ok(false);
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "changed patch data does not fit in the previous output range".to_owned(),
+            ));
         }
         let (data_out, padding) = output_range.split_at_mut(patch.data.len());
         data_out.copy_from_slice(&patch.data);
@@ -470,7 +508,7 @@ fn patch_changed_inputs(
         state_dir,
         &format!("patched {patched_section_count} changed input sections before loading inputs"),
     )?;
-    Ok(true)
+    Ok(ChangedInputPatchResult::Patched)
 }
 
 struct SectionPatch {
@@ -1377,34 +1415,28 @@ fn changed_patch_sections(
 fn patch_sections_for_input(
     bytes: &[u8],
     sections: impl IntoIterator<Item = PatchSection>,
-) -> Result<Vec<SectionPatch>> {
+) -> Result<Option<Vec<SectionPatch>>> {
     let file = object::File::parse(bytes).context("Failed to parse changed incremental input")?;
-    sections
-        .into_iter()
-        .map(|patch_section| {
-            let section = file
-                .section_by_index(object::SectionIndex(patch_section.section_index as usize))
-                .context("Missing changed incremental input section")?;
-            let data = section
-                .data()
-                .context("Failed to read changed incremental input section data")?;
-            if data.len() as u64 != patch_section.input_size {
-                return Err(crate::error!(
-                    "Changed incremental input section size changed since the previous link"
-                ));
-            }
-            if data.len() > patch_section.output_size as usize {
-                return Err(crate::error!(
-                    "Changed incremental input section grew beyond previous output allocation"
-                ));
-            }
-            Ok(SectionPatch {
-                output_offset: patch_section.output_offset,
-                size: patch_section.output_size,
-                data: data.to_owned(),
-            })
-        })
-        .collect()
+    let mut patches = Vec::new();
+    for patch_section in sections {
+        let section = file
+            .section_by_index(object::SectionIndex(patch_section.section_index as usize))
+            .context("Missing changed incremental input section")?;
+        let data = section
+            .data()
+            .context("Failed to read changed incremental input section data")?;
+        if data.len() as u64 != patch_section.input_size
+            || data.len() > patch_section.output_size as usize
+        {
+            return Ok(None);
+        }
+        patches.push(SectionPatch {
+            output_offset: patch_section.output_offset,
+            size: patch_section.output_size,
+            data: data.to_owned(),
+        });
+    }
+    Ok(Some(patches))
 }
 
 fn patch_ranges(
@@ -2751,6 +2783,40 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn patch_sections_for_input_rejects_section_size_changes() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&current_exe) else {
+            return;
+        };
+        let Ok(object) = object::File::parse(&*bytes) else {
+            return;
+        };
+        let Some(section) = object
+            .sections()
+            .find(|section| section.file_range().is_some_and(|(_, size)| size > 0))
+        else {
+            return;
+        };
+        let Some((_, size)) = section.file_range() else {
+            return;
+        };
+        let patch_section = PatchSection {
+            section_index: section.index().0 as u32,
+            input_size: size + 1,
+            output_offset: 64,
+            output_size: size + 1,
+        };
+
+        assert!(
+            patch_sections_for_input(&bytes, [patch_section])
+                .unwrap()
+                .is_none()
         );
     }
 

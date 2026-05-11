@@ -3,8 +3,10 @@
 Wild is a linker with the goal of being very fast for iterative development.
 
 The plan is to eventually make it fully incremental. Initial incremental support can reuse an
-existing output for unchanged relinks and conservatively falls back to a full relink when inputs or
-arguments change. Wild is already pretty fast even without fine-grained incremental updates.
+existing output for unchanged relinks, update rewritten inputs whose contents are unchanged, and
+patch some same-layout changed object files in place. It still conservatively falls back to a full
+relink when arguments change or when an input change is outside the currently patchable subset. Wild
+is already pretty fast even without fully general fine-grained incremental updates.
 
 ## Installation
 
@@ -149,7 +151,7 @@ The following is working with the caveat that there may be bugs:
 
 Here are some of the larger things that aren't yet done, roughly sorted by current priority:
 
-* Fine-grained incremental updates for changed inputs
+* Fully general fine-grained incremental updates for changed inputs
 * More complex linker scripts
 * Mach-O support
 * Windows support
