@@ -111,9 +111,22 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
         if bins.is_empty() {
             bail!("Need at least one binary");
         }
+        let mut baseline_outputs = Vec::new();
         for bin in bins {
             let warmup_flags = extra_flags_for_run(bin, bench, false);
-            run_once(bin, bench, args, &warmup_flags, false)?;
+            let warmup_run = run_once(bin, bench, args, &warmup_flags, false)?;
+            let baseline_output = if bench.config.expect_output_change && warmup_run.is_some() {
+                let output_path = output_path_for_bin(args.tmp.as_path(), bin);
+                Some(std::fs::read(&output_path).with_context(|| {
+                    format!(
+                        "Failed to read warmup output `{}` for output-change verification",
+                        output_path.display()
+                    )
+                })?)
+            } else {
+                None
+            };
+            baseline_outputs.push(baseline_output);
         }
 
         let mut bench_results = Vec::new();
@@ -127,6 +140,12 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
                         extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
 
                     if let Some(run) = run_once(bin, bench, args, &extra_flags, true)? {
+                        if let Some(baseline_output) = baseline_outputs
+                            .get(bin_index)
+                            .and_then(|baseline| baseline.as_deref())
+                        {
+                            verify_output_changed(bin, bench, args, baseline_output)?;
+                        }
                         batch_runs[bin_index].push(run);
                     }
                     progress_bar.inc(1);
@@ -249,7 +268,7 @@ fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
     let byte = bytes
         .get_mut(start as usize)
         .with_context(|| format!("Mutation section `{section_name}` starts past end of file"))?;
-    *byte ^= 1;
+    *byte = byte.wrapping_add(1);
     std::fs::write(path, bytes)
         .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
     Ok(())
@@ -586,6 +605,29 @@ fn verify_wild_incremental_log(output_path: &Path, expected: &[String]) -> Resul
     Ok(())
 }
 
+fn verify_output_changed(
+    bin: &Bin,
+    bench: &Benchmark,
+    args: &BenchArgs,
+    baseline_output: &[u8],
+) -> Result {
+    let output_path = output_path_for_bin(args.tmp.as_path(), bin);
+    let output = std::fs::read(&output_path).with_context(|| {
+        format!(
+            "Failed to read output `{}` for output-change verification",
+            output_path.display()
+        )
+    })?;
+    if output == baseline_output {
+        bail!(
+            "Benchmark `{}` with linker `{}` did not change output after mutation",
+            bench.name,
+            bin.identifier.kind
+        );
+    }
+    Ok(())
+}
+
 fn incremental_log_path(output_path: &Path) -> std::path::PathBuf {
     let mut state_dir = output_path.as_os_str().to_owned();
     state_dir.push(".incr");
@@ -664,7 +706,9 @@ mod tests {
     use super::mutate_inputs;
     use super::output_path_for_bin;
     use super::should_verify_wild_incremental_log;
+    use super::verify_output_changed;
     use super::verify_wild_incremental_log;
+    use crate::BenchArgs;
     use crate::Benchmark;
     use crate::Bin;
     use crate::LinkerIdentifier;
@@ -726,6 +770,23 @@ mod tests {
         mutate_elf_section_byte(&path, ".data").unwrap();
 
         assert_ne!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn elf_section_byte_mutation_does_not_toggle_to_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.o");
+        std::fs::write(&path, growable_data_elf()).unwrap();
+
+        mutate_elf_section_byte(&path, ".data").unwrap();
+        mutate_elf_section_byte(&path, ".data").unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[3, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -835,6 +896,52 @@ mod tests {
         assert!(!should_verify_wild_incremental_log(&wild, &bench, false));
         assert!(should_verify_wild_incremental_log(&wild, &bench, true));
         assert!(!should_verify_wild_incremental_log(&mold, &bench, true));
+    }
+
+    #[test]
+    fn output_change_expectation_requires_changed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = BenchArgs {
+            config: PathBuf::from("benchmarks/test.toml"),
+            saves: dir.path().join("saves"),
+            no_verify: false,
+            no_check_system: true,
+            allow_non_tmpfs: true,
+            tmp: dir.path().join("out"),
+            batch_size: 1,
+            num_batches: 1,
+            no_mem: true,
+            benches: Vec::new(),
+            output: None,
+            binaries: Vec::new(),
+        };
+        let bin = Bin {
+            index: 0,
+            path: PathBuf::from("/bin/wild"),
+            identifier: LinkerIdentifier {
+                kind: LinkerKind::Wild,
+                version: "wild 0.0.0".to_owned(),
+                variant: None,
+                hash: None,
+                effective_version: vec![0, 0, 0],
+            },
+        };
+        let bench = Benchmark {
+            name: "changed-incremental".to_owned(),
+            path: PathBuf::from("/tmp/save/run-with"),
+            config: BenchConfig {
+                expect_output_change: true,
+                ..BenchConfig::default()
+            },
+        };
+        let output = output_path_for_bin(args.tmp.as_path(), &bin);
+
+        std::fs::write(&output, b"baseline").unwrap();
+        let error = verify_output_changed(&bin, &bench, &args, b"baseline").unwrap_err();
+        assert!(error.to_string().contains("did not change output"));
+
+        std::fs::write(&output, b"changed").unwrap();
+        verify_output_changed(&bin, &bench, &args, b"baseline").unwrap();
     }
 
     #[test]

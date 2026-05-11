@@ -35,6 +35,9 @@ pub(crate) struct BenchConfig {
     /// Strings that must appear in Wild's incremental log after each timed Wild run.
     #[serde(default)]
     pub(crate) expect_wild_log: Vec<String>,
+    /// Whether every timed run must produce output bytes that differ from the warmup output.
+    #[serde(default)]
+    pub(crate) expect_output_change: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -162,5 +165,24 @@ expect_wild_log = ["patched ", "before loading inputs"]
             bench.expect_wild_log,
             ["patched ".to_owned(), "before loading inputs".to_owned()]
         );
+    }
+
+    #[test]
+    fn parses_incremental_output_change_expectation() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+mutate_files = [{ path = "changed.o", section = ".data" }]
+expect_output_change = true
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert!(bench.expect_output_change);
     }
 }
