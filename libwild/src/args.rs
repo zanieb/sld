@@ -25,6 +25,7 @@ use itertools::Itertools;
 use jobserver::Acquired;
 use jobserver::Client;
 use rayon::ThreadPoolBuilder;
+use std::fmt;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -316,6 +317,10 @@ fn default_warning_callback(warning: Warning) {
 }
 
 impl CommonArgs {
+    pub(crate) fn incremental_link_options(&self) -> impl fmt::Debug + '_ {
+        CommonIncrementalLinkOptions(self)
+    }
+
     pub(crate) fn trace_span_for_file(
         &self,
         file_id: FileId,
@@ -446,6 +451,46 @@ impl CommonArgs {
         }
 
         Ok(common)
+    }
+}
+
+struct CommonIncrementalLinkOptions<'a>(&'a CommonArgs);
+
+impl fmt::Debug for CommonIncrementalLinkOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args = self.0;
+        f.debug_struct("CommonArgs")
+            .field("unrecognized_options", &args.unrecognized_options)
+            .field("available_threads", &args.available_threads)
+            .field("num_threads", &args.num_threads)
+            .field("files_per_group", &args.files_per_group)
+            .field("jobserver_client", &args.jobserver_client)
+            .field("file_write_mode", &args.file_write_mode)
+            .field("save_dir", &args.save_dir)
+            .field("prepopulate_maps", &args.prepopulate_maps)
+            .field("debug_fuel", &args.debug_fuel)
+            .field("should_fork", &args.should_fork)
+            .field("demangle", &args.demangle)
+            .field("mmap_output_file", &args.mmap_output_file)
+            .field("incremental", &args.incremental)
+            .field(
+                "incremental_padding_percent",
+                &args.incremental_padding_percent,
+            )
+            .field("validate_output", &args.validate_output)
+            .field(
+                "verify_allocation_consistency",
+                &args.verify_allocation_consistency,
+            )
+            .field("write_layout", &args.write_layout)
+            .field("write_trace", &args.write_trace)
+            .field("print_allocations", &args.print_allocations)
+            .field("sym_info", &args.sym_info)
+            .field("numeric_experiments", &args.numeric_experiments)
+            .field("version_mode", &args.version_mode)
+            .field("time_phase_options", &args.time_phase_options)
+            .field("version", &args.version)
+            .finish()
     }
 }
 

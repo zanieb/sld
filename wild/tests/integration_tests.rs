@@ -164,6 +164,9 @@
 //! TestIncrementalInterrupted:{bool} Whether to extend TestIncremental by creating a stale
 //! update-in-progress marker, then checking that the next link performs a full relink.
 //!
+//! TestIncrementalAddedInput:{source-filename} Whether to extend TestIncremental by appending the
+//! compiled object for the source file, then checking that the relink reuses unchanged sections.
+//!
 //! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
@@ -802,6 +805,7 @@ struct Config {
     test_incremental_compare_full: bool,
     test_incremental_changed: bool,
     test_incremental_interrupted: bool,
+    test_incremental_added_input: Option<String>,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
@@ -1403,6 +1407,7 @@ impl Config {
             test_incremental_compare_full: true,
             test_incremental_changed: false,
             test_incremental_interrupted: false,
+            test_incremental_added_input: None,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
@@ -1806,6 +1811,9 @@ fn process_directive(
         }
         "TestIncrementalInterrupted" => {
             config.test_incremental_interrupted = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalAddedInput" => {
+            config.test_incremental_added_input = Some(arg.to_owned());
         }
         "TestIncrementalChangedExpectPatch" => {
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
@@ -2453,6 +2461,66 @@ impl ProgramInputs {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not reuse \
                     unchanged input sections. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+        }
+
+        if let Some(added_input) = &config.test_incremental_added_input {
+            let added_input_path = config.source_path(added_input);
+            let added_linker_input = build_linker_input(
+                &Dep {
+                    files: vec![FilenameArgumentPair::new(
+                        &added_input_path,
+                        ArgumentSet::empty(),
+                    )],
+                    input_type: InputType::Object,
+                    template: None,
+                },
+                config,
+                &Linker::Wild,
+                cross_arch,
+            )?;
+            let mut added_inputs = inputs.to_vec();
+            added_inputs.push(added_linker_input);
+
+            let link_output_added =
+                Linker::Wild.link(self.name(), &added_inputs, &incremental_config, cross_arch)?;
+            let added_content = std::fs::read(&link_output_added.binary).with_context(|| {
+                format!(
+                    "Failed to read added-input incremental output: {}",
+                    link_output_added.binary.display()
+                )
+            })?;
+            let link_output_added_full =
+                Linker::Wild.link(self.name(), &added_inputs, config, cross_arch)?;
+            let added_full_content =
+                std::fs::read(&link_output_added_full.binary).with_context(|| {
+                    format!(
+                        "Failed to read added-input full output: {}",
+                        link_output_added_full.binary.display()
+                    )
+                })?;
+            if added_content != added_full_content {
+                let diffs = sections_with_diffs(&added_content, &added_full_content)?;
+                bail!(
+                    "Incremental test failed for {}: added-input incremental output differs \
+                    from a full relink of the same inputs. Diffs:\n{diffs:#?}",
+                    self.name()
+                );
+            }
+
+            let log = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
+            if !log.contains("full relink: input file added:")
+                || !log.contains("reused ")
+                || !log.contains(" unchanged input sections")
+            {
+                bail!(
+                    "Incremental test failed for {}: added-input relink did not reuse unchanged \
+                    sections. Log:\n{}",
                     self.name(),
                     log
                 );
