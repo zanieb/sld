@@ -2375,7 +2375,7 @@ where
                 .into_iter()
                 .flat_map(|relocations| relocations.iter().copied()),
         )?;
-        let fde_relocation_ranges = fde_relocation_addend_ranges_for_input(
+        let fde_relocation_ranges = fde_patch_input_ranges_for_input(
             input_file.data(),
             input.path.as_str(),
             input_fdes
@@ -3308,7 +3308,7 @@ fn dynamic_relocation_patches_for_input_bytes(
     Ok(patches)
 }
 
-fn fde_relocation_addend_ranges_for_input<'a>(
+fn fde_patch_input_ranges_for_input<'a>(
     bytes: &[u8],
     input_file_path: &str,
     records: impl IntoIterator<Item = &'a FdeRecord>,
@@ -3326,7 +3326,7 @@ fn fde_relocation_addend_ranges_for_input<'a>(
         let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
             continue;
         };
-        ranges.extend(fde_relocation_addend_ranges_for_input_bytes(
+        ranges.extend(fde_patch_input_ranges_for_input_bytes(
             input_bytes.bytes,
             input_bytes.file_offset,
             records,
@@ -3335,7 +3335,7 @@ fn fde_relocation_addend_ranges_for_input<'a>(
     Ok(ranges)
 }
 
-fn fde_relocation_addend_ranges_for_input_bytes(
+fn fde_patch_input_ranges_for_input_bytes(
     bytes: &[u8],
     file_offset: usize,
     records: Vec<&FdeRecord>,
@@ -3348,17 +3348,29 @@ fn fde_relocation_addend_ranges_for_input_bytes(
     for record in records {
         let relocation_sizes =
             eh_frame_relocation_sizes(&file, record.eh_frame_section_index, record)?;
-        for entry in
+        let Some(fde_range) = fde_input_range(bytes.len(), &section_headers, record) else {
+            continue;
+        };
+        let Some(entries) =
             rela_entries_for_section(bytes, &section_headers, record.eh_frame_section_index)
-                .into_iter()
-                .flatten()
-                .filter(|entry| fde_contains_relocation(record, entry.offset))
+        else {
+            continue;
+        };
+        let mut record_ranges = vec![file_offset + fde_range.start..file_offset + fde_range.end];
+        let mut supported = true;
+        for entry in entries
+            .into_iter()
+            .filter(|entry| fde_contains_relocation(record, entry.offset))
         {
-            if relocation_sizes.contains_key(&entry.offset) {
-                ranges.push(
-                    file_offset + entry.addend_range.start..file_offset + entry.addend_range.end,
-                );
+            if !relocation_sizes.contains_key(&entry.offset) {
+                supported = false;
+                break;
             }
+            record_ranges
+                .push(file_offset + entry.addend_range.start..file_offset + entry.addend_range.end);
+        }
+        if supported {
+            ranges.extend(record_ranges);
         }
     }
     Ok(ranges)
@@ -3418,6 +3430,26 @@ fn fde_relocation_patches_for_input_bytes(
 
     let mut patches = Vec::new();
     for record in records {
+        let Some(current_fde_range) =
+            fde_input_range(current_bytes.len(), &current_section_headers, record)
+        else {
+            continue;
+        };
+        let Some(previous_fde_range) =
+            fde_input_range(previous_bytes.len(), &previous_section_headers, record)
+        else {
+            continue;
+        };
+        let current_fde_data = &current_bytes[current_fde_range.clone()];
+        let previous_fde_data = &previous_bytes[previous_fde_range];
+        if current_fde_data.get(4..8) != previous_fde_data.get(4..8) {
+            patches.push(FdeRelocationPatch {
+                input_ranges: Vec::new(),
+                patch: None,
+                eh_frame_hdr_delta: None,
+            });
+            continue;
+        }
         let current_entries = rela_entries_for_section(
             current_bytes,
             &current_section_headers,
@@ -3448,18 +3480,24 @@ fn fde_relocation_patches_for_input_bytes(
         let relocation_sizes =
             eh_frame_relocation_sizes(&current_file, record.eh_frame_section_index, record)?;
 
-        let mut input_ranges = Vec::new();
+        let mut input_ranges = vec![
+            current_file_offset + current_fde_range.start
+                ..current_file_offset + current_fde_range.end,
+        ];
+        let mut preserve_ranges = vec![4..8];
         let mut adjustments = Vec::new();
         let mut eh_frame_hdr_delta = None;
         for (current, previous) in current_entries.iter().zip(&previous_entries) {
             if current.offset != previous.offset || current.info != previous.info {
                 input_ranges.clear();
+                preserve_ranges.clear();
                 adjustments.clear();
                 eh_frame_hdr_delta = None;
                 break;
             }
             let Some(field_size) = relocation_sizes.get(&current.offset).copied() else {
                 input_ranges.clear();
+                preserve_ranges.clear();
                 adjustments.clear();
                 eh_frame_hdr_delta = None;
                 break;
@@ -3468,15 +3506,6 @@ fn fde_relocation_patches_for_input_bytes(
                 current_file_offset + current.addend_range.start
                     ..current_file_offset + current.addend_range.end,
             );
-            let Some(addend_delta) = current.addend.checked_sub(previous.addend) else {
-                input_ranges.clear();
-                adjustments.clear();
-                eh_frame_hdr_delta = None;
-                break;
-            };
-            if addend_delta == 0 {
-                continue;
-            }
             let field_start = usize::try_from(current.offset - record.input_offset)
                 .context("Incremental .eh_frame relocation offset is too large")?;
             let field_end = field_start
@@ -3484,9 +3513,21 @@ fn fde_relocation_patches_for_input_bytes(
                 .context("Incremental .eh_frame relocation range overflow")?;
             if field_end > record.size as usize {
                 input_ranges.clear();
+                preserve_ranges.clear();
                 adjustments.clear();
                 eh_frame_hdr_delta = None;
                 break;
+            }
+            preserve_ranges.push(field_start..field_end);
+            let Some(addend_delta) = current.addend.checked_sub(previous.addend) else {
+                input_ranges.clear();
+                preserve_ranges.clear();
+                adjustments.clear();
+                eh_frame_hdr_delta = None;
+                break;
+            };
+            if addend_delta == 0 {
+                continue;
             }
             if field_start == crate::elf::FDE_PC_BEGIN_OFFSET {
                 eh_frame_hdr_delta = Some(EhFrameHdrDelta {
@@ -3499,13 +3540,17 @@ fn fde_relocation_patches_for_input_bytes(
                 addend_delta,
             });
         }
+        preserve_ranges.sort_by_key(|range| (range.start, range.end));
+        preserve_ranges.dedup_by(|left, right| left.start == right.start && left.end == right.end);
+        let needs_patch = !input_ranges.is_empty()
+            && (current_fde_data != previous_fde_data || !adjustments.is_empty());
         patches.push(FdeRelocationPatch {
             input_ranges,
-            patch: (!adjustments.is_empty()).then(|| SectionPatch {
+            patch: needs_patch.then(|| SectionPatch {
                 output_offset: record.output_offset,
                 size: record.size,
-                data: vec![0; record.size as usize],
-                preserve_ranges: vec![0..record.size as usize],
+                data: current_fde_data.to_vec(),
+                preserve_ranges,
                 adjustments,
             }),
             eh_frame_hdr_delta,
@@ -3674,6 +3719,21 @@ fn eh_frame_relocation_sizes(
 fn fde_contains_relocation(record: &FdeRecord, relocation_offset: u64) -> bool {
     relocation_offset >= record.input_offset
         && relocation_offset < record.input_offset.saturating_add(record.size)
+}
+
+fn fde_input_range(
+    input_len: usize,
+    section_headers: &[ElfSectionHeader],
+    record: &FdeRecord,
+) -> Option<std::ops::Range<usize>> {
+    let section = section_headers.get(record.eh_frame_section_index as usize)?;
+    let section_start = usize::try_from(section.sh_offset).ok()?;
+    let section_size = usize::try_from(section.sh_size).ok()?;
+    let section_end = section_start.checked_add(section_size)?;
+    let start = section_start.checked_add(usize::try_from(record.input_offset).ok()?)?;
+    let size = usize::try_from(record.size).ok()?;
+    let end = start.checked_add(size)?;
+    (end <= input_len && end <= section_end && size >= 8).then_some(start..end)
 }
 
 struct RelaPatchEntry {
@@ -6282,7 +6342,7 @@ mod tests {
         };
         let fde = fde_record("input.o", 1, 2, 0, 300, 16);
         let previous_ranges =
-            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+            fde_patch_input_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
         let previous_fingerprint = patch_fingerprint_with_extra_ranges(
             &previous,
             &input_ref,
@@ -6308,14 +6368,68 @@ mod tests {
             previous_fingerprint
         );
         assert_eq!(current_patches.len(), 1);
-        assert_eq!(current_patches[0].input_ranges, vec![0x58 + 16..0x58 + 24]);
+        assert_eq!(
+            current_patches[0].input_ranges,
+            vec![0x48..0x58, 0x58 + 16..0x58 + 24]
+        );
         let patch = current_patches[0].patch.as_ref().unwrap();
         assert_eq!(patch.output_offset, 300);
         assert_eq!(patch.size, 16);
-        assert_eq!(patch.preserve_ranges, vec![0..16]);
+        assert_eq!(patch.preserve_ranges, vec![4..8, 8..12]);
         assert_eq!(patch.adjustments.len(), 1);
         assert_eq!(patch.adjustments[0].range, 8..12);
         assert_eq!(patch.adjustments[0].addend_delta, 6);
+        assert!(current_patches[0].eh_frame_hdr_delta.is_some());
+    }
+
+    #[test]
+    fn patch_fingerprint_allows_fde_content_changes() {
+        let previous = eh_frame_relocation_elf(8, -4);
+        let mut current = previous.clone();
+        current[0x54] = 8;
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+        };
+        let fde = fde_record("input.o", 1, 2, 0, 300, 16);
+        let previous_ranges =
+            fde_patch_input_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+        let previous_fingerprint = patch_fingerprint_with_extra_ranges(
+            &previous,
+            &input_ref,
+            [patch_section.clone()],
+            previous_ranges.into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let current_patches =
+            fde_relocation_patches_for_input(&current, &previous, &input_ref, [&fde]).unwrap();
+
+        assert_eq!(
+            patch_fingerprint_with_extra_ranges(
+                &current,
+                &input_ref,
+                [patch_section],
+                current_patches
+                    .iter()
+                    .flat_map(|patch| patch.input_ranges.iter().cloned()),
+            )
+            .unwrap()
+            .unwrap(),
+            previous_fingerprint
+        );
+        assert_eq!(current_patches.len(), 1);
+        let patch = current_patches[0].patch.as_ref().unwrap();
+        assert_eq!(&patch.data[12..16], &[8, 0, 0, 0]);
+        assert_eq!(patch.preserve_ranges, vec![4..8, 8..12]);
+        assert!(patch.adjustments.is_empty());
+        assert!(current_patches[0].eh_frame_hdr_delta.is_none());
     }
 
     #[test]
@@ -6334,7 +6448,7 @@ mod tests {
         };
         let fde = fde_record("input.o", 1, 2, 0, 300, 16);
         let previous_ranges =
-            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+            fde_patch_input_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
         let previous_fingerprint = patch_fingerprint_with_extra_ranges(
             &previous,
             &input_ref,
@@ -6380,7 +6494,7 @@ mod tests {
         };
         let fde = fde_record("input.o", 1, 2, 0, 300, 16);
         let previous_ranges =
-            fde_relocation_addend_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
+            fde_patch_input_ranges_for_input(&previous, &input_ref, [&fde]).unwrap();
         let previous_fingerprint = patch_fingerprint_with_extra_ranges(
             &previous,
             &input_ref,

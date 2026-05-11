@@ -12,6 +12,9 @@
 //#TestIncrementalStateContains:fde\t
 //#Config:eh-frame-hdr:eh-frame
 //#WildExtraLinkArgs:--eh-frame-hdr
+//#Config:eh-frame-data:eh-frame
+//#TestIncrementalChangedSection:.eh_frame
+//#TestIncrementalChangedSectionOffset:32
 
 int incremental_text_value(void);
 
