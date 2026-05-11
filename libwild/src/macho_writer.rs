@@ -8,6 +8,7 @@ use crate::file_writer::SizedOutput;
 use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
+use crate::incremental::PreparedState;
 use crate::layout::FileLayout;
 use crate::layout::HeaderInfo;
 use crate::layout::Layout;
@@ -71,6 +72,7 @@ use crate::part_id;
 use crate::platform::Arch;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
+use crate::platform::RelocationList;
 use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
 use crate::sharding::ShardKey;
@@ -667,8 +669,10 @@ fn macho_addend(rel: RelocationInfo) -> i64 {
 pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     sized_output: &mut SizedOutput,
     layout: &MachOLayout<'data>,
+    incremental: &PreparedState,
 ) -> Result {
     timing_phase!("Write data to file");
+    let existing_output_bytes_available = sized_output.existing_data_available();
     let chained_rebases = ChainedRebases::collect::<A>(layout)?;
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
@@ -693,7 +697,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
     groups_and_buffers.into_par_iter().try_for_each(
-        |(group, mut buffers, _group_file_offsets)| -> Result {
+        |(group, mut buffers, group_file_offsets)| -> Result {
             verbose_timing_phase!("Write group");
 
             let mut symbol_writer = MachOSymbolTableWriter {
@@ -707,6 +711,10 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                     &sized_output.trace,
                     &mut symbol_writer,
                     &chained_rebases,
+                    incremental,
+                    existing_output_bytes_available,
+                    &group_file_offsets,
+                    &group.file_sizes,
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
@@ -740,10 +748,24 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     _trace: &TraceOutput,
     symbol_writer: &mut MachOSymbolTableWriter,
     chained_rebases: &ChainedRebases,
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     match file {
         FileLayout::Object(s) => {
-            write_object::<A>(s, buffers, layout, symbol_writer, chained_rebases)?;
+            write_object::<A>(
+                s,
+                buffers,
+                layout,
+                symbol_writer,
+                chained_rebases,
+                incremental,
+                existing_output_bytes_available,
+                group_file_offsets,
+                group_file_sizes,
+            )?;
         }
         FileLayout::Prelude(s) => {
             write_prelude::<A>(s, buffers, layout, symbol_writer, chained_rebases)?;
@@ -1091,6 +1113,10 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
     chained_rebases: &ChainedRebases,
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
 
@@ -1106,6 +1132,10 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
                     object::SectionIndex(i),
                     buffers,
                     chained_rebases,
+                    incremental,
+                    existing_output_bytes_available,
+                    group_file_offsets,
+                    group_file_sizes,
                 )?;
             }
             _ => (),
@@ -1172,8 +1202,38 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     chained_rebases: &ChainedRebases,
+    incremental: &PreparedState,
+    existing_output_bytes_available: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
-    let out = write_section_raw(object_layout, layout, section, section_index, buffers)?;
+    let relocations = object_layout.relocations(section_index)?;
+    let record_for_reuse = !layout.args().should_output_partial_object()
+        && relocations.num_relocations() == 0
+        && object_layout
+            .section_relax_deltas
+            .get(section_index.0)
+            .is_none()
+        && !section.flags.needs_got()
+        && !section.flags.needs_plt();
+    let can_reuse_existing_bytes = existing_output_bytes_available && record_for_reuse;
+
+    let written = write_section_raw(
+        object_layout,
+        layout,
+        section,
+        section_index,
+        buffers,
+        incremental,
+        record_for_reuse,
+        can_reuse_existing_bytes,
+        group_file_offsets,
+        group_file_sizes,
+    )?;
+    if written.reused {
+        return Ok(());
+    }
+    let out = written.bytes;
 
     let section_address = object_layout.section_resolutions[section_index.0]
         .address()
@@ -1183,7 +1243,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let mut paired_addend = 0;
     let mut paired_subtractor = None;
     let section_header = object_layout.object.section(section_index)?;
-    for rel in object_layout.relocations(section_index)?.relocations {
+    for rel in relocations.relocations {
         let rel = rel.info(LE);
         if rel.r_type == macho::ARM64_RELOC_ADDEND {
             paired_addend = macho_addend(rel);
@@ -2157,13 +2217,23 @@ fn macho_image_offset(address: u64) -> Result<u32> {
         .with_context(|| format!("Mach-O address {address:#x} is outside the 32-bit image range"))
 }
 
+struct WrittenSection<'out> {
+    bytes: &'out mut [u8],
+    reused: bool,
+}
+
 fn write_section_raw<'out, 'data>(
     object: &ObjectLayout<'data, MachO>,
     layout: &MachOLayout,
     sec: &Section,
     section_index: object::SectionIndex,
     buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
-) -> Result<&'out mut [u8]> {
+    incremental: &PreparedState,
+    record_for_reuse: bool,
+    allow_reuse: bool,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
+) -> Result<WrittenSection<'out>> {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
     if layout
         .output_sections
@@ -2171,6 +2241,14 @@ fn write_section_raw<'out, 'data>(
     {
         let section_buffer = buffers.get_mut(part_id);
         let allocation_size = sec.capacity(part_id, &layout.output_sections) as usize;
+        let consumed_in_group = group_file_sizes
+            .get(part_id)
+            .checked_sub(section_buffer.len())
+            .context("Incremental section buffer is larger than its group allocation")?;
+        let output_offset = group_file_offsets
+            .get(part_id)
+            .checked_add(consumed_in_group)
+            .context("Incremental section output offset overflow")?;
         if section_buffer.len() < allocation_size {
             bail!(
                 "Insufficient space allocated to section `{}`. Tried to take {} bytes, but only {} remain",
@@ -2180,15 +2258,34 @@ fn write_section_raw<'out, 'data>(
             );
         }
         let out = section_buffer.split_off_mut(..allocation_size).unwrap();
+        if incremental.try_reuse_section(
+            object.input,
+            section_index,
+            output_offset as u64,
+            allocation_size as u64,
+            record_for_reuse,
+            allow_reuse,
+        ) {
+            return Ok(WrittenSection {
+                bytes: &mut [],
+                reused: true,
+            });
+        }
         let object_section = object.object.section(section_index)?;
 
         let section_size = object.object.section_size(object_section)?;
         let (out, padding) = out.split_at_mut(section_size as usize);
         object.object.copy_section_data(object_section, out)?;
         padding.fill(0);
-        Ok(out)
+        Ok(WrittenSection {
+            bytes: out,
+            reused: false,
+        })
     } else {
-        Ok(&mut [])
+        Ok(WrittenSection {
+            bytes: &mut [],
+            reused: false,
+        })
     }
 }
 

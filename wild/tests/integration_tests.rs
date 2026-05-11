@@ -2331,6 +2331,9 @@ impl ProgramInputs {
                 }
             }
         }
+        if config.platform == PlatformKind::MachO {
+            verify_macho_signature(&link_output_2.binary)?;
+        }
 
         if config.test_incremental_interrupted {
             let marker_path =
@@ -2537,6 +2540,9 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.platform == PlatformKind::MachO {
+                verify_macho_signature(&link_output_3.binary)?;
+            }
 
             if let Some(expected) = &config.test_incremental_changed_section_prefix {
                 assert_output_section_prefix(
@@ -2591,6 +2597,9 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.platform == PlatformKind::MachO {
+                verify_macho_signature(&link_output_5.binary)?;
+            }
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
@@ -2626,7 +2635,33 @@ impl ProgramInputs {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
             let fallback_message = "changed-input patch unavailable before loading inputs";
-            if config.test_incremental_changed_expect_patch {
+            if config.platform == PlatformKind::MachO {
+                if log.contains("patched ") && log.contains(" changed input file") {
+                    bail!(
+                        "Incremental test failed for {}: Mach-O changed-input relink patched \
+                        the output before loading inputs, which would bypass code signing. \
+                        Log:\n{}",
+                        self.name(),
+                        log
+                    );
+                }
+                if !log.contains("full relink: input file changed:") {
+                    bail!(
+                        "Incremental test failed for {}: Mach-O changed-input relink did not \
+                        fall back to a full relink. Log:\n{}",
+                        self.name(),
+                        log
+                    );
+                }
+                if !log.contains("reused ") || !log.contains(" unchanged input sections") {
+                    bail!(
+                        "Incremental test failed for {}: Mach-O changed-input relink did not \
+                        reuse unchanged input sections. Log:\n{}",
+                        self.name(),
+                        log
+                    );
+                }
+            } else if config.test_incremental_changed_expect_patch {
                 let changed_input_count = changed_inputs.len();
                 let patched_input_message = format!(
                     "patched {changed_input_count} changed input file{} before loading inputs",
@@ -2875,6 +2910,29 @@ impl ProgramInputs {
 
         Ok(())
     }
+}
+
+fn verify_macho_signature(path: &Path) -> Result {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("codesign")
+            .arg("-v")
+            .arg(path)
+            .output()
+            .with_context(|| format!("Failed to run codesign for `{}`", path.display()))?;
+        ensure!(
+            output.status.success(),
+            "Mach-O incremental output `{}` failed code signature validation:\n{}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 struct RestoreFileOnDrop {

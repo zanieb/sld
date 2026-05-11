@@ -1194,9 +1194,11 @@ impl platform::Platform for MachO {
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &crate::layout::Layout<'data, Self>,
-        _incremental: &crate::incremental::PreparedState,
+        incremental: &crate::incremental::PreparedState,
     ) -> crate::error::Result {
-        output.write(layout, macho_writer::write::<A>)?;
+        output.write(layout, |sized_output, layout| {
+            macho_writer::write::<A>(sized_output, layout, incremental)
+        })?;
         if layout.args().should_adhoc_codesign && !layout.symbol_db.output_kind.is_partial_object()
         {
             ad_hoc_codesign(output.path())?;
