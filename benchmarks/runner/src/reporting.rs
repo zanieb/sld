@@ -207,7 +207,7 @@ impl Display for BenchmarkDisplay<'_> {
         if self.mode == ReportMode::Time {
             write_wild_speedups(f, self.benchmark, self.mode)?;
             if let Some(baseline) = self.baseline {
-                write_incremental_wild_speedup(f, self.benchmark, baseline, self.mode)?;
+                write_incremental_wild_speedups(f, self.benchmark, baseline, self.mode)?;
             }
         }
         Ok(())
@@ -248,7 +248,7 @@ fn write_wild_speedups(
     Ok(())
 }
 
-fn write_incremental_wild_speedup(
+fn write_incremental_wild_speedups(
     f: &mut std::fmt::Formatter<'_>,
     benchmark: &BenchmarkResult,
     baseline: &BenchmarkResult,
@@ -257,20 +257,25 @@ fn write_incremental_wild_speedup(
     let Some(incremental_wild) = wild_batch(benchmark) else {
         return Ok(());
     };
-    let Some(baseline_wild) = wild_batch(baseline) else {
-        return Ok(());
-    };
     let incremental_mean = mean(incremental_wild, mode);
     if incremental_mean <= 0.0 {
         return Ok(());
     }
 
-    writeln!(
-        f,
-        "  Wild incremental speedup over {baseline} Wild: {speedup:.2}x",
-        baseline = baseline.config.name,
-        speedup = mean(baseline_wild, mode) / incremental_mean,
-    )
+    for batch in &baseline.batches {
+        let baseline_name = if batch.bin.identifier.kind == LinkerKind::Wild {
+            "Wild".to_owned()
+        } else {
+            batch.bin.to_string()
+        };
+        writeln!(
+            f,
+            "  Wild incremental speedup over {baseline} {baseline_name}: {speedup:.2}x",
+            baseline = baseline.config.name,
+            speedup = mean(batch, mode) / incremental_mean,
+        )?;
+    }
+    Ok(())
 }
 
 fn find_incremental_baseline<'a>(
@@ -557,12 +562,13 @@ mod tests {
     }
 
     #[test]
-    fn time_stats_include_incremental_speedup_against_paired_full_wild() {
+    fn time_stats_include_incremental_speedups_against_paired_full_linkers() {
         let baseline = benchmark_result_with_name(
             "ruff",
             vec![
                 batch(LinkerKind::Wild, Duration::from_millis(100)),
                 batch(LinkerKind::Mold, Duration::from_millis(150)),
+                batch(LinkerKind::Bfd, Duration::from_millis(250)),
             ],
         );
         let incremental = benchmark_result_with_name(
@@ -578,6 +584,8 @@ mod tests {
         .to_string();
 
         assert!(display.contains("Wild incremental speedup over ruff Wild: 4.00x"));
+        assert!(display.contains("Wild incremental speedup over ruff Mold 1.0.0: 6.00x"));
+        assert!(display.contains("Wild incremental speedup over ruff GNU ld 1.0.0: 10.00x"));
     }
 
     #[test]
