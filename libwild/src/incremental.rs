@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v12";
+const STATE_VERSION: &str = "wild-incremental-state-v13";
+const STATE_VERSION_V12: &str = "wild-incremental-state-v12";
 const STATE_VERSION_V11: &str = "wild-incremental-state-v11";
 const STATE_VERSION_V10: &str = "wild-incremental-state-v10";
 const STATE_VERSION_V9: &str = "wild-incremental-state-v9";
@@ -76,12 +77,14 @@ enum IncrementalMode {
 struct CurrentState {
     state_dir: PathBuf,
     args_hash: String,
+    wild_version: String,
     input_files: Vec<FileState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedState {
     args_hash: String,
+    wild_version: Option<String>,
     output: FileContentState,
     build_id_hashes: Option<BuildIdHashState>,
     input_files: Vec<FileState>,
@@ -167,6 +170,7 @@ pub(crate) fn maybe_prepare(
             current: CurrentState {
                 state_dir: state_dir_for_output(args.output()),
                 args_hash: String::new(),
+                wild_version: String::new(),
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -277,6 +281,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     };
 
     if previous.args_hash != args_hash(args) {
+        return Ok(false);
+    }
+    let current_wild_version = wild_version(args);
+    if wild_version_relink_reason(previous.wild_version.as_deref(), &current_wild_version).is_some()
+    {
         return Ok(false);
     }
     if !previous.output.identity_matches_path(args.output())? {
@@ -617,6 +626,7 @@ fn patch_changed_inputs(
     refresh_input_file_identities(&mut input_files);
     PersistedState {
         args_hash: previous.args_hash,
+        wild_version: previous.wild_version,
         output,
         build_id_hashes,
         input_files,
@@ -838,6 +848,7 @@ impl PreparedState {
 
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
+            wild_version: Some(self.current.wild_version.clone()),
             output,
             build_id_hashes,
             input_files,
@@ -863,6 +874,15 @@ fn classify_incremental_mode(
     current: &CurrentState,
     previous: &PersistedState,
 ) -> IncrementalMode {
+    if let Some(reason) =
+        wild_version_relink_reason(previous.wild_version.as_deref(), &current.wild_version)
+    {
+        return IncrementalMode::Relink {
+            reason: reason.to_owned(),
+            can_reuse_unchanged_sections: false,
+        };
+    }
+
     if current.args_hash != previous.args_hash {
         return IncrementalMode::Relink {
             reason: "linker arguments changed".to_owned(),
@@ -953,6 +973,7 @@ impl CurrentState {
         Self {
             state_dir: state_dir_for_output(args.output()),
             args_hash: args_hash(args),
+            wild_version: wild_version(args),
             input_files: fingerprint_loaded_files(file_loader, previous),
         }
     }
@@ -1011,6 +1032,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V12
             && version != STATE_VERSION_V11
             && version != STATE_VERSION_V10
             && version != STATE_VERSION_V9
@@ -1029,6 +1051,17 @@ impl PersistedState {
         }
 
         let args_hash = parse_prefixed_line(lines.next(), "args")?.to_owned();
+        let wild_version = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("wild-version\t"))
+        {
+            Some(parse_prefixed_line(lines.next(), "wild-version")?.to_owned())
+        } else {
+            None
+        };
+        if version == STATE_VERSION && wild_version.is_none() {
+            return Err(crate::error!("Missing Wild version in incremental state"));
+        }
         let output = parse_content_line(lines.next(), "output")?;
         let build_id_hashes = if lines
             .peek()
@@ -1051,6 +1084,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V12
             || version == STATE_VERSION_V11
             || version == STATE_VERSION_V10
             || version == STATE_VERSION_V9
@@ -1096,6 +1130,7 @@ impl PersistedState {
 
         Ok(Self {
             args_hash,
+            wild_version,
             output,
             build_id_hashes,
             input_files,
@@ -1189,6 +1224,9 @@ impl PersistedState {
         let mut out = String::new();
         writeln!(&mut out, "{STATE_VERSION}").unwrap();
         writeln!(&mut out, "args\t{}", self.args_hash).unwrap();
+        if let Some(version) = &self.wild_version {
+            writeln!(&mut out, "wild-version\t{version}").unwrap();
+        }
         writeln!(
             &mut out,
             "output\t{}\t{}\t{}",
@@ -3307,6 +3345,18 @@ fn args_hash(args: &impl platform::Args) -> String {
     hash_text(&format!("{args:?}"))
 }
 
+fn wild_version(args: &impl platform::Args) -> String {
+    args.common().version.to_string()
+}
+
+fn wild_version_relink_reason<'a>(previous: Option<&'a str>, current: &str) -> Option<&'a str> {
+    match previous {
+        Some(previous) if previous == current => None,
+        Some(_) => Some("linker version changed"),
+        None => Some("linker version missing from previous state"),
+    }
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
@@ -3318,6 +3368,7 @@ mod tests {
     fn state(args_hash: &str, output: &[u8], inputs: &[(&str, &[u8])]) -> PersistedState {
         PersistedState {
             args_hash: args_hash.to_owned(),
+            wild_version: Some("wild-test".to_owned()),
             output: FileContentState::from_bytes(output),
             build_id_hashes: None,
             input_files: inputs
@@ -3404,7 +3455,9 @@ mod tests {
             .render()
             .replacen(STATE_VERSION, STATE_VERSION_V8, 1)
             .lines()
-            .filter(|line| !line.starts_with("build-id-hash\t"))
+            .filter(|line| {
+                !line.starts_with("build-id-hash\t") && !line.starts_with("wild-version\t")
+            })
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
@@ -4191,6 +4244,42 @@ mod tests {
     }
 
     #[test]
+    fn v12_state_version_is_accepted_without_wild_version() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V12, 1)
+            .lines()
+            .filter(|line| !line.starts_with("wild-version\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.sections.len(), 1);
+        assert!(parsed.wild_version.is_none());
+    }
+
+    #[test]
+    fn current_state_version_requires_wild_version() {
+        let rendered = state("args", b"output", &[("a.o", b"a")])
+            .render()
+            .lines()
+            .filter(|line| !line.starts_with("wild-version\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let error = PersistedState::parse(&rendered).unwrap_err();
+
+        assert!(error.to_string().contains("Missing Wild version"));
+    }
+
+    #[test]
     fn old_patch_section_metadata_cannot_patch_changed_inputs() {
         let line = format!(
             "input\t{}\t1\t{}\t-\told-patch-hash\t1:4,3:8",
@@ -4482,6 +4571,7 @@ mod tests {
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
 
@@ -4503,6 +4593,7 @@ mod tests {
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
 
@@ -4522,6 +4613,7 @@ mod tests {
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "new-args".to_owned(),
+            wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
 
@@ -4535,6 +4627,53 @@ mod tests {
     }
 
     #[test]
+    fn changed_wild_version_forces_initial_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let previous = state("args", b"output", &[("a.o", b"a")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            wild_version: "new-wild".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "linker version changed"
+        ));
+    }
+
+    #[test]
+    fn missing_wild_version_forces_initial_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::write(&output, b"output").unwrap();
+
+        let mut previous = state("args", b"output", &[("a.o", b"a")]);
+        previous.wild_version = None;
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "linker version missing from previous state"
+        ));
+    }
+
+    #[test]
     fn changed_input_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
@@ -4544,6 +4683,7 @@ mod tests {
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
             input_files: state("args", b"output", &[("a.o", b"b")]).input_files,
         };
 
@@ -4564,6 +4704,7 @@ mod tests {
         let current = CurrentState {
             state_dir: dir.path().join("out.incr"),
             args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
             input_files: previous.input_files.clone(),
         };
 
@@ -4710,6 +4851,7 @@ mod tests {
             current: CurrentState {
                 state_dir: PathBuf::new(),
                 args_hash: "args".to_owned(),
+                wild_version: "wild-test".to_owned(),
                 input_files: Vec::new(),
             },
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
@@ -4740,6 +4882,7 @@ mod tests {
             current: CurrentState {
                 state_dir: PathBuf::new(),
                 args_hash: "args".to_owned(),
+                wild_version: "wild-test".to_owned(),
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
