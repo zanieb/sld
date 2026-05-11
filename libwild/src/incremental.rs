@@ -1545,6 +1545,10 @@ pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
         && !name.starts_with(b".dtors")
 }
 
+pub(crate) fn section_name_allows_incremental_padding(name: &[u8]) -> bool {
+    name.starts_with(b".") && section_name_allows_direct_patching(name)
+}
+
 fn section_direct_patch_preserve_ranges<'data>(
     section: &impl object::ObjectSection<'data>,
     section_data_len: usize,
@@ -4045,6 +4049,16 @@ mod tests {
         assert!(!section_name_allows_direct_patching(b".preinit_array"));
         assert!(!section_name_allows_direct_patching(b".ctors"));
         assert!(!section_name_allows_direct_patching(b".dtors"));
+    }
+
+    #[test]
+    fn start_stop_sections_are_not_padded() {
+        assert!(section_name_allows_incremental_padding(b".text.foo"));
+        assert!(section_name_allows_incremental_padding(b".data.foo"));
+        assert!(!section_name_allows_incremental_padding(b"foo"));
+        assert!(!section_name_allows_incremental_padding(b"bar"));
+        assert!(!section_name_allows_incremental_padding(b".init_array"));
+        assert!(!section_name_allows_incremental_padding(b".eh_frame"));
     }
 
     #[test]
