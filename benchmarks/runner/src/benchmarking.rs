@@ -108,10 +108,13 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
         )?)
         .with_message(message.clone());
 
-        // Ensure the benchmark inputs are in cache.
-        let warmup_bin = bins.last().context("Need at least one binary")?;
-        let warmup_flags = extra_flags_for_run(warmup_bin, bench, false);
-        run_once(warmup_bin, bench, args, &warmup_flags)?;
+        if bins.is_empty() {
+            bail!("Need at least one binary");
+        }
+        for bin in bins {
+            let warmup_flags = extra_flags_for_run(bin, bench, false);
+            run_once(bin, bench, args, &warmup_flags)?;
+        }
 
         let mut bench_results = Vec::new();
         for batch_num in 0..args.num_batches {
@@ -275,8 +278,9 @@ fn run_once(
         return Ok(None);
     }
 
+    let output_path = output_path_for_bin(args.tmp.as_path(), bin);
     let mut command = Command::new(&bench.path);
-    command.env("OUT", args.tmp.as_os_str()).arg(&bin.path);
+    command.env("OUT", output_path.as_os_str()).arg(&bin.path);
     for arg in extra_flags {
         if bin.identifier.kind.supports_arg(arg) {
             command.arg(arg);
@@ -333,6 +337,18 @@ fn run_once(
         stime: res_use.rusage.stime,
         utime: res_use.rusage.utime,
     }))
+}
+
+fn output_path_for_bin(tmp: &Path, bin: &Bin) -> std::path::PathBuf {
+    let suffix = format!(".{}", bin.index);
+    let mut path = tmp.to_owned();
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| "linker-benchmark-out".into());
+    file_name.push(suffix);
+    path.set_file_name(file_name);
+    path
 }
 
 fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> {
@@ -403,10 +419,16 @@ mod tests {
     use super::ensure_relative_path;
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
+    use super::output_path_for_bin;
     use crate::Benchmark;
+    use crate::Bin;
+    use crate::LinkerIdentifier;
+    use crate::LinkerKind;
     use crate::config::BenchConfig;
     use crate::config::Mutation;
     use object::Object as _;
+    use std::path::Path;
+    use std::path::PathBuf;
 
     #[test]
     fn mutation_paths_must_be_save_dir_relative() {
@@ -458,5 +480,25 @@ mod tests {
         mutate_elf_section_byte(&path, ".data").unwrap();
 
         assert_ne!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn benchmark_output_paths_are_isolated_by_linker() {
+        let bin = Bin {
+            index: 7,
+            path: PathBuf::from("/bin/wild"),
+            identifier: LinkerIdentifier {
+                kind: LinkerKind::Wild,
+                version: "wild 0.0.0".to_owned(),
+                variant: None,
+                hash: None,
+                effective_version: vec![0, 0, 0],
+            },
+        };
+
+        assert_eq!(
+            output_path_for_bin(Path::new("/tmp/linker-benchmark-out"), &bin),
+            PathBuf::from("/tmp/linker-benchmark-out.7")
+        );
     }
 }
