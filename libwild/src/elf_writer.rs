@@ -3171,6 +3171,11 @@ fn apply_relocation<
 
     if let Some(source_section_index) = section_info.source_section_index {
         let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
+        let target_name = layout
+            .symbol_db
+            .symbol_name(target_symbol_id)
+            .ok()
+            .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
         let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
             .context("Incremental relocation target symbol ID overflow")?;
         incremental.record_relocation(
@@ -3182,6 +3187,8 @@ fn apply_relocation<
             relocation_record_size(&rel_info) as u64,
             r_type,
             addend,
+            resolution.raw_value,
+            target_name,
         );
     }
 

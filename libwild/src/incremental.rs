@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v23";
+const STATE_VERSION: &str = "wild-incremental-state-v24";
+const STATE_VERSION_V23: &str = "wild-incremental-state-v23";
 const STATE_VERSION_V22: &str = "wild-incremental-state-v22";
 const STATE_VERSION_V21: &str = "wild-incremental-state-v21";
 const STATE_VERSION_V20: &str = "wild-incremental-state-v20";
@@ -191,6 +192,8 @@ pub(crate) struct SectionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationRecord {
     target_symbol_id: u32,
+    target_value: u64,
+    target_name: Option<String>,
     input_file: String,
     input: String,
     section_index: u32,
@@ -1318,6 +1321,8 @@ impl PreparedState {
         size: u64,
         kind: u32,
         addend: i64,
+        target_value: u64,
+        target_name: Option<String>,
     ) {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
@@ -1334,6 +1339,8 @@ impl PreparedState {
                 size,
                 kind,
                 addend,
+                target_value,
+                target_name,
             ));
     }
 
@@ -1640,6 +1647,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V23
             && version != STATE_VERSION_V22
             && version != STATE_VERSION_V21
             && version != STATE_VERSION_V20
@@ -1731,6 +1739,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V23
             || version == STATE_VERSION_V22
             || version == STATE_VERSION_V21
             || version == STATE_VERSION_V20
@@ -2005,7 +2014,7 @@ impl PersistedState {
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
             writeln!(
                 &mut out,
-                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
                 relocation.target_symbol_id,
@@ -2013,7 +2022,9 @@ impl PersistedState {
                 relocation.output_offset,
                 relocation.size,
                 relocation.kind,
-                relocation.addend
+                relocation.addend,
+                relocation.target_value,
+                relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD)
             )
             .unwrap();
         }
@@ -2138,9 +2149,13 @@ impl RelocationRecord {
         size: u64,
         kind: u32,
         addend: i64,
+        target_value: u64,
+        target_name: Option<String>,
     ) -> Self {
         Self {
             target_symbol_id,
+            target_value,
+            target_name,
             input_file: encode_path(&input.file.filename),
             input: encode_input_ref(input),
             section_index: section_index.0 as u32,
@@ -4974,55 +4989,73 @@ fn parse_compact_relocation_line(
     section_inputs: &[(String, String)],
 ) -> Result<RelocationRecord> {
     let rest = parse_prefixed_line(Some(line), "reloc")?;
-    let mut parts = rest.split('\t');
+    let parts = rest.split('\t').collect::<Vec<_>>();
     let section_input_id: usize = parts
-        .next()
+        .first()
+        .copied()
         .context("Malformed incremental relocation input index")?
         .parse()
         .context("Invalid incremental relocation input index")?;
     let section_index = parts
-        .next()
+        .get(1)
+        .copied()
         .context("Malformed incremental relocation section index")?
         .parse()
         .context("Invalid incremental relocation section index")?;
     let target_symbol_id = parts
-        .next()
+        .get(2)
+        .copied()
         .context("Malformed incremental relocation target symbol")?
         .parse()
         .context("Invalid incremental relocation target symbol")?;
     let relocation_offset = parts
-        .next()
+        .get(3)
+        .copied()
         .context("Malformed incremental relocation input offset")?
         .parse()
         .context("Invalid incremental relocation input offset")?;
     let output_offset = parts
-        .next()
+        .get(4)
+        .copied()
         .context("Malformed incremental relocation output offset")?
         .parse()
         .context("Invalid incremental relocation output offset")?;
     let size = parts
-        .next()
+        .get(5)
+        .copied()
         .context("Malformed incremental relocation size")?
         .parse()
         .context("Invalid incremental relocation size")?;
     let kind = parts
-        .next()
+        .get(6)
+        .copied()
         .context("Malformed incremental relocation kind")?
         .parse()
         .context("Invalid incremental relocation kind")?;
     let addend = parts
-        .next()
+        .get(7)
+        .copied()
         .context("Malformed incremental relocation addend")?
         .parse()
         .context("Invalid incremental relocation addend")?;
-    if parts.next().is_some() {
-        return Err(crate::error!("Malformed incremental relocation record"));
-    }
+    let (target_value, target_name) = match parts.len() {
+        8 => (0, None),
+        10 => {
+            let target_value = parts[8]
+                .parse()
+                .context("Invalid incremental relocation target value")?;
+            let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
+            (target_value, target_name)
+        }
+        _ => return Err(crate::error!("Malformed incremental relocation record")),
+    };
     let (input_file, input) = section_inputs
         .get(section_input_id)
         .context("Incremental relocation input index out of bounds")?;
     Ok(RelocationRecord {
         target_symbol_id,
+        target_value,
+        target_name,
         input_file: input_file.clone(),
         input: input.clone(),
         section_index,
@@ -5671,6 +5704,8 @@ mod tests {
         input: &str,
         section_index: u32,
         target_symbol_id: u32,
+        target_value: u64,
+        target_name: Option<&str>,
         relocation_offset: u64,
         output_offset: u64,
         size: u64,
@@ -5679,6 +5714,8 @@ mod tests {
     ) -> RelocationRecord {
         RelocationRecord {
             target_symbol_id,
+            target_value,
+            target_name: target_name.map(hex::encode),
             input_file: hex::encode(input),
             input: hex::encode(input),
             section_index,
@@ -7469,15 +7506,63 @@ mod tests {
     fn persisted_state_round_trips_relocation_records() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
-        state
-            .relocations
-            .push(relocation_record("a.o", 1, 42, 8, 300, 8, 1, -4));
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            42,
+            0x1234,
+            Some("target"),
+            8,
+            300,
+            8,
+            1,
+            -4,
+        ));
 
         let rendered = state.render();
 
         assert!(rendered.contains("\nrelocs\t1\n"));
-        assert!(rendered.contains("\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\n"));
+        assert!(rendered.contains("\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t4660\t746172676574\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v23_state_version_is_accepted_without_relocation_target_metadata() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            42,
+            0x1234,
+            Some("target"),
+            8,
+            300,
+            8,
+            1,
+            -4,
+        ));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V23, 1)
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("reloc\t") {
+                    let fields = rest.split('\t').take(8).collect::<Vec<_>>().join("\t");
+                    format!("reloc\t{fields}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.relocations.len(), 1);
+        assert_eq!(parsed.relocations[0].target_value, 0);
+        assert_eq!(parsed.relocations[0].target_name, None);
     }
 
     #[test]
@@ -9001,8 +9086,30 @@ mod tests {
             reused_sections: AtomicUsize::new(0),
         };
 
-        state.record_relocation(input, object::SectionIndex(3), 42, 8, 256, 4, 2, -16);
-        state.record_relocation(input, object::SectionIndex(3), 43, 16, 280, 0, 2, 0);
+        state.record_relocation(
+            input,
+            object::SectionIndex(3),
+            42,
+            8,
+            256,
+            4,
+            2,
+            -16,
+            0x1234,
+            Some(hex::encode("target")),
+        );
+        state.record_relocation(
+            input,
+            object::SectionIndex(3),
+            43,
+            16,
+            280,
+            0,
+            2,
+            0,
+            0x5678,
+            None,
+        );
 
         assert_eq!(
             *state.current_relocations.lock().unwrap(),
@@ -9014,7 +9121,9 @@ mod tests {
                 256,
                 4,
                 2,
-                -16
+                -16,
+                0x1234,
+                Some(hex::encode("target"))
             )]
         );
     }
