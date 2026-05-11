@@ -1721,6 +1721,13 @@ fn record_patch_fingerprints(
             input.patch = None;
             continue;
         };
+        if input
+            .patch
+            .as_ref()
+            .is_some_and(|patch| patch_state_matches_section_records(patch, sections))
+        {
+            continue;
+        }
         let Some(input_file) = loaded_by_path.get(&input.path) else {
             input.patch = None;
             continue;
@@ -1749,6 +1756,44 @@ fn record_patch_fingerprints(
     }
 
     Ok(())
+}
+
+fn patch_state_matches_section_records(
+    patch: &FilePatchState,
+    sections: &[&SectionRecord],
+) -> bool {
+    if patch.sections.is_empty() || patch.sections.len() != sections.len() {
+        return false;
+    }
+
+    let mut patch_sections = patch
+        .sections
+        .iter()
+        .map(|section| {
+            (
+                section.input.as_str(),
+                section.section_index,
+                section.output_offset,
+                section.output_size,
+            )
+        })
+        .collect::<Vec<_>>();
+    patch_sections.sort();
+
+    let mut section_records = sections
+        .iter()
+        .map(|section| {
+            (
+                section.input.as_str(),
+                section.section_index,
+                section.output_offset,
+                section.size,
+            )
+        })
+        .collect::<Vec<_>>();
+    section_records.sort();
+
+    patch_sections == section_records
 }
 
 fn direct_copy_patch_sections<'a>(
@@ -4836,6 +4881,98 @@ mod tests {
             hex::encode("a.o"),
         )));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn patch_state_matches_current_section_records() {
+        let patch = FilePatchState {
+            fingerprint: "patch-hash".to_owned(),
+            sections: vec![
+                FilePatchSectionState {
+                    input: hex::encode("a.o"),
+                    section_index: 3,
+                    section_name: Some(".text.a".to_owned()),
+                    input_size: 4,
+                    output_offset: 200,
+                    output_size: 8,
+                },
+                FilePatchSectionState {
+                    input: hex::encode("a.o"),
+                    section_index: 1,
+                    section_name: Some(".data.a".to_owned()),
+                    input_size: 4,
+                    output_offset: 100,
+                    output_size: 4,
+                },
+            ],
+        };
+        let first = section_record("a.o", 1, 100, 4);
+        let second = section_record("a.o", 3, 200, 8);
+        let moved = section_record("a.o", 3, 208, 8);
+
+        assert!(patch_state_matches_section_records(
+            &patch,
+            &[&second, &first]
+        ));
+        assert!(!patch_state_matches_section_records(
+            &patch,
+            &[&first, &moved]
+        ));
+    }
+
+    #[test]
+    fn record_patch_fingerprints_preserves_matching_existing_patch() {
+        let arena = colosseum::sync::Arena::new();
+        let file_loader = FileLoader::new(&arena);
+        let mut input_files = vec![FileState {
+            path: hex::encode("a.o"),
+            content: FileContentState::from_bytes(b"a"),
+            patch: Some(FilePatchState {
+                fingerprint: "patch-hash".to_owned(),
+                sections: vec![FilePatchSectionState {
+                    input: hex::encode("a.o"),
+                    section_index: 1,
+                    section_name: Some(".data.a".to_owned()),
+                    input_size: 4,
+                    output_offset: 100,
+                    output_size: 4,
+                }],
+            }),
+        }];
+        let sections = vec![section_record("a.o", 1, 100, 4)];
+
+        record_patch_fingerprints(&mut input_files, &file_loader, &sections, b"").unwrap();
+
+        assert_eq!(
+            input_files[0].patch.as_ref().unwrap().fingerprint,
+            "patch-hash"
+        );
+    }
+
+    #[test]
+    fn record_patch_fingerprints_clears_stale_patch_without_loaded_input() {
+        let arena = colosseum::sync::Arena::new();
+        let file_loader = FileLoader::new(&arena);
+        let mut input_files = vec![FileState {
+            path: hex::encode("a.o"),
+            content: FileContentState::from_bytes(b"a"),
+            patch: Some(FilePatchState {
+                fingerprint: "patch-hash".to_owned(),
+                sections: vec![FilePatchSectionState {
+                    input: hex::encode("a.o"),
+                    section_index: 1,
+                    section_name: Some(".data.a".to_owned()),
+                    input_size: 4,
+                    output_offset: 100,
+                    output_size: 4,
+                }],
+            }),
+        }];
+        let sections = vec![section_record("a.o", 1, 108, 4)];
+
+        record_patch_fingerprints(&mut input_files, &file_loader, &sections, b"").unwrap();
+
+        assert!(input_files[0].patch.is_none());
     }
 
     #[test]
