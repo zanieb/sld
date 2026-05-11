@@ -7,6 +7,7 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedInput:incremental-relocated-data.c.o
 //#TestIncrementalChangedSection:.data.rel.local.incremental_relocated
+//#TestIncrementalStateContains:reloc\t
 //#Config:relocation-metadata:incremental-relocated-data
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections

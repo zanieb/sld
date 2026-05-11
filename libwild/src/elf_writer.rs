@@ -2045,6 +2045,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             table_writer,
             trace,
             incremental,
+            written.output_offset,
             out,
         );
     }
@@ -2058,6 +2059,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             object,
             out,
             section_index,
+            written.output_offset,
             rela.iter().map(|rela| Ok(*rela)),
             layout,
             table_writer,
@@ -2068,6 +2070,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
             object,
             out,
             section_index,
+            written.output_offset,
             crel_iter,
             layout,
             table_writer,
@@ -2096,6 +2099,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
     incremental: &PreparedState,
+    output_offset: u64,
     out: &mut [u8],
 ) -> Result {
     const WORD_SIZE: usize = core::mem::size_of::<u64>();
@@ -2121,6 +2125,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
             object,
             out,
             section_index,
+            output_offset,
             rela.iter().map(|r| {
                 let mut crel = Crel::from_rela(r, LittleEndian, false);
                 crel.r_offset = section_size.saturating_sub(crel.r_offset + WORD_SIZE as u64);
@@ -2135,6 +2140,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
             object,
             out,
             section_index,
+            output_offset,
             crel_iter.map(|r| {
                 r.map(|mut crel| {
                     crel.r_offset = section_size.saturating_sub(crel.r_offset + WORD_SIZE as u64);
@@ -2228,6 +2234,7 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
 
 struct WrittenSection<'out> {
     bytes: &'out mut [u8],
+    output_offset: u64,
     reused: bool,
 }
 
@@ -2277,6 +2284,7 @@ fn write_section_raw<'out, 'data>(
         ) {
             return Ok(WrittenSection {
                 bytes: &mut [],
+                output_offset: output_offset as u64,
                 reused: true,
             });
         }
@@ -2291,6 +2299,7 @@ fn write_section_raw<'out, 'data>(
                 padding.fill(0);
                 Ok(WrittenSection {
                     bytes: out,
+                    output_offset: output_offset as u64,
                     reused: false,
                 })
             }
@@ -2325,6 +2334,7 @@ fn write_section_raw<'out, 'data>(
 
                 Ok(WrittenSection {
                     bytes: &mut out[..effective_size],
+                    output_offset: output_offset as u64,
                     reused: false,
                 })
             }
@@ -2332,6 +2342,7 @@ fn write_section_raw<'out, 'data>(
     } else {
         Ok(WrittenSection {
             bytes: &mut [],
+            output_offset: 0,
             reused: false,
         })
     }
@@ -2468,6 +2479,7 @@ fn apply_relocations<
     object: &ObjectLayout<'data, Elf>,
     out: &mut [u8],
     section_index: object::SectionIndex,
+    section_output_offset: u64,
     mut relocations: I,
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter,
@@ -2518,6 +2530,7 @@ fn apply_relocations<
                 section_flags,
                 part_id: object.section_part_id(section_index, &layout.symbol_db.section_part_ids),
                 source_section_index: Some(section_index),
+                section_output_offset,
             },
             layout,
             out,
@@ -2787,6 +2800,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
                         // base part as a placeholder so the thunk lookup always misses.
                         part_id: output_section_id::EH_FRAME.base_part_id(),
                         source_section_index: None,
+                        section_output_offset: output_file_offset,
                     },
                     layout,
                     entry_out,
@@ -2889,6 +2903,7 @@ struct SectionInfo<S: platform::SectionFlags> {
     section_flags: S,
     part_id: crate::part_id::PartId,
     source_section_index: Option<object::SectionIndex>,
+    section_output_offset: u64,
 }
 
 fn get_resolution<'data, R: Relocation>(
@@ -3030,6 +3045,13 @@ fn adjust_relocation_based_on_value(
     }
 }
 
+fn relocation_record_size(rel_info: &RelocationKindInfo) -> usize {
+    match rel_info.size {
+        RelocationSize::ByteSize(size) => size,
+        RelocationSize::BitMasking(mask) => mask.instruction.write_windows_size(),
+    }
+}
+
 #[inline(always)]
 fn get_pair_subtraction_relocation_value<'data, A: Arch<Platform = Elf>, R: Relocation>(
     object_layout: &ObjectLayout<'data, Elf>,
@@ -3145,6 +3167,22 @@ fn apply_relocation<
         next_modifier = relaxation.next_modifier();
     } else {
         rel_info = A::relocation_from_raw(r_type)?;
+    }
+
+    if let Some(source_section_index) = section_info.source_section_index {
+        let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
+        let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
+            .context("Incremental relocation target symbol ID overflow")?;
+        incremental.record_relocation(
+            object_layout.input,
+            source_section_index,
+            target_symbol_id,
+            rel.offset(),
+            section_info.section_output_offset + offset_in_section,
+            relocation_record_size(&rel_info) as u64,
+            r_type,
+            addend,
+        );
     }
 
     // Compute place to which IP-relative relocations will be relative. This is different to
