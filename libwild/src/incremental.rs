@@ -40,6 +40,7 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
+const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const SECTIONS_FILE: &str = "sections";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
@@ -302,13 +303,13 @@ fn patch_changed_inputs(
             return Ok(false);
         }
 
-        let content = FileContentState::from_path_identity_only(path).with_context(|| {
-            format!(
-                "Failed to record changed incremental input `{}`",
-                path.display()
-            )
-        })?;
-        input_files[*input_index].content = content;
+        input_files[*input_index].content = FileContentState::from_path_identity_only(path)
+            .with_context(|| {
+                format!(
+                    "Failed to record changed incremental input `{}`",
+                    path.display()
+                )
+            })?;
         input_files[*input_index].patch = Some(previous_patch.clone());
 
         patches.extend(patch_sections(&bytes, sections.iter().copied())?);
@@ -389,6 +390,11 @@ fn patch_changed_inputs(
         )
     })?;
     write_build_id_hash_tree(state_dir, build_id_tree.as_deref())?;
+    snapshot_input_paths(
+        state_dir,
+        changed_inputs.iter().map(|(_, path)| path.as_path()),
+    )?;
+    refresh_input_file_identities(&mut input_files);
     PersistedState {
         args_hash: previous.args_hash,
         output,
@@ -514,7 +520,7 @@ impl PreparedState {
     pub(crate) fn finish(
         &self,
         args: &impl platform::Args,
-        _file_loader: &FileLoader<'_>,
+        file_loader: &FileLoader<'_>,
     ) -> Result {
         if self.mode == IncrementalMode::Disabled {
             return Ok(());
@@ -548,7 +554,9 @@ impl PreparedState {
         sections.sort();
 
         let mut input_files = self.current.input_files.clone();
-        record_patch_fingerprints(&mut input_files, _file_loader, &sections, &output_bytes)?;
+        record_patch_fingerprints(&mut input_files, file_loader, &sections, &output_bytes)?;
+        snapshot_loaded_files(&self.current.state_dir, file_loader)?;
+        refresh_input_file_identities(&mut input_files);
 
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
@@ -2019,6 +2027,97 @@ fn parse_compact_section_line(
     })
 }
 
+fn snapshot_loaded_files(state_dir: &Path, file_loader: &FileLoader<'_>) -> Result<usize> {
+    snapshot_input_paths(
+        state_dir,
+        file_loader
+            .loaded_files
+            .iter()
+            .map(|input_file| input_file.filename.as_path()),
+    )
+}
+
+fn refresh_input_file_identities(input_files: &mut [FileState]) {
+    for input in input_files {
+        let Ok(path) = decode_path(&input.path) else {
+            continue;
+        };
+        let Ok(Some(identity)) = FileIdentity::from_path(&path) else {
+            continue;
+        };
+        input.content.len = identity.len;
+        input.content.identity = Some(identity);
+    }
+}
+
+fn snapshot_input_paths<'a>(
+    state_dir: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<usize> {
+    let mut seen = HashSet::new();
+    let mut snapshotted = 0;
+    for path in paths {
+        if !seen.insert(encode_path(path)) {
+            continue;
+        }
+        if snapshot_input_path(state_dir, path)? {
+            snapshotted += 1;
+        }
+    }
+    Ok(snapshotted)
+}
+
+fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false),
+    };
+    if !metadata.is_file() || metadata.permissions().readonly() {
+        return Ok(false);
+    }
+
+    let snapshot_dir = input_snapshot_dir(state_dir);
+    std::fs::create_dir_all(&snapshot_dir).with_context(|| {
+        format!(
+            "Failed to create incremental input snapshot directory `{}`",
+            snapshot_dir.display()
+        )
+    })?;
+
+    let target = input_snapshot_path(state_dir, path);
+    let tmp = target.with_file_name(format!(
+        "{}.{}.tmp",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("input"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+
+    if std::fs::hard_link(path, &tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+
+    let _ = std::fs::remove_file(&target);
+    std::fs::rename(&tmp, &target).with_context(|| {
+        format!(
+            "Failed to install incremental input snapshot `{}`",
+            target.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
+    input_snapshot_dir(state_dir).join(hash_text(&encode_path(path)))
+}
+
+fn input_snapshot_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(INPUT_SNAPSHOT_DIR)
+}
+
 fn append_log(state_dir: &Path, message: &str) -> Result {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(LOG_FILE);
@@ -2356,6 +2455,68 @@ mod tests {
 
         assert!(
             out.contains("\ttarget/debug/app.incr\tfull relink: no previous incremental state\n")
+        );
+    }
+
+    #[test]
+    fn input_snapshot_path_is_stable_for_input_path() {
+        let state_dir = Path::new("target/debug/app.incr");
+        assert_eq!(
+            input_snapshot_path(state_dir, Path::new("obj/main.o")),
+            input_snapshot_path(state_dir, Path::new("obj/main.o"))
+        );
+        assert_ne!(
+            input_snapshot_path(state_dir, Path::new("obj/main.o")),
+            input_snapshot_path(state_dir, Path::new("obj/other.o"))
+        );
+    }
+
+    #[test]
+    fn input_snapshots_are_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+        let mut input_files = vec![FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            patch: None,
+        }];
+
+        assert_eq!(
+            snapshot_input_paths(&state_dir, [input.as_path()]).unwrap(),
+            1
+        );
+        refresh_input_file_identities(&mut input_files);
+
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
+        assert!(
+            input_files[0]
+                .content
+                .identity_matches_path(&input)
+                .unwrap()
+        );
+
+        #[cfg(unix)]
+        {
+            let input_metadata = std::fs::metadata(&input).unwrap();
+            let snapshot_metadata = std::fs::metadata(&snapshot).unwrap();
+            assert_eq!(input_metadata.dev(), snapshot_metadata.dev());
+            assert_eq!(input_metadata.ino(), snapshot_metadata.ino());
+        }
+    }
+
+    #[test]
+    fn input_snapshots_deduplicate_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+
+        assert_eq!(
+            snapshot_input_paths(&state_dir, [input.as_path(), input.as_path()]).unwrap(),
+            1
         );
     }
 
