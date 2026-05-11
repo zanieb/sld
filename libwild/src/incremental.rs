@@ -378,7 +378,7 @@ fn patch_changed_inputs(
             )
         })?;
 
-        let (fingerprint, current_sections, resolved_patches) = {
+        let (fingerprint, matched_sections, current_sections, resolved_patches) = {
             let input = &previous.input_files[*input_index];
             let Some(previous_patch) = input.patch.as_ref() else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
@@ -502,9 +502,22 @@ fn patch_changed_inputs(
                 }
             }
 
-            (fingerprint, current_sections, resolved_patches)
+            (
+                fingerprint,
+                matched_sections,
+                current_sections,
+                resolved_patches,
+            )
         };
 
+        let sections_changed = update_section_records_for_matched_patches(
+            previous.input_files[*input_index].path.as_str(),
+            &matched_sections,
+            &mut previous.sections,
+        );
+        if sections_changed {
+            previous.sections_file = None;
+        }
         previous.input_files[*input_index].content =
             FileContentState::from_path_identity_only(path).with_context(|| {
                 format!(
@@ -763,6 +776,40 @@ impl MatchedPatchSection {
             current: section,
         }
     }
+}
+
+fn update_section_records_for_matched_patches(
+    input_file: &str,
+    matched_sections: &[MatchedPatchSection],
+    records: &mut [SectionRecord],
+) -> bool {
+    let mut changed = false;
+    for matched in matched_sections {
+        let Some(record) = records.iter_mut().find(|record| {
+            record.input_file == input_file
+                && record.input == matched.previous.input
+                && record.section_index == matched.previous.section_index
+                && record.output_offset == matched.previous.output_offset
+                && record.size == matched.previous.output_size
+        }) else {
+            continue;
+        };
+
+        if record.input == matched.current.input
+            && record.section_index == matched.current.section_index
+            && record.output_offset == matched.current.output_offset
+            && record.size == matched.current.output_size
+        {
+            continue;
+        }
+
+        record.input = matched.current.input.clone();
+        record.section_index = matched.current.section_index;
+        record.output_offset = matched.current.output_offset;
+        record.size = matched.current.output_size;
+        changed = true;
+    }
+    changed
 }
 
 impl PreparedState {
@@ -3917,6 +3964,55 @@ mod tests {
             match_section_by_references(&signature, &current_references),
             None
         );
+    }
+
+    #[test]
+    fn patched_section_records_follow_current_section_identity() {
+        let input_file = hex::encode("input.o");
+        let input_ref = input_file.clone();
+        let unrelated_input = hex::encode("other.o");
+        let mut records = vec![
+            SectionRecord {
+                input_file: input_file.clone(),
+                input: input_ref.clone(),
+                section_index: 3,
+                output_offset: 64,
+                size: 16,
+            },
+            SectionRecord {
+                input_file: unrelated_input,
+                input: input_ref.clone(),
+                section_index: 3,
+                output_offset: 64,
+                size: 16,
+            },
+        ];
+        let previous = PatchSection {
+            input: input_ref.clone(),
+            section_index: 3,
+            section_name: None,
+            input_size: 8,
+            output_offset: 64,
+            output_size: 16,
+        };
+        let current = PatchSection {
+            input: input_ref.clone(),
+            section_index: 7,
+            section_name: None,
+            input_size: 9,
+            output_offset: 64,
+            output_size: 16,
+        };
+
+        assert!(update_section_records_for_matched_patches(
+            &input_file,
+            &[MatchedPatchSection { previous, current }],
+            &mut records,
+        ));
+
+        assert_eq!(records[0].section_index, 7);
+        assert_eq!(records[0].size, 16);
+        assert_eq!(records[1].section_index, 3);
     }
 
     #[test]
