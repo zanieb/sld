@@ -1607,9 +1607,10 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let object::SectionFlags::Elf { sh_flags } = flags else {
         return false;
     };
-    let allocated = sh_flags & u64::from(object::elf::SHF_ALLOC) != 0;
-    let content_ordered = sh_flags & u64::from(object::elf::SHF_MERGE) != 0;
-    allocated && !content_ordered
+    // Sections that Wild actually merges are written by the merge-strings path, so they don't
+    // produce direct-copy patch records. Merge-flagged sections that reach this point were copied
+    // directly, for example under --no-string-merge.
+    sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
 }
 
 pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
@@ -4132,7 +4133,7 @@ mod tests {
     }
 
     #[test]
-    fn strictly_ordered_or_no_gap_sections_are_not_directly_patchable() {
+    fn special_ordered_sections_are_not_directly_patchable() {
         assert!(section_name_allows_direct_patching(b".text.foo"));
         assert!(section_name_allows_direct_patching(b".data.foo"));
         assert!(!section_name_allows_direct_patching(b".eh_frame"));
@@ -4729,7 +4730,7 @@ mod tests {
     }
 
     #[test]
-    fn patchable_sections_are_allocated_but_not_mergeable() {
+    fn patchable_sections_must_be_allocated() {
         let data = object::SectionFlags::Elf {
             sh_flags: u64::from(object::elf::SHF_ALLOC | object::elf::SHF_WRITE),
         };
@@ -4751,7 +4752,7 @@ mod tests {
         assert!(section_flags_allow_patching(data));
         assert!(section_flags_allow_patching(text));
         assert!(section_flags_allow_patching(rodata));
-        assert!(!section_flags_allow_patching(mergeable));
+        assert!(section_flags_allow_patching(mergeable));
         assert!(!section_flags_allow_patching(non_alloc));
         assert!(!section_flags_allow_patching(object::SectionFlags::None));
     }

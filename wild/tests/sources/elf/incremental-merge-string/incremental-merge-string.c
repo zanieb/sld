@@ -8,6 +8,9 @@
 //#TestIncrementalChangedFallbackReason:missing patch metadata
 //#TestIncrementalChangedInput:incremental-merge-string-value.s.o
 //#TestIncrementalChangedSection:.rodata.str1.1
+//#Config:no-string-merge:incremental-merge-string
+//#WildExtraLinkArgs:--no-string-merge
+//#TestIncrementalChangedExpectPatch:true
 
 extern const char incremental_merge_string_value[];
 
