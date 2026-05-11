@@ -157,6 +157,9 @@
 //! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
 //! then checking that the changed-input incremental link matches a full relink.
 //!
+//! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
+//! Defaults to the last linker input.
+//!
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
 //! to .data.
 //!
@@ -761,6 +764,7 @@ struct Config {
     test_update_in_place: bool,
     test_incremental: bool,
     test_incremental_changed: bool,
+    test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
@@ -1332,6 +1336,7 @@ impl Config {
             test_update_in_place: false,
             test_incremental: false,
             test_incremental_changed: false,
+            test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
             test_config: test_config.clone(),
             tracked_files: Default::default(),
@@ -1707,6 +1712,9 @@ fn process_directive(
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChangedInput" => {
+            config.test_incremental_changed_input = Some(arg.to_owned());
+        }
         "TestIncrementalChangedSection" => {
             arg.clone_into(&mut config.test_incremental_changed_section);
         }
@@ -2033,12 +2041,31 @@ impl ProgramInputs {
         }
 
         if config.test_incremental_changed {
-            let changed_input = inputs.last().with_context(|| {
-                format!(
-                    "Incremental changed-input test for {} needs at least one input",
-                    self.name()
-                )
-            })?;
+            let changed_input =
+                if let Some(expected_name) = config.test_incremental_changed_input.as_deref() {
+                    inputs
+                        .iter()
+                        .find(|input| {
+                            input
+                                .path
+                                .file_name()
+                                .is_some_and(|name| name == expected_name)
+                        })
+                        .with_context(|| {
+                            format!(
+                                "Incremental changed-input test for {} could not find input `{}`",
+                                self.name(),
+                                expected_name
+                            )
+                        })?
+                } else {
+                    inputs.last().with_context(|| {
+                        format!(
+                            "Incremental changed-input test for {} needs at least one input",
+                            self.name()
+                        )
+                    })?
+                };
             if inputs.len() < 2 {
                 bail!(
                     "Incremental changed-input test for {} needs at least two inputs",
@@ -2095,6 +2122,14 @@ impl ProgramInputs {
                     log
                 );
             }
+            if !log.contains("patched 1 changed input sections before loading inputs") {
+                bail!(
+                    "Incremental test failed for {}: changed-input relink did not narrow the \
+                    update to the changed section. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
         }
 
         Ok(())
@@ -2118,8 +2153,9 @@ fn rewrite_file_with_same_contents(path: &Path) -> Result {
 }
 
 fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
-    let mut bytes =
+    let original =
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let mut bytes = original.clone();
     let (offset, len) = {
         let file = object::File::parse(bytes.as_slice())
             .with_context(|| format!("Failed to parse `{}` as an object file", path.display()))?;
@@ -2138,8 +2174,23 @@ fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
     let index =
         usize::try_from(offset).with_context(|| format!("Invalid {section_name} offset"))?;
     bytes[index] = bytes[index].wrapping_add(1);
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write mutated object `{}`", path.display()))?;
+    let tmp_path = append_to_path(path, ".mutated");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write mutated object `{}`", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to replace `{}` with mutated object `{}`",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    let mutated =
+        std::fs::read(path).with_context(|| format!("Failed to reread `{}`", path.display()))?;
+    ensure!(
+        mutated != original,
+        "Mutation did not change `{}`",
+        path.display()
+    );
     Ok(())
 }
 
