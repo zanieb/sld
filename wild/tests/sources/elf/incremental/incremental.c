@@ -3,6 +3,7 @@
 //#RunEnabled:false
 //#DiffEnabled:false
 //#TestIncremental:true
+//#TestIncrementalInterrupted:true
 //#TestIncrementalChanged:true
 
 volatile int incremental_value = 42;

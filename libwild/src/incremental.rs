@@ -50,6 +50,7 @@ const GLOBAL_LOG_FILE: &str = "incremental.log";
 const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
+const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
@@ -282,6 +283,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     timing_phase!("Check incremental fast path");
 
     let state_dir = state_dir_for_output(args.output());
+    if let Some(reason) = interrupted_update_relink_reason(&state_dir) {
+        append_log(
+            &state_dir,
+            &format!("incremental fast path unavailable before loading inputs: {reason}"),
+        )?;
+        return Ok(false);
+    }
+
     let Some(mut previous) = PersistedState::read_metadata(&state_dir).unwrap_or_default() else {
         return Ok(false);
     };
@@ -597,6 +606,8 @@ fn patch_changed_inputs(
         build_id_hashes = Some(previous_hashes.clone());
     }
 
+    mark_incremental_update_started(state_dir, "patch changed inputs")?;
+
     let mut patched_ranges = Vec::new();
     for mut patch in patches {
         let start = patch.output_offset as usize;
@@ -676,6 +687,7 @@ fn patch_changed_inputs(
         sections_file: previous.sections_file,
     }
     .write_metadata_update(state_dir)?;
+    clear_incremental_update_marker(state_dir)?;
 
     append_log(
         state_dir,
@@ -962,6 +974,13 @@ fn update_matched_patch_current_sections(
 }
 
 impl PreparedState {
+    pub(crate) fn begin_update(&self) -> Result {
+        if self.mode == IncrementalMode::Disabled {
+            return Ok(());
+        }
+        mark_incremental_update_started(&self.current.state_dir, "link output")
+    }
+
     pub(crate) fn can_reuse_output(&self) -> bool {
         self.mode == IncrementalMode::Reuse
     }
@@ -1065,6 +1084,7 @@ impl PreparedState {
 
         write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
         state.write(&self.current.state_dir)?;
+        clear_incremental_update_marker(&self.current.state_dir)?;
         let reused = self.reused_sections.load(Ordering::Relaxed);
         if reused > 0 {
             append_log(
@@ -1081,6 +1101,13 @@ fn classify_incremental_mode(
     current: &CurrentState,
     previous: &PersistedState,
 ) -> IncrementalMode {
+    if let Some(reason) = interrupted_update_relink_reason(&current.state_dir) {
+        return IncrementalMode::Relink {
+            reason,
+            can_reuse_unchanged_sections: false,
+        };
+    }
+
     if let Some(reason) =
         wild_version_relink_reason(previous.wild_version.as_deref(), &current.wild_version)
     {
@@ -3692,6 +3719,45 @@ fn input_snapshot_dir(state_dir: &Path) -> PathBuf {
     state_dir.join(INPUT_SNAPSHOT_DIR)
 }
 
+fn interrupted_update_relink_reason(state_dir: &Path) -> Option<String> {
+    match update_marker_path(state_dir).try_exists() {
+        Ok(true) => Some("previous incremental update did not complete".to_owned()),
+        Ok(false) => None,
+        Err(error) => Some(format!(
+            "previous incremental update status could not be checked: {error:?}"
+        )),
+    }
+}
+
+fn mark_incremental_update_started(state_dir: &Path, operation: &str) -> Result {
+    std::fs::create_dir_all(state_dir)?;
+    let path = update_marker_path(state_dir);
+    std::fs::write(&path, format!("{operation}\n")).with_context(|| {
+        format!(
+            "Failed to write incremental update marker `{}`",
+            path.display()
+        )
+    })
+}
+
+fn clear_incremental_update_marker(state_dir: &Path) -> Result {
+    let path = update_marker_path(state_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to remove incremental update marker `{}`",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn update_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(UPDATE_MARKER_FILE)
+}
+
 fn append_log(state_dir: &Path, message: &str) -> Result {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(LOG_FILE);
@@ -5729,6 +5795,34 @@ mod tests {
             classify_incremental_mode(&output, &current, &previous),
             IncrementalMode::Reuse
         );
+    }
+
+    #[test]
+    fn interrupted_update_marker_forces_initial_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let state_dir = dir.path().join("out.incr");
+        std::fs::write(&output, b"output").unwrap();
+        mark_incremental_update_started(&state_dir, "test").unwrap();
+
+        let previous = state("args", b"output", &[("a.o", b"a")]);
+        let current = CurrentState {
+            state_dir: state_dir.clone(),
+            args_hash: "args".to_owned(),
+            wild_version: "wild-test".to_owned(),
+            input_files: previous.input_files.clone(),
+        };
+
+        assert!(matches!(
+            classify_incremental_mode(&output, &current, &previous),
+            IncrementalMode::Relink {
+                reason,
+                can_reuse_unchanged_sections: false,
+            } if reason == "previous incremental update did not complete"
+        ));
+
+        clear_incremental_update_marker(&state_dir).unwrap();
+        assert!(!update_marker_path(&state_dir).exists());
     }
 
     #[test]
