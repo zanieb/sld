@@ -5,9 +5,12 @@
 //#RunEnabled:false
 //#DiffEnabled:false
 //#TestIncremental:true
+//#TestIncrementalCompareFull:false
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-dynamic-relocation-removed.c.o
 //#TestIncrementalChangedCompArgs:-DINCREMENTAL_DYNAMIC_RELOCATION_REMOVED=1
+//#TestIncrementalChangedSection:.data.rel.incremental_dynamic_removed
+//#TestIncrementalChangedSection:.rela.data.rel.incremental_dynamic_removed
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_dynamic_removed_payload=0x2b000000
