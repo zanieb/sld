@@ -380,6 +380,12 @@ fn patch_changed_inputs(
 
         let (fingerprint, matched_sections, current_sections, resolved_patches) = {
             let input = &previous.input_files[*input_index];
+            if !archive_members_match_snapshot(state_dir, input, &bytes)? {
+                return Ok(ChangedInputPatchResult::Unsupported(format!(
+                    "archive members changed in `{}`",
+                    path.display()
+                )));
+            }
             let Some(previous_patch) = input.patch.as_ref() else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "missing patch metadata for `{}`",
@@ -1897,6 +1903,55 @@ fn patch_archive_member_bytes<'data>(
         }
     }
     Ok(matched.map_or(ArchiveMemberMatch::Unavailable, ArchiveMemberMatch::Unique))
+}
+
+fn archive_members_match_snapshot(
+    state_dir: &Path,
+    previous_input: &FileState,
+    current_bytes: &[u8],
+) -> Result<bool> {
+    let current_members = archive_member_identifiers(current_bytes)?;
+    if current_members.is_none() && !patch_state_references_archive_member(previous_input) {
+        return Ok(true);
+    }
+    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    if !previous_input
+        .content
+        .identity_matches_path(&snapshot)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    let previous_bytes = match std::fs::read(&snapshot) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(archive_member_identifiers(&previous_bytes)? == current_members)
+}
+
+fn patch_state_references_archive_member(previous_input: &FileState) -> bool {
+    previous_input.patch.as_ref().is_some_and(|patch| {
+        patch
+            .sections
+            .iter()
+            .any(|section| section.input != previous_input.path)
+    })
+}
+
+fn archive_member_identifiers(bytes: &[u8]) -> Result<Option<Vec<Vec<u8>>>> {
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut identifiers = Vec::new();
+    for entry in archive {
+        match entry? {
+            ArchiveEntry::Regular(content) => identifiers.push(content.ident.as_slice().to_vec()),
+            ArchiveEntry::Thin(entry) => identifiers.push(entry.ident.as_slice().to_vec()),
+        }
+    }
+    Ok(Some(identifiers))
 }
 
 fn patch_fingerprint(
@@ -4420,6 +4475,91 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn archive_member_identifiers_track_member_set() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"first.o".to_vec(), 5),
+                b"first".as_slice(),
+            )
+            .unwrap();
+        builder
+            .append(
+                &ar::Header::new(b"second.o".to_vec(), 6),
+                b"second".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+
+        assert_eq!(
+            archive_member_identifiers(&archive).unwrap().unwrap(),
+            vec![b"first.o".to_vec(), b"second.o".to_vec()]
+        );
+        assert!(
+            archive_member_identifiers(b"not an archive")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn archive_member_changes_do_not_match_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libarchive.a");
+        let mut previous_builder = ar::Builder::new(Vec::new());
+        previous_builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 6),
+                b"member".as_slice(),
+            )
+            .unwrap();
+        let previous_archive = previous_builder.into_inner().unwrap();
+        std::fs::write(&input, &previous_archive).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let mut member_ref = input.as_os_str().as_encoded_bytes().to_vec();
+        member_ref.push(0);
+        member_ref.extend_from_slice(b"member.o");
+        member_ref.push(0);
+        member_ref.extend_from_slice(b"8:14");
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            patch: Some(FilePatchState {
+                fingerprint: String::new(),
+                sections: vec![FilePatchSectionState {
+                    input: hex::encode(member_ref),
+                    section_index: 0,
+                    section_name: None,
+                    input_size: 0,
+                    output_offset: 0,
+                    output_size: 0,
+                }],
+            }),
+        };
+
+        let mut current_builder = ar::Builder::new(Vec::new());
+        current_builder
+            .append(
+                &ar::Header::new(b"padding.o".to_vec(), 7),
+                b"padding".as_slice(),
+            )
+            .unwrap();
+        current_builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 6),
+                b"member".as_slice(),
+            )
+            .unwrap();
+        let current_archive = current_builder.into_inner().unwrap();
+
+        assert!(!archive_members_match_snapshot(&state_dir, &previous, &current_archive).unwrap());
+        assert!(!archive_members_match_snapshot(&state_dir, &previous, b"not an archive").unwrap());
+        assert!(archive_members_match_snapshot(&state_dir, &previous, &previous_archive).unwrap());
     }
 
     #[test]
