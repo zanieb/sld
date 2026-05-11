@@ -179,13 +179,13 @@ pub(crate) fn maybe_prepare(
     timing_phase!("Prepare incremental link");
 
     let state_dir = state_dir_for_output(args.output());
-    let previous = PersistedState::read(&state_dir);
+    let previous_metadata = PersistedState::read_metadata(&state_dir);
     let current = CurrentState::new(
         args,
         file_loader,
-        previous.as_ref().ok().and_then(|p| p.as_ref()),
+        previous_metadata.as_ref().ok().and_then(|p| p.as_ref()),
     );
-    let (mode, previous) = match previous {
+    let (mut mode, previous_metadata) = match previous_metadata {
         Ok(Some(previous)) => (
             classify_incremental_mode(args.output(), &current, &previous),
             Some(previous),
@@ -206,15 +206,32 @@ pub(crate) fn maybe_prepare(
         ),
     };
 
+    let mut previous_sections = HashSet::new();
+    if mode_needs_previous_sections(&mode) {
+        match PersistedState::read(&state_dir) {
+            Ok(Some(previous)) => {
+                previous_sections = previous.sections.iter().cloned().collect();
+            }
+            Ok(None) => {
+                mode = IncrementalMode::Relink {
+                    reason: "no previous incremental state".to_owned(),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
+            Err(error) => {
+                mode = IncrementalMode::Relink {
+                    reason: format!("could not read previous incremental state: {error:?}"),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
+        }
+    }
+
     current.log_mode(&mode)?;
 
-    let reusable_inputs = previous
+    let reusable_inputs = previous_metadata
         .as_ref()
         .map(|previous| reusable_input_files(&current.input_files, &previous.input_files))
-        .unwrap_or_default();
-    let previous_sections = previous
-        .as_ref()
-        .map(|previous| previous.sections.iter().cloned().collect())
         .unwrap_or_default();
 
     Ok(PreparedState {
@@ -225,6 +242,17 @@ pub(crate) fn maybe_prepare(
         current_sections: Mutex::new(Vec::new()),
         reused_sections: AtomicUsize::new(0),
     })
+}
+
+fn mode_needs_previous_sections(mode: &IncrementalMode) -> bool {
+    matches!(
+        mode,
+        IncrementalMode::Reuse
+            | IncrementalMode::Relink {
+                can_reuse_unchanged_sections: true,
+                ..
+            }
+    )
 }
 
 pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> Result<bool> {
@@ -4216,6 +4244,38 @@ mod tests {
         assert!(rendered.contains("\nsection\t0\t1\t100\t12\n"));
         assert!(rendered.contains("\nsection\t0\t2\t112\t8\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn read_metadata_skips_missing_sections_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state.write(dir.path()).unwrap();
+        let sections_file = PersistedState::read_metadata(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        std::fs::remove_file(dir.path().join(sections_file)).unwrap();
+
+        let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert!(metadata.sections.is_empty());
+        assert!(PersistedState::read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn previous_sections_are_only_needed_for_reuse_capable_modes() {
+        assert!(!mode_needs_previous_sections(&IncrementalMode::Disabled));
+        assert!(mode_needs_previous_sections(&IncrementalMode::Reuse));
+        assert!(mode_needs_previous_sections(&IncrementalMode::Relink {
+            reason: "input file changed".to_owned(),
+            can_reuse_unchanged_sections: true,
+        }));
+        assert!(!mode_needs_previous_sections(&IncrementalMode::Relink {
+            reason: "linker arguments changed".to_owned(),
+            can_reuse_unchanged_sections: false,
+        }));
     }
 
     #[test]
