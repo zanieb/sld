@@ -341,6 +341,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
 
+    if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
+        append_log(
+            &state_dir,
+            &format!("incremental fast path unavailable before loading inputs: {reason}"),
+        )?;
+        return Ok(false);
+    }
+
     if !rewritten_inputs.is_empty() {
         previous.write_metadata_update(&state_dir)?;
         append_log(
@@ -373,12 +381,26 @@ fn patch_changed_inputs(
     let mut patches = Vec::new();
     let mut patched_section_count = 0;
     for (input_index, path) in changed_inputs {
-        let bytes = std::fs::read(path).with_context(|| {
-            format!(
-                "Failed to read changed incremental input `{}`",
+        let previous_patch = {
+            let input = &previous.input_files[*input_index];
+            match patch_sections_from_previous_state(input, path) {
+                Ok(previous_patch) => previous_patch,
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            }
+        };
+        let Some((bytes, input_content)) =
+            read_file_with_stable_identity(path).with_context(|| {
+                format!(
+                    "Failed to read changed incremental input `{}`",
+                    path.display()
+                )
+            })?
+        else {
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "changed input changed while being read: {}",
                 path.display()
-            )
-        })?;
+            )));
+        };
 
         let (fingerprint, matched_sections, current_sections, resolved_patches) = {
             let input = &previous.input_files[*input_index];
@@ -388,49 +410,15 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             }
-            let Some(previous_patch) = input.patch.as_ref() else {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "missing patch metadata for `{}`",
-                    path.display()
-                )));
-            };
-            if previous_patch.sections.is_empty() {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "no patchable sections recorded for `{}`",
-                    path.display()
-                )));
-            }
-            let patch_section_keys = previous_patch
-                .sections
-                .iter()
-                .map(|section| (section.input.as_str(), section.section_index))
-                .collect::<HashSet<_>>();
-            if patch_section_keys.len() != previous_patch.sections.len() {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "duplicate patchable section metadata for `{}`",
-                    path.display()
-                )));
-            }
-            let sections = previous_patch
-                .sections
-                .iter()
-                .map(|section| PatchSection {
-                    input: section.input.clone(),
-                    section_index: section.section_index,
-                    section_name: section.section_name.clone(),
-                    input_size: section.input_size,
-                    output_offset: section.output_offset,
-                    output_size: section.output_size,
-                })
-                .collect::<Vec<_>>();
 
             let (mut matched_sections, matched_changed_sections) =
-                match match_patch_sections(state_dir, input, &bytes, &sections)? {
+                match match_patch_sections(state_dir, input, &bytes, &previous_patch.sections)? {
                     Some(matched_sections) => (
                         matched_sections.sections,
                         Some(matched_sections.changed_sections),
                     ),
-                    None if sections
+                    None if previous_patch
+                        .sections
                         .iter()
                         .any(|section| section.section_name.is_none()) =>
                     {
@@ -440,7 +428,8 @@ fn patch_changed_inputs(
                         )));
                     }
                     None => (
-                        sections
+                        previous_patch
+                            .sections
                             .iter()
                             .cloned()
                             .map(MatchedPatchSection::same)
@@ -527,13 +516,7 @@ fn patch_changed_inputs(
         if sections_changed {
             previous.sections_file = None;
         }
-        previous.input_files[*input_index].content =
-            FileContentState::from_path_identity_only(path).with_context(|| {
-                format!(
-                    "Failed to record changed incremental input `{}`",
-                    path.display()
-                )
-            })?;
+        previous.input_files[*input_index].content = input_content;
         previous.input_files[*input_index].patch = Some(FilePatchState {
             fingerprint: fingerprint.clone(),
             sections: current_sections
@@ -549,6 +532,14 @@ fn patch_changed_inputs(
                 .collect(),
         });
         patches.extend(resolved_patches.into_iter().map(|resolved| resolved.patch));
+    }
+
+    if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
+
+    if let Some(reason) = patch_output_range_rejection_reason(&patches) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
     let file = OpenOptions::new()
@@ -657,6 +648,9 @@ fn patch_changed_inputs(
         &mut previous.input_files,
         changed_inputs.iter().map(|(input_index, _)| *input_index),
     );
+    if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
     PersistedState {
         args_hash: previous.args_hash,
         wild_version: previous.wild_version,
@@ -683,6 +677,52 @@ fn patch_changed_inputs(
     Ok(ChangedInputPatchResult::Patched)
 }
 
+struct PreviousPatchState {
+    fingerprint: String,
+    sections: Vec<PatchSection>,
+}
+
+fn patch_sections_from_previous_state(
+    input: &FileState,
+    path: &Path,
+) -> std::result::Result<PreviousPatchState, String> {
+    let Some(previous_patch) = input.patch.as_ref() else {
+        return Err(format!("missing patch metadata for `{}`", path.display()));
+    };
+    if previous_patch.sections.is_empty() {
+        return Err(format!(
+            "no patchable sections recorded for `{}`",
+            path.display()
+        ));
+    }
+    let patch_section_keys = previous_patch
+        .sections
+        .iter()
+        .map(|section| (section.input.as_str(), section.section_index))
+        .collect::<HashSet<_>>();
+    if patch_section_keys.len() != previous_patch.sections.len() {
+        return Err(format!(
+            "duplicate patchable section metadata for `{}`",
+            path.display()
+        ));
+    }
+    Ok(PreviousPatchState {
+        fingerprint: previous_patch.fingerprint.clone(),
+        sections: previous_patch
+            .sections
+            .iter()
+            .map(|section| PatchSection {
+                input: section.input.clone(),
+                section_index: section.section_index,
+                section_name: section.section_name.clone(),
+                input_size: section.input_size,
+                output_offset: section.output_offset,
+                output_size: section.output_size,
+            })
+            .collect(),
+    })
+}
+
 struct SectionPatch {
     output_offset: u64,
     size: u64,
@@ -693,6 +733,29 @@ struct SectionPatch {
 struct ResolvedSectionPatch {
     section: PatchSection,
     patch: SectionPatch,
+}
+
+fn patch_output_range_rejection_reason(patches: &[SectionPatch]) -> Option<String> {
+    let mut ranges = Vec::with_capacity(patches.len());
+    for patch in patches {
+        let Ok(start) = usize::try_from(patch.output_offset) else {
+            return Some("changed patch output range is out of bounds".to_owned());
+        };
+        let Some(end) = start.checked_add(patch.size as usize) else {
+            return Some("changed patch output range overflow".to_owned());
+        };
+        ranges.push(start..end);
+    }
+    ranges.sort_by_key(|range| range.start);
+
+    let mut previous_end = 0;
+    for range in ranges {
+        if !range.is_empty() && range.start < previous_end {
+            return Some("changed patch output ranges overlap".to_owned());
+        }
+        previous_end = previous_end.max(range.end);
+    }
+    None
 }
 
 fn flush_output_ranges(
@@ -792,33 +855,84 @@ fn update_section_records_for_matched_patches(
     matched_sections: &[MatchedPatchSection],
     records: &mut [SectionRecord],
 ) -> bool {
+    if matched_sections.len() == 1 {
+        return update_section_record_for_matched_patch(input_file, &matched_sections[0], records);
+    }
+
+    let updates = matched_sections
+        .iter()
+        .map(|matched| {
+            (
+                section_record_update_key(input_file, &matched.previous),
+                &matched.current,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
     let mut changed = false;
-    for matched in matched_sections {
-        let Some(record) = records.iter_mut().find(|record| {
-            record.input_file == input_file
-                && record.input == matched.previous.input
-                && record.section_index == matched.previous.section_index
-                && record.output_offset == matched.previous.output_offset
-                && record.size == matched.previous.output_size
-        }) else {
+    for record in records {
+        let Some(current) = updates.get(&(
+            record.input_file.as_str(),
+            record.input.as_str(),
+            record.section_index,
+            record.output_offset,
+            record.size,
+        )) else {
             continue;
         };
 
-        if record.input == matched.current.input
-            && record.section_index == matched.current.section_index
-            && record.output_offset == matched.current.output_offset
-            && record.size == matched.current.output_size
-        {
-            continue;
+        if update_section_record(record, current) {
+            changed = true;
         }
-
-        record.input = matched.current.input.clone();
-        record.section_index = matched.current.section_index;
-        record.output_offset = matched.current.output_offset;
-        record.size = matched.current.output_size;
-        changed = true;
     }
     changed
+}
+
+fn update_section_record_for_matched_patch(
+    input_file: &str,
+    matched: &MatchedPatchSection,
+    records: &mut [SectionRecord],
+) -> bool {
+    let Some(record) = records.iter_mut().find(|record| {
+        record.input_file == input_file
+            && record.input == matched.previous.input
+            && record.section_index == matched.previous.section_index
+            && record.output_offset == matched.previous.output_offset
+            && record.size == matched.previous.output_size
+    }) else {
+        return false;
+    };
+
+    update_section_record(record, &matched.current)
+}
+
+fn section_record_update_key<'a>(
+    input_file: &'a str,
+    section: &'a PatchSection,
+) -> (&'a str, &'a str, u32, u64, u64) {
+    (
+        input_file,
+        section.input.as_str(),
+        section.section_index,
+        section.output_offset,
+        section.output_size,
+    )
+}
+
+fn update_section_record(record: &mut SectionRecord, current: &PatchSection) -> bool {
+    if record.input == current.input
+        && record.section_index == current.section_index
+        && record.output_offset == current.output_offset
+        && record.size == current.output_size
+    {
+        return false;
+    }
+
+    record.input = current.input.clone();
+    record.section_index = current.section_index;
+    record.output_offset = current.output_offset;
+    record.size = current.output_size;
+    true
 }
 
 fn update_matched_patch_current_sections(
@@ -3253,6 +3367,53 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     Ok(left == right)
 }
 
+fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileContentState)>> {
+    let before = FileIdentity::from_path(path)?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let after = FileIdentity::from_path(path)?;
+    if before != after {
+        return Ok(None);
+    }
+    let Some(identity) = after else {
+        let content = FileContentState::from_bytes(&bytes);
+        return Ok(Some((bytes, content)));
+    };
+    if bytes.len() as u64 != identity.len {
+        return Ok(None);
+    }
+    Ok(Some((
+        bytes,
+        FileContentState {
+            len: identity.len,
+            hash: String::new(),
+            identity: Some(identity),
+        },
+    )))
+}
+
+fn input_identity_mismatch_reason(input_files: &[FileState]) -> Result<Option<String>> {
+    for input in input_files {
+        let path = decode_path(&input.path)?;
+        match input.content.identity_matches_path(&path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Some(format!(
+                    "input file changed while incremental fast path was running: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Ok(Some(format!(
+                    "input file could not be rechecked while incremental fast path was running: {} ({error:?})",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn refresh_input_file_identities(input_files: &mut [FileState]) {
     for input in input_files {
         refresh_input_file_identity(input);
@@ -4745,6 +4906,38 @@ mod tests {
     }
 
     #[test]
+    fn changed_input_patch_rejects_missing_metadata_before_reading_changed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_input = dir.path().join("missing.o");
+        let previous = PersistedState {
+            args_hash: "args".to_owned(),
+            wild_version: Some("wild-test".to_owned()),
+            output: FileContentState::from_bytes(b"output"),
+            build_id_hashes: None,
+            input_files: vec![FileState {
+                path: encode_path(&missing_input),
+                content: FileContentState::from_bytes(b"previous"),
+                patch: None,
+            }],
+            sections: Vec::new(),
+            sections_file: None,
+        };
+
+        let result = patch_changed_inputs(
+            &crate::args::elf::ElfArgs::default(),
+            dir.path(),
+            previous,
+            &[(0, missing_input)],
+        )
+        .unwrap();
+
+        let ChangedInputPatchResult::Unsupported(reason) = result else {
+            panic!("changed input was unexpectedly patched");
+        };
+        assert!(reason.contains("missing patch metadata"));
+    }
+
+    #[test]
     fn persisted_state_round_trips_build_id_hashes() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         let output_len = 5 * BUILD_ID_HASH_GROUP_LEN + 100;
@@ -5011,6 +5204,42 @@ mod tests {
 
         std::fs::write(&path, b"abcde").unwrap();
         assert!(!content.identity_matches_path(&path).unwrap());
+    }
+
+    #[test]
+    fn stable_identity_read_records_matching_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.o");
+        std::fs::write(&path, b"abcd").unwrap();
+
+        let (bytes, content) = read_file_with_stable_identity(&path).unwrap().unwrap();
+
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(content, FileContentState::from_path(&path).unwrap());
+    }
+
+    #[test]
+    fn input_identity_mismatch_reason_rechecks_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.o");
+        std::fs::write(&path, b"abcd").unwrap();
+        let input = FileState {
+            path: encode_path(&path),
+            content: FileContentState::from_path_identity_only(&path).unwrap(),
+            patch: None,
+        };
+
+        assert!(
+            input_identity_mismatch_reason(std::slice::from_ref(&input))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(&path, b"abcde").unwrap();
+        let reason = input_identity_mismatch_reason(&[input]).unwrap().unwrap();
+
+        assert!(reason.contains("input file changed while incremental fast path was running"));
+        assert!(reason.contains("input.o"));
     }
 
     #[test]
@@ -5367,5 +5596,26 @@ mod tests {
 
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, false, true));
         assert!(state.current_sections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_output_ranges_must_not_overlap() {
+        let patch = |output_offset, size| SectionPatch {
+            output_offset,
+            size,
+            data: Vec::new(),
+            preserve_ranges: Vec::new(),
+        };
+
+        assert!(patch_output_range_rejection_reason(&[patch(16, 8), patch(24, 8)]).is_none());
+        assert!(patch_output_range_rejection_reason(&[patch(24, 8), patch(16, 8)]).is_none());
+        assert_eq!(
+            patch_output_range_rejection_reason(&[patch(16, 8), patch(23, 8)]).as_deref(),
+            Some("changed patch output ranges overlap")
+        );
+        assert_eq!(
+            patch_output_range_rejection_reason(&[patch(usize::MAX as u64, 8)]).as_deref(),
+            Some("changed patch output range overflow")
+        );
     }
 }
