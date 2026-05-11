@@ -176,6 +176,9 @@
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Defaults
 //! to .data.
 //!
+//! TestIncrementalChangedSectionOffset:{bytes} Offset within the selected ELF section to mutate.
+//! Defaults to 0.
+//!
 //! TestIncrementalChangedGrowSection:{bytes} Whether the changed-input test should grow the
 //! selected ELF section by the supplied number of bytes instead of mutating an existing byte.
 //!
@@ -797,6 +800,7 @@ struct Config {
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
     test_incremental_changed_section: String,
+    test_incremental_changed_section_offset: u64,
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
@@ -1383,6 +1387,7 @@ impl Config {
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
             test_incremental_changed_section: ".data".to_owned(),
+            test_incremental_changed_section_offset: 0,
             test_incremental_changed_grow_section: None,
             test_incremental_changed_compare_full: true,
             test_incremental_changed_section_prefix: None,
@@ -1789,6 +1794,11 @@ fn process_directive(
         }
         "TestIncrementalChangedSection" => {
             arg.clone_into(&mut config.test_incremental_changed_section);
+        }
+        "TestIncrementalChangedSectionOffset" => {
+            config.test_incremental_changed_section_offset = arg
+                .parse()
+                .context("Invalid TestIncrementalChangedSectionOffset")?;
         }
         "TestIncrementalChangedGrowSection" => {
             config.test_incremental_changed_grow_section = Some(
@@ -2199,6 +2209,7 @@ impl ProgramInputs {
                     mutate_section_byte(
                         &changed_input.path,
                         &config.test_incremental_changed_section,
+                        config.test_incremental_changed_section_offset,
                     )?;
                 }
             }
@@ -2372,19 +2383,23 @@ fn rewrite_file_with_same_contents(path: &Path) -> Result {
     Ok(())
 }
 
-fn mutate_section_byte(path: &Path, section_name: &str) -> Result {
+fn mutate_section_byte(path: &Path, section_name: &str, section_offset: u64) -> Result {
     let original =
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
     let mut bytes = original.clone();
     let (offset, len) = mutation_section_file_range(bytes.as_slice(), path, section_name)?
         .with_context(|| format!("Missing {section_name} section in `{}`", path.display()))?;
     ensure!(
-        len > 0,
-        "Cannot mutate empty {section_name} section in `{}`",
+        section_offset < len,
+        "Cannot mutate {section_name} section at offset {section_offset} with size {len} in `{}`",
         path.display()
     );
-    let index =
-        usize::try_from(offset).with_context(|| format!("Invalid {section_name} offset"))?;
+    let index = usize::try_from(
+        offset
+            .checked_add(section_offset)
+            .with_context(|| format!("Invalid {section_name} mutation offset"))?,
+    )
+    .with_context(|| format!("Invalid {section_name} offset"))?;
     bytes[index] = bytes[index].wrapping_add(1);
     let tmp_path = append_to_path(path, ".mutated");
     std::fs::write(&tmp_path, bytes)

@@ -7,6 +7,11 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedInput:incremental-relocated-data.c.o
 //#TestIncrementalChangedSection:.data.rel.local.incremental_relocated
+//#Config:relocation-metadata:incremental-relocated-data
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
+//#TestIncrementalChangedSection:.rela.data.rel.local.incremental_relocated
+//#TestIncrementalChangedSectionOffset:16
 
 extern int relocated_target;
 
