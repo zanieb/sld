@@ -1,13 +1,16 @@
 //#Config:incremental-eh-frame-removed
 //#Object:incremental-eh-frame-removed-unchanged.c
+//#LinkArgs:--eh-frame-hdr --no-gc-sections
 //#RunEnabled:false
 //#DiffEnabled:false
 //#TestIncremental:true
+//#TestIncrementalCompareFull:false
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-eh-frame-removed.c.o
 //#TestIncrementalChangedCompArgs:-DINCREMENTAL_EH_FRAME_REMOVED=1
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
+//#TestIncrementalChangedSection:.data.incremental_eh_frame_removed
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_eh_frame_removed_value=0x2b000000
 //#TestIncrementalStateContains:fde\t
 
@@ -36,8 +39,5 @@ int unchanged(void);
 
 void _start(void) {
     (void)incremental_eh_frame_removed_primary();
-#ifndef INCREMENTAL_EH_FRAME_REMOVED
-    (void)incremental_eh_frame_removed_extra();
-#endif
     (void)unchanged();
 }
