@@ -400,6 +400,7 @@ fn patch_changed_inputs(
 
     let mut previous = previous;
     let mut patches = Vec::new();
+    let mut expected_changed_inputs = Vec::new();
     let mut patched_section_count = 0;
     for (input_index, path) in changed_inputs {
         let previous_patch = {
@@ -422,6 +423,7 @@ fn patch_changed_inputs(
                 path.display()
             )));
         };
+        expected_changed_inputs.push(ExpectedInputContent::from_bytes(path, &bytes));
 
         let (fingerprint, matched_sections, current_sections, resolved_patches) = {
             let input = &previous.input_files[*input_index];
@@ -566,6 +568,10 @@ fn patch_changed_inputs(
         patches.extend(resolved_patches.into_iter().map(|resolved| resolved.patch));
     }
 
+    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
+
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -682,6 +688,9 @@ fn patch_changed_inputs(
         &mut previous.input_files,
         changed_inputs.iter().map(|(input_index, _)| *input_index),
     );
+    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -771,6 +780,23 @@ struct SectionPatch {
 struct ResolvedSectionPatch {
     section: PatchSection,
     patch: SectionPatch,
+}
+
+struct ExpectedInputContent {
+    path: PathBuf,
+    len: u64,
+    hash: String,
+}
+
+impl ExpectedInputContent {
+    fn from_bytes(path: &Path, bytes: &[u8]) -> Self {
+        let content = FileContentState::from_bytes(bytes);
+        Self {
+            path: path.to_owned(),
+            len: content.len,
+            hash: content.hash,
+        }
+    }
 }
 
 fn patch_output_range_rejection_reason(patches: &[SectionPatch]) -> Option<String> {
@@ -3664,6 +3690,35 @@ fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileCo
     )))
 }
 
+fn input_content_mismatch_reason(
+    expected_inputs: &[ExpectedInputContent],
+) -> Result<Option<String>> {
+    for expected in expected_inputs {
+        let current = match read_file_with_stable_identity(&expected.path) {
+            Ok(Some((bytes, _))) => FileContentState::from_bytes(&bytes),
+            Ok(None) => {
+                return Ok(Some(format!(
+                    "input file changed while incremental fast path was running: {}",
+                    expected.path.display()
+                )));
+            }
+            Err(error) => {
+                return Ok(Some(format!(
+                    "input file could not be rechecked while incremental fast path was running: {} ({error:?})",
+                    expected.path.display()
+                )));
+            }
+        };
+        if current.len != expected.len || current.hash != expected.hash {
+            return Ok(Some(format!(
+                "input file changed while incremental fast path was running: {}",
+                expected.path.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn input_identity_mismatch_reason(input_files: &[FileState]) -> Result<Option<String>> {
     for input in input_files {
         let path = decode_path(&input.path)?;
@@ -5927,6 +5982,26 @@ mod tests {
 
         std::fs::write(&path, b"abcde").unwrap();
         let reason = input_identity_mismatch_reason(&[input]).unwrap().unwrap();
+
+        assert!(reason.contains("input file changed while incremental fast path was running"));
+        assert!(reason.contains("input.o"));
+    }
+
+    #[test]
+    fn input_content_mismatch_reason_rechecks_changed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.o");
+        std::fs::write(&path, b"abcd").unwrap();
+        let expected = ExpectedInputContent::from_bytes(&path, b"abcd");
+
+        assert!(
+            input_content_mismatch_reason(std::slice::from_ref(&expected))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(&path, b"wxyz").unwrap();
+        let reason = input_content_mismatch_reason(&[expected]).unwrap().unwrap();
 
         assert!(reason.contains("input file changed while incremental fast path was running"));
         assert!(reason.contains("input.o"));
