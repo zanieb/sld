@@ -185,6 +185,10 @@
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Can be repeated to mutate multiple inputs. Defaults to the last linker input.
 //!
+//! TestIncrementalChangedCompArgs:{args} Extra compiler arguments used to rebuild the changed input
+//! from its original source. This exercises a real compiler-produced object change instead of
+//! mutating bytes in the previous object.
+//!
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Can be
 //! repeated to mutate multiple sections in each changed input. Defaults to .data.
 //!
@@ -822,6 +826,7 @@ struct Config {
     test_incremental_changed_fallback_reason: Option<String>,
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
+    test_incremental_changed_comp_args: Option<ArgumentSet>,
     test_incremental_changed_sections: Vec<String>,
     test_incremental_changed_sections_explicit: bool,
     test_incremental_changed_section_offset: u64,
@@ -1427,6 +1432,7 @@ impl Config {
             test_incremental_changed_fallback_reason: None,
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
+            test_incremental_changed_comp_args: None,
             test_incremental_changed_sections: Vec::new(),
             test_incremental_changed_sections_explicit: false,
             test_incremental_changed_section_offset: 0,
@@ -1477,6 +1483,32 @@ fn parse_named_bytes_directive(directive: &str, arg: &str) -> Result<(String, Ve
         hex::decode(hex_str).with_context(|| format!("Invalid hex in {directive}: {hex_str}"))?;
 
     Ok((name.to_owned(), expected_bytes))
+}
+
+fn changed_source_for_input(config: &Config, input_path: &Path) -> Result<PathBuf> {
+    let input_filename = input_path
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .with_context(|| {
+            format!(
+                "Invalid incremental input filename `{}`",
+                input_path.display()
+            )
+        })?;
+    let source_filename = input_filename.strip_suffix(".o").with_context(|| {
+        format!(
+            "Incremental changed compiler arguments require an object input ending in `.o`, got `{}`",
+            input_path.display()
+        )
+    })?;
+    let source_path = config.source_path(source_filename);
+    if !source_path.exists() {
+        bail!(
+            "Incremental changed input source `{}` does not exist",
+            source_path.display()
+        );
+    }
+    Ok(source_path)
 }
 
 fn parse_configs(src_filename: &Path, default_config: &Config) -> Result<Vec<Config>> {
@@ -1848,6 +1880,9 @@ fn process_directive(
         }
         "TestIncrementalChangedInput" => {
             config.test_incremental_changed_inputs.push(arg.to_owned());
+        }
+        "TestIncrementalChangedCompArgs" => {
+            config.test_incremental_changed_comp_args = Some(ArgumentSet::parse(arg)?);
         }
         "TestIncrementalChangedSection" => {
             if !config.test_incremental_changed_sections_explicit {
@@ -2323,20 +2358,64 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.test_incremental_changed_comp_args.is_some() && changed_inputs.len() != 1 {
+                bail!(
+                    "Incremental changed-source test for {} must configure exactly one changed input",
+                    self.name()
+                );
+            }
 
             let mut _restore_changed_inputs = Vec::with_capacity(changed_inputs.len());
             let changed_sections = config.incremental_changed_sections();
             for changed_input in &changed_inputs {
                 _restore_changed_inputs.push(RestoreFileOnDrop::new(&changed_input.path)?);
-                for changed_section in &changed_sections {
-                    if let Some(growth) = config.test_incremental_changed_grow_section {
-                        grow_section_bytes(&changed_input.path, changed_section, growth)?;
-                    } else {
-                        mutate_section_byte(
-                            &changed_input.path,
-                            changed_section,
-                            config.test_incremental_changed_section_offset,
+                if let Some(changed_comp_args) = &config.test_incremental_changed_comp_args {
+                    let changed_source = changed_source_for_input(config, &changed_input.path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to identify source for incremental input `{}`",
+                                changed_input.path.display()
+                            )
+                        })?;
+                    let replacement_config = config.config_for_deps();
+                    let changed_source =
+                        FilenameArgumentPair::new(&changed_source, changed_comp_args.clone());
+                    let replacement = build_obj_impl(
+                        &changed_source,
+                        &replacement_config,
+                        &Linker::Wild,
+                        InputType::Object,
+                        cross_arch,
+                        false,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Failed to build incremental replacement source `{}`",
+                            changed_source.path.display()
+                        )
+                    })?;
+                    if replacement.path != changed_input.path {
+                        std::fs::copy(&replacement.path, &changed_input.path).with_context(
+                            || {
+                                format!(
+                                    "Failed to replace incremental input `{}` with `{}`",
+                                    changed_input.path.display(),
+                                    replacement.path.display()
+                                )
+                            },
                         )?;
+                    }
+                } else {
+                    for changed_section in &changed_sections {
+                        if let Some(growth) = config.test_incremental_changed_grow_section {
+                            grow_section_bytes(&changed_input.path, changed_section, growth)?;
+                        } else {
+                            mutate_section_byte(
+                                &changed_input.path,
+                                changed_section,
+                                config.test_incremental_changed_section_offset,
+                            )?;
+                        }
                     }
                 }
                 if config.test_incremental_changed_append_archive_member {
@@ -3567,6 +3646,17 @@ fn build_obj(
     input_type: InputType,
     cross_arch: Option<Architecture>,
 ) -> Result<BuiltObject> {
+    build_obj_impl(file, config, linker, input_type, cross_arch, true)
+}
+
+fn build_obj_impl(
+    file: &FilenameArgumentPair,
+    config: &Config,
+    linker: &Linker,
+    input_type: InputType,
+    cross_arch: Option<Architecture>,
+    verify_unique_output: bool,
+) -> Result<BuiltObject> {
     let src_path = file.path.clone();
 
     if input_type == InputType::LinkerScript {
@@ -3713,7 +3803,9 @@ fn build_obj(
 
     command.args(compiler_args);
 
-    verify_path_unique_for_args(&output_path, &command)?;
+    if verify_unique_output {
+        verify_path_unique_for_args(&output_path, &command)?;
+    }
 
     match compiler_kind {
         CompilerKind::C => {
