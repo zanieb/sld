@@ -9,6 +9,7 @@ use hashbrown::HashSet;
 use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
+use object::ObjectSymbol as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::Metadata;
@@ -367,7 +368,29 @@ fn patch_changed_inputs(
                 path.display()
             )
         })?;
-        let fingerprint = patch_fingerprint(&bytes, sections.iter().cloned())?;
+        let matched_sections = match match_patch_sections(state_dir, input, &bytes, &sections)? {
+            Some(matched_sections) => matched_sections,
+            None if sections
+                .iter()
+                .any(|section| section.section_name.is_none()) =>
+            {
+                return Ok(ChangedInputPatchResult::Unsupported(format!(
+                    "could not match anonymous patch sections in `{}`",
+                    path.display()
+                )));
+            }
+            None => sections
+                .iter()
+                .cloned()
+                .map(MatchedPatchSection::same)
+                .collect(),
+        };
+        let current_sections = matched_sections
+            .iter()
+            .map(|section| section.current.clone())
+            .collect::<Vec<_>>();
+
+        let fingerprint = patch_fingerprint(&bytes, current_sections.iter().cloned())?;
         if fingerprint.as_deref() != Some(previous_patch.fingerprint.as_str()) {
             return Ok(ChangedInputPatchResult::Unsupported(format!(
                 "changed bytes outside patchable sections in `{}`",
@@ -375,8 +398,8 @@ fn patch_changed_inputs(
             )));
         }
 
-        let patch_sections = changed_patch_sections(state_dir, input, &bytes, &sections)?
-            .unwrap_or_else(|| sections.clone());
+        let patch_sections = changed_patch_sections(state_dir, input, &bytes, &matched_sections)?
+            .unwrap_or_else(|| current_sections.clone());
         patched_section_count += patch_sections.len();
 
         input_files[*input_index].content = FileContentState::from_path_identity_only(path)
@@ -563,6 +586,31 @@ struct PatchSection {
     input_size: u64,
     output_offset: u64,
     output_size: u64,
+}
+
+#[derive(Clone)]
+struct MatchedPatchSection {
+    previous: PatchSection,
+    current: PatchSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SectionReference {
+    source_section_name: String,
+    relocation_offset: u64,
+    relocation_kind: String,
+    relocation_encoding: String,
+    relocation_size: u8,
+    relocation_addend: i64,
+}
+
+impl MatchedPatchSection {
+    fn same(section: PatchSection) -> Self {
+        Self {
+            previous: section.clone(),
+            current: section,
+        }
+    }
 }
 
 impl PreparedState {
@@ -1411,11 +1459,145 @@ fn patch_fingerprint(
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
-fn changed_patch_sections(
+fn match_patch_sections(
     state_dir: &Path,
     previous_input: &FileState,
     current_bytes: &[u8],
     sections: &[PatchSection],
+) -> Result<Option<Vec<MatchedPatchSection>>> {
+    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    if !previous_input
+        .content
+        .identity_matches_path(&snapshot)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let previous_bytes = match std::fs::read(&snapshot) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let previous_file =
+        object::File::parse(&*previous_bytes).context("Failed to parse previous patch input")?;
+    let current_file =
+        object::File::parse(current_bytes).context("Failed to parse current patch input")?;
+    let previous_references = section_reference_map(&previous_file)?;
+    let current_references = section_reference_map(&current_file)?;
+
+    let mut matched_sections = Vec::new();
+    for section in sections.iter().cloned() {
+        let Some(previous_index) = patch_section_index(&previous_file, &section)? else {
+            return Ok(None);
+        };
+        let Some(current_index) = match_current_patch_section_index(
+            &current_file,
+            &section,
+            previous_index,
+            &previous_references,
+            &current_references,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut previous = section.clone();
+        previous.section_index = previous_index.0 as u32;
+        let mut current = section;
+        current.section_index = current_index.0 as u32;
+        matched_sections.push(MatchedPatchSection { previous, current });
+    }
+
+    Ok(Some(matched_sections))
+}
+
+fn match_current_patch_section_index(
+    current_file: &object::File<'_>,
+    patch_section: &PatchSection,
+    previous_index: object::SectionIndex,
+    previous_references: &HashMap<object::SectionIndex, Vec<SectionReference>>,
+    current_references: &HashMap<object::SectionIndex, Vec<SectionReference>>,
+) -> Result<Option<object::SectionIndex>> {
+    if patch_section.section_name.is_some() {
+        return patch_section_index(current_file, patch_section);
+    }
+
+    let Some(previous_signature) = previous_references.get(&previous_index) else {
+        return Ok(None);
+    };
+    Ok(match_section_by_references(
+        previous_signature,
+        current_references,
+    ))
+}
+
+fn match_section_by_references(
+    previous_signature: &[SectionReference],
+    current_references: &HashMap<object::SectionIndex, Vec<SectionReference>>,
+) -> Option<object::SectionIndex> {
+    if previous_signature.is_empty() {
+        return None;
+    }
+
+    let mut matches = current_references
+        .iter()
+        .filter_map(|(index, signature)| (signature == previous_signature).then_some(*index));
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn section_reference_map(
+    file: &object::File<'_>,
+) -> Result<HashMap<object::SectionIndex, Vec<SectionReference>>> {
+    let mut references = HashMap::<object::SectionIndex, Vec<SectionReference>>::new();
+    for section in file.sections() {
+        let Some(source_section_name) = patch_section_name_for_matching(&section) else {
+            continue;
+        };
+        for (relocation_offset, relocation) in section.relocations() {
+            let Some(target_section) = relocation_target_section(file, relocation.target())? else {
+                continue;
+            };
+            references
+                .entry(target_section)
+                .or_default()
+                .push(SectionReference {
+                    source_section_name: source_section_name.clone(),
+                    relocation_offset,
+                    relocation_kind: format!("{:?}", relocation.kind()),
+                    relocation_encoding: format!("{:?}", relocation.encoding()),
+                    relocation_size: relocation.size(),
+                    relocation_addend: relocation.addend(),
+                });
+        }
+    }
+    for signature in references.values_mut() {
+        signature.sort();
+    }
+    Ok(references)
+}
+
+fn relocation_target_section(
+    file: &object::File<'_>,
+    target: object::RelocationTarget,
+) -> Result<Option<object::SectionIndex>> {
+    match target {
+        object::RelocationTarget::Section(section) => Ok(Some(section)),
+        object::RelocationTarget::Symbol(symbol) => {
+            Ok(file.symbol_by_index(symbol)?.section_index())
+        }
+        object::RelocationTarget::Absolute => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+fn changed_patch_sections(
+    state_dir: &Path,
+    previous_input: &FileState,
+    current_bytes: &[u8],
+    sections: &[MatchedPatchSection],
 ) -> Result<Option<Vec<PatchSection>>> {
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
@@ -1438,20 +1620,16 @@ fn changed_patch_sections(
         object::File::parse(current_bytes).context("Failed to parse current patch input")?;
     let mut changed_sections = Vec::new();
 
-    for patch_section in sections.iter().cloned() {
-        let Some(previous_section_index) = patch_section_index(&previous_file, &patch_section)?
-        else {
-            return Ok(None);
-        };
-        let Some(current_section_index) = patch_section_index(&current_file, &patch_section)?
-        else {
-            return Ok(None);
-        };
+    for patch_section in sections {
         let previous_section = previous_file
-            .section_by_index(previous_section_index)
+            .section_by_index(object::SectionIndex(
+                patch_section.previous.section_index as usize,
+            ))
             .context("Missing previous incremental patch section")?;
         let current_section = current_file
-            .section_by_index(current_section_index)
+            .section_by_index(object::SectionIndex(
+                patch_section.current.section_index as usize,
+            ))
             .context("Missing current incremental patch section")?;
         let previous_data = previous_section
             .data()
@@ -1460,7 +1638,7 @@ fn changed_patch_sections(
             .data()
             .context("Failed to read current incremental patch section data")?;
         if previous_data != current_data {
-            changed_sections.push(patch_section);
+            changed_sections.push(patch_section.current.clone());
         }
     }
 
@@ -2577,6 +2755,17 @@ mod tests {
         }
     }
 
+    fn section_reference(source_section_name: &str, relocation_offset: u64) -> SectionReference {
+        SectionReference {
+            source_section_name: source_section_name.to_owned(),
+            relocation_offset,
+            relocation_kind: "Absolute".to_owned(),
+            relocation_encoding: "Generic".to_owned(),
+            relocation_size: 64,
+            relocation_addend: 0,
+        }
+    }
+
     fn render_legacy_state(state: &PersistedState, version: &str) -> String {
         let mut out = String::new();
         writeln!(&mut out, "{version}").unwrap();
@@ -2878,11 +3067,47 @@ mod tests {
         };
 
         assert_eq!(
-            changed_patch_sections(&state_dir, &previous, &current, &[patch_section])
-                .unwrap()
-                .unwrap()
-                .len(),
+            changed_patch_sections(
+                &state_dir,
+                &previous,
+                &current,
+                &[MatchedPatchSection::same(patch_section)]
+            )
+            .unwrap()
+            .unwrap()
+            .len(),
             1
+        );
+    }
+
+    #[test]
+    fn reference_matching_resolves_unique_anonymous_section() {
+        let signature = vec![section_reference(".text.foo", 12)];
+        let current_references = HashMap::from([
+            (
+                object::SectionIndex(3),
+                vec![section_reference(".text.bar", 4)],
+            ),
+            (object::SectionIndex(7), signature.clone()),
+        ]);
+
+        assert_eq!(
+            match_section_by_references(&signature, &current_references),
+            Some(object::SectionIndex(7))
+        );
+    }
+
+    #[test]
+    fn reference_matching_rejects_ambiguous_anonymous_section() {
+        let signature = vec![section_reference(".text.foo", 12)];
+        let current_references = HashMap::from([
+            (object::SectionIndex(3), signature.clone()),
+            (object::SectionIndex(7), signature.clone()),
+        ]);
+
+        assert_eq!(
+            match_section_by_references(&signature, &current_references),
+            None
         );
     }
 
