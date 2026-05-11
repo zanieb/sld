@@ -1420,6 +1420,7 @@ fn section_allows_direct_patching<'data>(section: &impl object::ObjectSection<'d
 
 fn section_name_allows_direct_patching(name: &str) -> bool {
     !matches!(name, ".init" | ".fini")
+        && !name.starts_with(".eh_frame")
         && !name.starts_with(".init_array")
         && !name.starts_with(".fini_array")
         && !name.starts_with(".preinit_array")
@@ -3218,6 +3219,8 @@ mod tests {
     fn strictly_ordered_or_no_gap_sections_are_not_directly_patchable() {
         assert!(section_name_allows_direct_patching(".text.foo"));
         assert!(section_name_allows_direct_patching(".data.foo"));
+        assert!(!section_name_allows_direct_patching(".eh_frame"));
+        assert!(!section_name_allows_direct_patching(".eh_frame_hdr"));
         assert!(!section_name_allows_direct_patching(".init"));
         assert!(!section_name_allows_direct_patching(".fini"));
         assert!(!section_name_allows_direct_patching(".init_array"));
