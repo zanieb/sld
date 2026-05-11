@@ -1217,10 +1217,7 @@ impl PersistedState {
                 if !load_sections {
                     return Ok(None);
                 }
-                let path = state_dir.join(sections_file);
-                std::fs::read_to_string(&path).map(Some).with_context(|| {
-                    format!("Failed to read incremental sections `{}`", path.display())
-                })
+                read_sections_sidecar(state_dir, sections_file).map(Some)
             },
         )?))
     }
@@ -1507,6 +1504,22 @@ impl PersistedState {
         }
         out
     }
+}
+
+fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
+    let path = state_dir.join(file_name);
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read incremental sections `{}`", path.display()))?;
+    if file_name.starts_with(SECTIONS_FILE_PREFIX) {
+        let expected_name = section_sidecar_file_name(&contents);
+        if file_name != expected_name {
+            return Err(crate::error!(
+                "Incremental sections `{}` do not match their content hash",
+                path.display()
+            ));
+        }
+    }
+    Ok(contents)
 }
 
 impl PartialEq for FileContentState {
@@ -5310,6 +5323,32 @@ mod tests {
         let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert!(metadata.sections.is_empty());
         assert!(PersistedState::read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn hashed_sections_sidecar_must_match_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state.write(dir.path()).unwrap();
+        let sections_file = PersistedState::read_metadata(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        std::fs::write(
+            dir.path().join(&sections_file),
+            "section-inputs\t0\nsections\t0\n",
+        )
+        .unwrap();
+
+        let error = PersistedState::read(dir.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("do not match their content hash")
+        );
     }
 
     #[test]
