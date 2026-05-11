@@ -157,6 +157,9 @@
 //! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
 //! then checking that the changed-input incremental link matches a full relink.
 //!
+//! TestIncrementalChangedExpectPatch:{bool} Whether the changed-input incremental link should use
+//! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
+//!
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Defaults to the last linker input.
 //!
@@ -764,6 +767,7 @@ struct Config {
     test_update_in_place: bool,
     test_incremental: bool,
     test_incremental_changed: bool,
+    test_incremental_changed_expect_patch: bool,
     test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
     test_config: TestConfig,
@@ -1336,6 +1340,7 @@ impl Config {
             test_update_in_place: false,
             test_incremental: false,
             test_incremental_changed: false,
+            test_incremental_changed_expect_patch: true,
             test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
             test_config: test_config.clone(),
@@ -1711,6 +1716,9 @@ fn process_directive(
         }
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedExpectPatch" => {
+            config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedInput" => {
             config.test_incremental_changed_input = Some(arg.to_owned());
@@ -2114,18 +2122,40 @@ impl ProgramInputs {
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
-            if !log.contains("patched 1 changed input file before loading inputs") {
+            let patched_input_message = "patched 1 changed input file before loading inputs";
+            let patched_section_message = "patched 1 changed input sections before loading inputs";
+            let fallback_message = "changed-input patch unavailable before loading inputs";
+            if config.test_incremental_changed_expect_patch {
+                if !log.contains(patched_input_message) {
+                    bail!(
+                        "Incremental test failed for {}: changed-input relink did not patch the \
+                        changed input before loading all inputs. Log:\n{}",
+                        self.name(),
+                        log
+                    );
+                }
+                if !log.contains(patched_section_message) {
+                    bail!(
+                        "Incremental test failed for {}: changed-input relink did not narrow the \
+                        update to the changed section. Log:\n{}",
+                        self.name(),
+                        log
+                    );
+                }
+            } else if log.contains(patched_input_message) {
                 bail!(
-                    "Incremental test failed for {}: changed-input relink did not patch the \
-                    changed input before loading all inputs. Log:\n{}",
+                    "Incremental test failed for {}: changed input was unexpectedly patched \
+                    before loading all inputs. Log:\n{}",
                     self.name(),
                     log
                 );
-            }
-            if !log.contains("patched 1 changed input sections before loading inputs") {
+            } else if !log.contains(fallback_message)
+                || !log.contains("changed bytes outside patchable sections")
+                || !log.contains("full relink: input file changed:")
+            {
                 bail!(
-                    "Incremental test failed for {}: changed-input relink did not narrow the \
-                    update to the changed section. Log:\n{}",
+                    "Incremental test failed for {}: changed-input relink did not record the \
+                    expected incremental fallback. Log:\n{}",
                     self.name(),
                     log
                 );
