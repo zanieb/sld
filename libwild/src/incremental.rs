@@ -472,41 +472,65 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             .as_deref()
             .is_some_and(|sections_file| should_filter_sections_sidecar(&state_dir, sections_file));
         let should_retry_with_full_state = should_filter_records && rewritten_inputs.is_empty();
-        let mut records_complete = previous.sections_file.is_none() || !should_filter_records;
-        if should_filter_records {
-            let changed_input_files = changed_inputs
-                .iter()
-                .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
-                .collect::<HashSet<_>>();
-            previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
-        }
-
-        if !should_filter_records
-            && previous.sections_file.is_some()
-            && let Some(mut full_previous) = PersistedState::read(&state_dir)?
-        {
-            full_previous.input_files = previous.input_files;
-            previous = full_previous;
-            records_complete = true;
-        }
-        let result = patch_changed_inputs(
-            args,
-            &state_dir,
-            previous,
-            current_link_start.clone(),
-            records_complete,
-            &changed_inputs,
-        )?;
-        let result = if let ChangedInputPatchResult::Unsupported(reason) = result {
-            if should_retry_with_full_state
-                && let Some(full_previous) = PersistedState::read(&state_dir)?
-            {
+        let result = if should_filter_records {
+            let result = patch_changed_inputs(
+                args,
+                &state_dir,
+                previous,
+                current_link_start.clone(),
+                false,
+                &changed_inputs,
+            )?;
+            if let ChangedInputPatchResult::Unsupported(reason) = result {
                 append_log(
                     &state_dir,
                     &format!(
                         "metadata-only changed-input patch unavailable before loading inputs: {reason}"
                     ),
                 )?;
+                let Some(mut previous) = PersistedState::read_metadata(&state_dir)? else {
+                    return Ok(false);
+                };
+                previous
+                    .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
+                let changed_input_files = changed_inputs
+                    .iter()
+                    .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
+                    .collect::<HashSet<_>>();
+                previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                patch_changed_inputs(
+                    args,
+                    &state_dir,
+                    previous,
+                    current_link_start.clone(),
+                    false,
+                    &changed_inputs,
+                )?
+            } else {
+                result
+            }
+        } else {
+            let mut records_complete = previous.sections_file.is_none();
+            if previous.sections_file.is_some()
+                && let Some(mut full_previous) = PersistedState::read(&state_dir)?
+            {
+                full_previous.input_files = previous.input_files;
+                previous = full_previous;
+                records_complete = true;
+            }
+            patch_changed_inputs(
+                args,
+                &state_dir,
+                previous,
+                current_link_start.clone(),
+                records_complete,
+                &changed_inputs,
+            )?
+        };
+        let result = if let ChangedInputPatchResult::Unsupported(reason) = result {
+            if should_retry_with_full_state
+                && let Some(full_previous) = PersistedState::read(&state_dir)?
+            {
                 patch_changed_inputs(
                     args,
                     &state_dir,
@@ -1042,10 +1066,26 @@ fn patch_changed_inputs(
                 } else {
                     false
                 };
+                let metadata_only_fingerprint_matches = !records_complete
+                    && previous.sections.is_empty()
+                    && previous.relocations.is_empty()
+                    && previous.fdes.is_empty()
+                    && previous.dynamic_relocations.is_empty()
+                    && if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                        patch_fingerprint_matches_previous_without_extra_ranges(
+                            previous_bytes,
+                            fingerprint.as_str(),
+                            input.path.as_str(),
+                            &matched_sections,
+                        )?
+                    } else {
+                        false
+                    };
                 if !allows_dynamic_relocation_removal
                     && !allows_dynamic_relocation_addition
                     && !allows_fde_removal
                     && !allows_fde_addition
+                    && !metadata_only_fingerprint_matches
                 {
                     return Ok(ChangedInputPatchResult::Unsupported(format!(
                         "changed bytes outside patchable sections in `{}`",
@@ -2250,6 +2290,7 @@ impl PersistedState {
         let Some(sections_file) = self.sections_file.as_deref() else {
             return Ok(());
         };
+        timing_phase!("Read incremental sidecar records");
         let contents = read_sections_sidecar(state_dir, sections_file)?;
         let records = parse_compact_records_block_for_input_files(contents.lines(), input_files)?;
         self.sections = records.sections;
@@ -3979,6 +4020,24 @@ fn patch_fingerprint_with_extra_ranges(
     }
     hasher.update(&bytes[position..]);
     Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
+fn patch_fingerprint_matches_previous_without_extra_ranges(
+    previous_bytes: &[u8],
+    current_fingerprint: &str,
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+) -> Result<bool> {
+    Ok(patch_fingerprint_with_extra_ranges(
+        previous_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.previous.clone()),
+        std::iter::empty(),
+    )?
+    .as_deref()
+        == Some(current_fingerprint))
 }
 
 fn normalize_patch_ranges(
@@ -9594,6 +9653,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_fingerprint_matches_previous_without_extra_ranges() {
+        let bytes = relocated_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+        let previous_with_extra = patch_fingerprint_with_extra_ranges(
+            &bytes,
+            &input_ref,
+            [patch_section.clone()],
+            [0x90..0x98],
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut current = bytes.clone();
+        current[0x40] ^= 1;
+        let current_without_extra =
+            patch_fingerprint(&current, &input_ref, [patch_section.clone()])
+                .unwrap()
+                .unwrap();
+        assert_ne!(previous_with_extra, current_without_extra);
+
+        assert!(
+            patch_fingerprint_matches_previous_without_extra_ranges(
+                &bytes,
+                current_without_extra.as_str(),
+                &input_ref,
+                &[MatchedPatchSection::same(patch_section)],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn patch_fingerprint_allows_dynamic_relocation_addend_changes() {
         let bytes = relocated_data_elf();
         let input_ref = encode_path(Path::new("input.o"));
@@ -12208,6 +12308,36 @@ mod tests {
                 .dynamic_relocations
                 .iter()
                 .all(|record| record.input_file == hex::encode("a.o"))
+        );
+    }
+
+    #[test]
+    fn read_records_for_input_files_validates_sections_sidecar_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+        let sections_file = PersistedState::read_metadata(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        std::fs::write(
+            dir.path().join(&sections_file),
+            "section-inputs\t0\nsections\t0\n",
+        )
+        .unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
+
+        let error = metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("do not match their content hash")
         );
     }
 
