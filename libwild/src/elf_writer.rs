@@ -269,6 +269,7 @@ fn write_file_contents<'data, A: Arch<Platform = Elf>>(
                 group.strtab_start_offset,
                 &mut buffers,
                 group.format_specific.eh_frame_start_address,
+                *group_file_offsets.get(part_id::EH_FRAME) as u64,
             );
 
             for file in &group.files {
@@ -633,6 +634,7 @@ struct TableWriter<'layout, 'out> {
     dynsym_writer: SymbolTableWriter<'layout, 'out>,
     debug_symbol_writer: SymbolTableWriter<'layout, 'out>,
     eh_frame_start_address: u64,
+    eh_frame_start_file_offset: u64,
     eh_frame: &'out mut [u8],
 
     /// Note, this is stored as raw bytes because it starts with an EhFrameHdr, but is then
@@ -650,6 +652,7 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         strtab_start_offset: u32,
         buffers: &mut OutputSectionPartMap<&'out mut [u8]>,
         eh_frame_start_address: u64,
+        eh_frame_start_file_offset: u64,
     ) -> TableWriter<'layout, 'out> {
         let dynsym_writer =
             SymbolTableWriter::new_dynamic(dynstr_start_offset, buffers, &layout.output_sections);
@@ -663,6 +666,7 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
             dynsym_writer,
             debug_symbol_writer,
             eh_frame_start_address,
+            eh_frame_start_file_offset,
             layout.symbol_db.args.is_relr_enabled(),
         )
     }
@@ -674,6 +678,7 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
         dynsym_writer: SymbolTableWriter<'layout, 'out>,
         debug_symbol_writer: SymbolTableWriter<'layout, 'out>,
         eh_frame_start_address: u64,
+        eh_frame_start_file_offset: u64,
         pack_relative_relocs: bool,
     ) -> TableWriter<'layout, 'out> {
         let eh_frame = buffers.take(part_id::EH_FRAME);
@@ -700,6 +705,7 @@ impl<'layout, 'out> TableWriter<'layout, 'out> {
             dynsym_writer,
             debug_symbol_writer,
             eh_frame_start_address,
+            eh_frame_start_file_offset,
             eh_frame,
             eh_frame_hdr,
             dynamic,
@@ -1519,7 +1525,14 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
                 )?;
             }
             SectionSlot::FrameData(section_index) => {
-                write_eh_frame_data::<A>(object, *section_index, layout, table_writer, trace)?;
+                write_eh_frame_data::<A>(
+                    object,
+                    *section_index,
+                    layout,
+                    table_writer,
+                    trace,
+                    incremental,
+                )?;
             }
             _ => (),
         }
@@ -2514,22 +2527,27 @@ fn write_eh_frame_data<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
+    incremental: &PreparedState,
 ) -> Result {
     let eh_frame_section = object.object.section(eh_frame_section_index)?;
     match object.relocations(eh_frame_section_index)? {
         elf::RelocationList::Rela(relocations) => write_eh_frame_relocations::<A, Rela>(
             object,
+            eh_frame_section_index,
             layout,
             table_writer,
             trace,
+            incremental,
             eh_frame_section,
             relocations.rel_iter(),
         ),
         elf::RelocationList::Crel(relocations) => write_eh_frame_relocations::<A, Crel>(
             object,
+            eh_frame_section_index,
             layout,
             table_writer,
             trace,
+            incremental,
             eh_frame_section,
             relocations.flat_map(|r| r.ok()),
         ),
@@ -2538,9 +2556,11 @@ fn write_eh_frame_data<'data, A: Arch<Platform = Elf>>(
 
 fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     object: &ObjectLayout<'data, Elf>,
+    eh_frame_section_index: object::SectionIndex,
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
+    incremental: &PreparedState,
     eh_frame_section: &object::elf::SectionHeader64<LittleEndian>,
     relocations: impl Iterator<Item = R>,
 ) -> std::result::Result<(), error::Error> {
@@ -2569,6 +2589,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
         }
         let mut should_keep = false;
         let mut output_cie_offset = None;
+        let mut target_section_index = None;
         if prefix.cie_id == 0 {
             // This is a CIE
             cies_offset_conversion.insert(input_pos as u32, output_pos as u32);
@@ -2602,6 +2623,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
                                 != 0
                         {
                             should_keep = true;
+                            target_section_index = Some(section_index);
                             let cie_pointer_pos = input_pos as u32 + 4;
                             let input_cie_pos = cie_pointer_pos
                                 .checked_sub(prefix.cie_id)
@@ -2641,10 +2663,21 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
             }
         }
         if should_keep {
+            let output_file_offset = table_writer.eh_frame_start_file_offset + output_pos as u64;
             let entry_out = table_writer.take_eh_frame_data(next_output_pos - output_pos)?;
             entry_out.copy_from_slice(&data[input_pos..next_input_pos]);
             if let Some(output_cie_offset) = output_cie_offset {
                 entry_out[4..8].copy_from_slice(&output_cie_offset.to_le_bytes());
+            }
+            if let Some(section_index) = target_section_index {
+                incremental.record_eh_frame_fde(
+                    object.input,
+                    section_index,
+                    eh_frame_section_index,
+                    input_pos as u64,
+                    output_file_offset,
+                    size as u64,
+                );
             }
             while let Some(rel) = relocations.peek() {
                 let rel_offset = rel.offset();
@@ -2705,6 +2738,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     }
 
     table_writer.eh_frame_start_address += output_pos as u64;
+    table_writer.eh_frame_start_file_offset += output_pos as u64;
 
     Ok(())
 }
@@ -5933,6 +5967,7 @@ pub(crate) fn verify_resolution_allocation(
         &mut buffers,
         dynsym_writer,
         debug_symbol_writer,
+        0,
         0,
         args.is_relr_enabled(),
     );

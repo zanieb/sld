@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v17";
+const STATE_VERSION: &str = "wild-incremental-state-v18";
+const STATE_VERSION_V17: &str = "wild-incremental-state-v17";
 const STATE_VERSION_V16: &str = "wild-incremental-state-v16";
 const STATE_VERSION_V15: &str = "wild-incremental-state-v15";
 const STATE_VERSION_V14: &str = "wild-incremental-state-v14";
@@ -64,7 +65,9 @@ pub(crate) struct PreparedState {
     current: CurrentState,
     reusable_inputs: HashSet<String>,
     previous_sections: HashSet<SectionRecord>,
+    previous_fdes: Vec<FdeRecord>,
     current_sections: Mutex<Vec<SectionRecord>>,
+    current_fdes: Mutex<Vec<FdeRecord>>,
     reused_sections: AtomicUsize,
 }
 
@@ -98,6 +101,7 @@ struct PersistedState {
     build_id_hashes: Option<BuildIdHashState>,
     input_files: Vec<FileState>,
     sections: Vec<SectionRecord>,
+    fdes: Vec<FdeRecord>,
     sections_file: Option<String>,
 }
 
@@ -173,6 +177,17 @@ pub(crate) struct SectionRecord {
     size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct FdeRecord {
+    input_file: String,
+    input: String,
+    section_index: u32,
+    eh_frame_section_index: u32,
+    input_offset: u64,
+    output_offset: u64,
+    size: u64,
+}
+
 pub(crate) fn maybe_prepare(
     args: &impl platform::Args,
     file_loader: &FileLoader<'_>,
@@ -190,7 +205,9 @@ pub(crate) fn maybe_prepare(
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_fdes: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
         });
     }
@@ -226,10 +243,12 @@ pub(crate) fn maybe_prepare(
     };
 
     let mut previous_sections = HashSet::new();
+    let mut previous_fdes = Vec::new();
     if mode_needs_previous_sections(&mode) {
         match PersistedState::read(&state_dir) {
             Ok(Some(previous)) => {
                 previous_sections = previous.sections.iter().cloned().collect();
+                previous_fdes = previous.fdes;
             }
             Ok(None) => {
                 mode = IncrementalMode::Relink {
@@ -258,7 +277,9 @@ pub(crate) fn maybe_prepare(
         current,
         reusable_inputs,
         previous_sections,
+        previous_fdes,
         current_sections: Mutex::new(Vec::new()),
+        current_fdes: Mutex::new(Vec::new()),
         reused_sections: AtomicUsize::new(0),
     })
 }
@@ -703,6 +724,7 @@ fn patch_changed_inputs(
         build_id_hashes,
         input_files: previous.input_files,
         sections: previous.sections,
+        fdes: previous.fdes,
         sections_file: previous.sections_file,
     }
     .write_metadata_update(state_dir)?;
@@ -1080,6 +1102,28 @@ impl PreparedState {
             .push(generated_section_record(name, output_offset, size));
     }
 
+    pub(crate) fn record_eh_frame_fde(
+        &self,
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        eh_frame_section_index: object::SectionIndex,
+        input_offset: u64,
+        output_offset: u64,
+        size: u64,
+    ) {
+        if self.mode == IncrementalMode::Disabled || size == 0 {
+            return;
+        }
+        self.current_fdes.lock().unwrap().push(FdeRecord::new(
+            input,
+            section_index,
+            eh_frame_section_index,
+            input_offset,
+            output_offset,
+            size,
+        ));
+    }
+
     pub(crate) fn finish(
         &self,
         args: &impl platform::Args,
@@ -1112,6 +1156,12 @@ impl PreparedState {
         }
         sections.sort();
 
+        let mut fdes = self.current_fdes.lock().unwrap().clone();
+        if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
+            fdes.extend(self.previous_fdes.iter().cloned());
+        }
+        fdes.sort();
+
         let mut input_files = self.current.input_files.clone();
         record_patch_fingerprints(&mut input_files, file_loader, &sections, &mut output_bytes)?;
         snapshot_loaded_files(&self.current.state_dir, file_loader)?;
@@ -1126,6 +1176,7 @@ impl PreparedState {
             build_id_hashes,
             input_files,
             sections,
+            fdes,
             sections_file: None,
         };
 
@@ -1332,6 +1383,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V17
             && version != STATE_VERSION_V16
             && version != STATE_VERSION_V15
             && version != STATE_VERSION_V14
@@ -1413,7 +1465,9 @@ impl PersistedState {
         }
 
         let mut sections_file = None;
+        let mut fdes = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V17
             || version == STATE_VERSION_V16
             || version == STATE_VERSION_V15
             || version == STATE_VERSION_V14
@@ -1433,14 +1487,18 @@ impl PersistedState {
             if first_line.starts_with("sections-file\t") {
                 let file = parse_prefixed_line(Some(first_line), "sections-file")?.to_owned();
                 validate_sections_file_name(&file)?;
-                let sections = load_sections(&file)?
-                    .map(|contents| parse_compact_sections_block(contents.lines()))
+                let records = load_sections(&file)?
+                    .map(|contents| parse_compact_records_block(contents.lines()))
                     .transpose()?
                     .unwrap_or_default();
                 sections_file = Some(file);
-                sections
+                fdes = records.fdes;
+                records.sections
             } else {
-                parse_compact_sections_block(std::iter::once(first_line).chain(&mut lines))?
+                let records =
+                    parse_compact_records_block(std::iter::once(first_line).chain(&mut lines))?;
+                fdes = records.fdes;
+                records.sections
             }
         } else if version == STATE_VERSION_V4
             || version == STATE_VERSION_V3
@@ -1472,6 +1530,7 @@ impl PersistedState {
             build_id_hashes,
             input_files,
             sections,
+            fdes,
             sections_file,
         })
     }
@@ -1617,12 +1676,20 @@ impl PersistedState {
         let mut section_inputs = Vec::new();
         let mut section_input_ids = HashMap::new();
         for section in &self.sections {
-            let key = (section.input_file.as_str(), section.input.as_str());
-            if !section_input_ids.contains_key(&key) {
-                let index = section_inputs.len();
-                section_input_ids.insert(key, index);
-                section_inputs.push(key);
-            }
+            add_section_input(
+                &mut section_inputs,
+                &mut section_input_ids,
+                section.input_file.as_str(),
+                section.input.as_str(),
+            );
+        }
+        for fde in &self.fdes {
+            add_section_input(
+                &mut section_inputs,
+                &mut section_input_ids,
+                fde.input_file.as_str(),
+                fde.input.as_str(),
+            );
         }
 
         writeln!(&mut out, "section-inputs\t{}", section_inputs.len()).unwrap();
@@ -1641,7 +1708,37 @@ impl PersistedState {
             )
             .unwrap();
         }
+        writeln!(&mut out, "fdes\t{}", self.fdes.len()).unwrap();
+        for fde in &self.fdes {
+            let section_input_id =
+                section_input_ids[&(fde.input_file.as_str(), fde.input.as_str())];
+            writeln!(
+                &mut out,
+                "fde\t{}\t{}\t{}\t{}\t{}\t{}",
+                section_input_id,
+                fde.section_index,
+                fde.eh_frame_section_index,
+                fde.input_offset,
+                fde.output_offset,
+                fde.size
+            )
+            .unwrap();
+        }
         out
+    }
+}
+
+fn add_section_input<'a>(
+    section_inputs: &mut Vec<(&'a str, &'a str)>,
+    section_input_ids: &mut HashMap<(&'a str, &'a str), usize>,
+    input_file: &'a str,
+    input: &'a str,
+) {
+    let key = (input_file, input);
+    if !section_input_ids.contains_key(&key) {
+        let index = section_inputs.len();
+        section_input_ids.insert(key, index);
+        section_inputs.push(key);
     }
 }
 
@@ -1701,6 +1798,27 @@ impl SectionRecord {
             input_file: encode_path(&input.file.filename),
             input: encode_input_ref(input),
             section_index: section_index.0 as u32,
+            output_offset,
+            size,
+        }
+    }
+}
+
+impl FdeRecord {
+    fn new(
+        input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        eh_frame_section_index: object::SectionIndex,
+        input_offset: u64,
+        output_offset: u64,
+        size: u64,
+    ) -> Self {
+        Self {
+            input_file: encode_path(&input.file.filename),
+            input: encode_input_ref(input),
+            section_index: section_index.0 as u32,
+            eh_frame_section_index: eh_frame_section_index.0 as u32,
+            input_offset,
             output_offset,
             size,
         }
@@ -3434,9 +3552,15 @@ fn parse_build_id_hash_line(line: Option<&str>) -> Result<Option<BuildIdHashStat
     }))
 }
 
-fn parse_compact_sections_block<'a>(
+#[derive(Default)]
+struct CompactRecords {
+    sections: Vec<SectionRecord>,
+    fdes: Vec<FdeRecord>,
+}
+
+fn parse_compact_records_block<'a>(
     mut lines: impl Iterator<Item = &'a str>,
-) -> Result<Vec<SectionRecord>> {
+) -> Result<CompactRecords> {
     let section_input_count: usize = parse_prefixed_line(lines.next(), "section-inputs")?
         .parse()
         .context("Invalid incremental section input count")?;
@@ -3456,12 +3580,25 @@ fn parse_compact_sections_block<'a>(
         let line = lines.next().context("Missing incremental section record")?;
         sections.push(parse_compact_section_line(line, &section_inputs)?);
     }
+    let fdes = if let Some(line) = lines.next() {
+        let fde_count: usize = parse_prefixed_line(Some(line), "fdes")?
+            .parse()
+            .context("Invalid incremental FDE count")?;
+        let mut fdes = Vec::with_capacity(fde_count);
+        for _ in 0..fde_count {
+            let line = lines.next().context("Missing incremental FDE record")?;
+            fdes.push(parse_compact_fde_line(line, &section_inputs)?);
+        }
+        fdes
+    } else {
+        Vec::new()
+    };
     if lines.next().is_some() {
         return Err(crate::error!(
             "Unexpected trailing incremental section data"
         ));
     }
-    Ok(sections)
+    Ok(CompactRecords { sections, fdes })
 }
 
 fn parse_input_line(line: &str) -> Result<FileState> {
@@ -3683,6 +3820,56 @@ fn parse_compact_section_line(
         input_file: input_file.clone(),
         input: input.clone(),
         section_index,
+        output_offset,
+        size,
+    })
+}
+
+fn parse_compact_fde_line(line: &str, section_inputs: &[(String, String)]) -> Result<FdeRecord> {
+    let rest = parse_prefixed_line(Some(line), "fde")?;
+    let mut parts = rest.split('\t');
+    let section_input_id: usize = parts
+        .next()
+        .context("Malformed incremental FDE input index")?
+        .parse()
+        .context("Invalid incremental FDE input index")?;
+    let section_index = parts
+        .next()
+        .context("Malformed incremental FDE section index")?
+        .parse()
+        .context("Invalid incremental FDE section index")?;
+    let eh_frame_section_index = parts
+        .next()
+        .context("Malformed incremental FDE .eh_frame section index")?
+        .parse()
+        .context("Invalid incremental FDE .eh_frame section index")?;
+    let input_offset = parts
+        .next()
+        .context("Malformed incremental FDE input offset")?
+        .parse()
+        .context("Invalid incremental FDE input offset")?;
+    let output_offset = parts
+        .next()
+        .context("Malformed incremental FDE output offset")?
+        .parse()
+        .context("Invalid incremental FDE output offset")?;
+    let size = parts
+        .next()
+        .context("Malformed incremental FDE size")?
+        .parse()
+        .context("Invalid incremental FDE size")?;
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental FDE record"));
+    }
+    let (input_file, input) = section_inputs
+        .get(section_input_id)
+        .context("Incremental FDE input index out of bounds")?;
+    Ok(FdeRecord {
+        input_file: input_file.clone(),
+        input: input.clone(),
+        section_index,
+        eh_frame_section_index,
+        input_offset,
         output_offset,
         size,
     })
@@ -4153,6 +4340,7 @@ mod tests {
                 })
                 .collect(),
             sections: Vec::new(),
+            fdes: Vec::new(),
             sections_file: None,
         }
     }
@@ -4176,6 +4364,25 @@ mod tests {
             input_file: hex::encode(input),
             input: hex::encode(input),
             section_index,
+            output_offset,
+            size,
+        }
+    }
+
+    fn fde_record(
+        input: &str,
+        section_index: u32,
+        eh_frame_section_index: u32,
+        input_offset: u64,
+        output_offset: u64,
+        size: u64,
+    ) -> FdeRecord {
+        FdeRecord {
+            input_file: hex::encode(input),
+            input: hex::encode(input),
+            section_index,
+            eh_frame_section_index,
+            input_offset,
             output_offset,
             size,
         }
@@ -5333,6 +5540,19 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_round_trips_fde_records() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state.fdes.push(fde_record("a.o", 1, 4, 32, 200, 24));
+
+        let rendered = state.render();
+
+        assert!(rendered.contains("\nfdes\t1\n"));
+        assert!(rendered.contains("\nfde\t0\t1\t4\t32\t200\t24\n"));
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
     fn persisted_state_round_trips_patch_metadata() {
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"bbb")]);
         state.input_files[0].patch = Some(FilePatchState {
@@ -5670,6 +5890,7 @@ mod tests {
                 patch: None,
             }],
             sections: Vec::new(),
+            fdes: Vec::new(),
             sections_file: None,
         };
 
@@ -6574,7 +6795,9 @@ mod tests {
             },
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
             previous_sections: [record].into_iter().collect(),
+            previous_fdes: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -6607,7 +6830,9 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_fdes: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -6632,7 +6857,9 @@ mod tests {
             },
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
+            previous_fdes: Vec::new(),
             current_sections: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -6643,6 +6870,65 @@ mod tests {
             *state.current_sections.lock().unwrap(),
             vec![generated_section_record(
                 "generated:.rela.dyn.general",
+                256,
+                24
+            )]
+        );
+    }
+
+    #[test]
+    fn record_eh_frame_fde_records_non_empty_ranges() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("a.o");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "no previous incremental state".to_owned(),
+                can_reuse_unchanged_sections: false,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
+                wild_version: "wild-test".to_owned(),
+                input_files: Vec::new(),
+            },
+            reusable_inputs: HashSet::new(),
+            previous_sections: HashSet::new(),
+            previous_fdes: Vec::new(),
+            current_sections: Mutex::new(Vec::new()),
+            current_fdes: Mutex::new(Vec::new()),
+            reused_sections: AtomicUsize::new(0),
+        };
+
+        state.record_eh_frame_fde(
+            input,
+            object::SectionIndex(3),
+            object::SectionIndex(5),
+            32,
+            256,
+            24,
+        );
+        state.record_eh_frame_fde(
+            input,
+            object::SectionIndex(3),
+            object::SectionIndex(5),
+            56,
+            280,
+            0,
+        );
+
+        assert_eq!(
+            *state.current_fdes.lock().unwrap(),
+            vec![FdeRecord::new(
+                input,
+                object::SectionIndex(3),
+                object::SectionIndex(5),
+                32,
                 256,
                 24
             )]

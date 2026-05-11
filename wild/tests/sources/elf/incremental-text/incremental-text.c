@@ -11,6 +11,7 @@
 //#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
 //#TestIncrementalChangedSection:.rela.eh_frame
 //#TestIncrementalChangedSectionOffset:16
+//#TestIncrementalStateContains:fde\t
 
 int incremental_text_value(void);
 

@@ -208,6 +208,10 @@
 //! TestIncrementalChangedSymbolBytes:{symbol_name}=0x{hex_bytes} Checks that bytes at the changed
 //! incremental output symbol address match the specified bytes.
 //!
+//! TestIncrementalStateContains:{string} Checks that the incremental index or sections sidecar
+//! contains the specified text after the second unchanged incremental link. `\t` is decoded to a
+//! tab for matching.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -826,6 +830,7 @@ struct Config {
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
+    test_incremental_state_contains: Vec<String>,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1430,6 +1435,7 @@ impl Config {
             test_incremental_changed_compare_full: true,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
+            test_incremental_state_contains: Vec::new(),
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1885,6 +1891,11 @@ fn process_directive(
                 expected_bytes,
             });
         }
+        "TestIncrementalStateContains" => {
+            config
+                .test_incremental_state_contains
+                .push(arg.replace("\\t", "\t"));
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -2172,6 +2183,19 @@ impl ProgramInputs {
                 self.name(),
                 log
             );
+        }
+        if !config.test_incremental_state_contains.is_empty() {
+            let state_text = read_incremental_state_text(&link_output_2.binary)?;
+            for expected in &config.test_incremental_state_contains {
+                if !state_text.contains(expected) {
+                    bail!(
+                        "Incremental test failed for {}: incremental state did not contain `{}`. State:\n{}",
+                        self.name(),
+                        expected.escape_debug(),
+                        state_text
+                    );
+                }
+            }
         }
 
         if config.test_incremental_interrupted {
@@ -4635,6 +4659,32 @@ fn append_to_path(path: &Path, extra: &str) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(extra);
     PathBuf::from(path)
+}
+
+fn read_incremental_state_text(output: &Path) -> Result<String> {
+    let state_dir = append_to_path(output, ".incr");
+    let index_path = state_dir.join("index");
+    let mut state_text = std::fs::read_to_string(&index_path).with_context(|| {
+        format!(
+            "Failed to read incremental state `{}`",
+            index_path.display()
+        )
+    })?;
+    if let Some(sections_file) = state_text
+        .lines()
+        .find_map(|line| line.strip_prefix("sections-file\t"))
+    {
+        let sections_path = state_dir.join(sections_file);
+        let sections = std::fs::read_to_string(&sections_path).with_context(|| {
+            format!(
+                "Failed to read incremental sections `{}`",
+                sections_path.display()
+            )
+        })?;
+        state_text.push('\n');
+        state_text.push_str(&sections);
+    }
+    Ok(state_text)
 }
 
 fn add_inputs_to_command(config: &Config, inputs: &[LinkerInput], command: &mut Command) {
