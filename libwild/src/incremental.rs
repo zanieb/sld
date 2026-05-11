@@ -48,6 +48,7 @@ const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const SECTIONS_FILE: &str = "sections";
+const SECTIONS_FILE_PREFIX: &str = "sections-";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const ABSENT_FIELD: &str = "-";
@@ -1076,8 +1077,13 @@ impl PersistedState {
     }
 
     fn write(&self, state_dir: &Path) -> Result {
-        self.write_sections(state_dir)?;
-        self.write_index(state_dir)
+        let sections = self.render_sections();
+        let sections_file = section_sidecar_file_name(&sections);
+        self.write_sections(state_dir, &sections_file, &sections)?;
+
+        let mut state = self.clone();
+        state.sections_file = Some(sections_file);
+        state.write_index(state_dir)
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -1107,7 +1113,7 @@ impl PersistedState {
         Ok(())
     }
 
-    fn write_sections(&self, state_dir: &Path) -> Result {
+    fn write_sections(&self, state_dir: &Path, file_name: &str, contents: &str) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "Failed to create incremental state directory `{}`",
@@ -1115,9 +1121,9 @@ impl PersistedState {
             )
         })?;
 
-        let path = state_dir.join(SECTIONS_FILE);
-        let tmp_path = state_dir.join(format!("{SECTIONS_FILE}.tmp"));
-        std::fs::write(&tmp_path, self.render_sections()).with_context(|| {
+        let path = state_dir.join(file_name);
+        let tmp_path = state_dir.join(format!("{file_name}.tmp"));
+        std::fs::write(&tmp_path, contents).with_context(|| {
             format!(
                 "Failed to write incremental sections `{}`",
                 tmp_path.display()
@@ -1135,7 +1141,12 @@ impl PersistedState {
 
     fn render_index(&self) -> String {
         let mut out = self.render_header_and_inputs();
-        writeln!(&mut out, "sections-file\t{SECTIONS_FILE}").unwrap();
+        writeln!(
+            &mut out,
+            "sections-file\t{}",
+            self.sections_file.as_deref().unwrap_or(SECTIONS_FILE)
+        )
+        .unwrap();
         out
     }
 
@@ -3260,6 +3271,10 @@ fn hash_text(text: &str) -> String {
     hash_bytes(text.as_bytes())
 }
 
+fn section_sidecar_file_name(contents: &str) -> String {
+    format!("{SECTIONS_FILE_PREFIX}{}", hash_text(contents))
+}
+
 fn args_hash(args: &impl platform::Args) -> String {
     hash_text(&format!("{args:?}"))
 }
@@ -4212,11 +4227,43 @@ mod tests {
 
         state.write_metadata_update(dir.path()).unwrap();
 
-        assert!(dir.path().join(SECTIONS_FILE).exists());
+        let sections_file = section_sidecar_file_name(&state.render_sections());
+        assert!(dir.path().join(&sections_file).exists());
+        let index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        assert!(index.contains(&format!("\nsections-file\t{sections_file}\n")));
         assert_eq!(
             PersistedState::read(dir.path()).unwrap().unwrap().sections,
             state.sections
         );
+    }
+
+    #[test]
+    fn section_sidecars_are_not_replaced_before_index_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old_state = state("old-args", b"old-output", &[("a.o", b"a")]);
+        old_state.sections.push(section_record("a.o", 1, 100, 12));
+        old_state.write(dir.path()).unwrap();
+        let old_sections_file = PersistedState::read(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+
+        let mut new_state = state("new-args", b"new-output", &[("b.o", b"b")]);
+        new_state.sections.push(section_record("b.o", 7, 900, 16));
+        let new_sections = new_state.render_sections();
+        let new_sections_file = section_sidecar_file_name(&new_sections);
+        new_state
+            .write_sections(dir.path(), &new_sections_file, &new_sections)
+            .unwrap();
+
+        let read_after_torn_write = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert_eq!(read_after_torn_write.sections, old_state.sections);
+        assert_eq!(
+            read_after_torn_write.sections_file.as_deref(),
+            Some(old_sections_file.as_str())
+        );
+        assert!(dir.path().join(new_sections_file).exists());
     }
 
     #[test]
