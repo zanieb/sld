@@ -61,6 +61,8 @@ const STATE_VERSION_V1: &str = "wild-incremental-state-v1";
 const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
+const METADATA_UPDATE_FILE: &str = "metadata-update";
+const METADATA_UPDATE_VERSION: &str = "wild-incremental-metadata-update-v1";
 const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
@@ -144,6 +146,7 @@ struct FileState {
 struct FilePatchState {
     fingerprint: String,
     sections: Vec<FilePatchSectionState>,
+    raw_sections: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +158,12 @@ struct FilePatchSectionState {
     output_offset: u64,
     output_size: u64,
     data_hash: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum PatchSectionReadMode {
+    Parse,
+    PreserveRaw,
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -446,24 +455,86 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !changed_inputs.is_empty() {
-        if previous.sections_file.is_some()
+        let changed_input_indices = changed_inputs
+            .iter()
+            .map(|(input_index, _)| *input_index)
+            .collect::<HashSet<_>>();
+        if changed_input_indices.iter().any(|index| {
+            previous.input_files[*index]
+                .patch
+                .as_ref()
+                .is_some_and(|patch| patch.sections.is_empty() && patch.raw_sections.is_none())
+        }) {
+            previous.read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
+        }
+        let should_filter_records = previous
+            .sections_file
+            .as_deref()
+            .is_some_and(|sections_file| should_filter_sections_sidecar(&state_dir, sections_file));
+        let should_retry_with_full_state = should_filter_records && rewritten_inputs.is_empty();
+        let mut records_complete = previous.sections_file.is_none() || !should_filter_records;
+        if should_filter_records {
+            let changed_input_files = changed_inputs
+                .iter()
+                .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
+                .collect::<HashSet<_>>();
+            previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+        }
+
+        if !should_filter_records
+            && previous.sections_file.is_some()
             && let Some(mut full_previous) = PersistedState::read(&state_dir)?
         {
             full_previous.input_files = previous.input_files;
             previous = full_previous;
+            records_complete = true;
         }
-        match patch_changed_inputs(
+        let result = patch_changed_inputs(
             args,
             &state_dir,
             previous,
-            current_link_start,
+            current_link_start.clone(),
+            records_complete,
             &changed_inputs,
-        )? {
+        )?;
+        let result = if let ChangedInputPatchResult::Unsupported(reason) = result {
+            if should_retry_with_full_state
+                && let Some(full_previous) = PersistedState::read(&state_dir)?
+            {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "metadata-only changed-input patch unavailable before loading inputs: {reason}"
+                    ),
+                )?;
+                patch_changed_inputs(
+                    args,
+                    &state_dir,
+                    full_previous,
+                    current_link_start,
+                    true,
+                    &changed_inputs,
+                )?
+            } else {
+                ChangedInputPatchResult::Unsupported(reason)
+            }
+        } else {
+            result
+        };
+        match result {
             ChangedInputPatchResult::Patched => return Ok(true),
             ChangedInputPatchResult::Unsupported(reason) => {
                 append_log(
                     &state_dir,
                     &format!("changed-input patch unavailable before loading inputs: {reason}"),
+                )?;
+            }
+            ChangedInputPatchResult::StartedUnsupported(reason) => {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "changed-input patch failed after starting update before loading inputs: {reason}"
+                    ),
                 )?;
             }
         }
@@ -479,8 +550,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !rewritten_inputs.is_empty() || checked_ambiguous_inputs {
-        previous.link_start = current_link_start;
-        previous.write_metadata_update(&state_dir)?;
+        if let Some(mut metadata) = PersistedState::read_metadata(&state_dir)? {
+            refresh_input_file_identities_at_indices(
+                &mut metadata.input_files,
+                rewritten_inputs.iter().map(|(input_index, _)| *input_index),
+            );
+            metadata.link_start = current_link_start;
+            metadata.write_metadata_update(&state_dir)?;
+        }
     }
     if !rewritten_inputs.is_empty() {
         append_log(
@@ -499,6 +576,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
 enum ChangedInputPatchResult {
     Patched,
     Unsupported(String),
+    StartedUnsupported(String),
 }
 
 fn relocation_target_patches_for_input(
@@ -706,6 +784,7 @@ fn patch_changed_inputs(
     state_dir: &Path,
     previous: PersistedState,
     current_link_start: Option<FileIdentity>,
+    records_complete: bool,
     changed_inputs: &[(usize, PathBuf)],
 ) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
@@ -1077,9 +1156,19 @@ fn patch_changed_inputs(
             &mut previous.sections,
         );
         if sections_changed {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete section records".to_owned(),
+                ));
+            }
             previous.sections_file = None;
         }
         if !added_dynamic_relocations.is_empty() {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete dynamic relocation records".to_owned(),
+                ));
+            }
             previous
                 .dynamic_relocations
                 .extend(added_dynamic_relocations);
@@ -1088,6 +1177,11 @@ fn patch_changed_inputs(
             previous.sections_file = None;
         }
         if !removed_dynamic_relocations.is_empty() {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete dynamic relocation records".to_owned(),
+                ));
+            }
             previous.dynamic_relocations.retain(|record| {
                 !removed_dynamic_relocations.contains(record)
                     || record.has_restorable_rela_output_info()
@@ -1095,6 +1189,11 @@ fn patch_changed_inputs(
             previous.sections_file = None;
         }
         if !removed_fdes.is_empty() {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete FDE records".to_owned(),
+                ));
+            }
             previous
                 .fdes
                 .retain(|record| !removed_fdes.contains(record));
@@ -1115,6 +1214,7 @@ fn patch_changed_inputs(
                     data_hash: section.data_hash.clone(),
                 })
                 .collect(),
+            raw_sections: None,
         });
         patches.extend(resolved_patches);
         eh_frame_hdr_changes.extend(fde_eh_frame_hdr_changes);
@@ -1155,6 +1255,11 @@ fn patch_changed_inputs(
     }
     match fde_add_patches_for_output(&output, &fde_add_candidates, &previous.fdes)? {
         Ok(resolved_fdes) => {
+            if !records_complete && !resolved_fdes.is_empty() {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "changed input needs complete FDE records".to_owned(),
+                ));
+            }
             patched_section_count += resolved_fdes.len();
             for resolved in resolved_fdes {
                 previous.fdes.push(resolved.record);
@@ -1207,23 +1312,23 @@ fn patch_changed_inputs(
             .checked_add(patch.size as usize)
             .context("Incremental patch output range overflow")?;
         let Some(output_range) = output.get_mut(start..end) else {
-            return Ok(ChangedInputPatchResult::Unsupported(
+            return Ok(ChangedInputPatchResult::StartedUnsupported(
                 "changed patch output range is out of bounds".to_owned(),
             ));
         };
         if patch.data.len() > output_range.len() {
-            return Ok(ChangedInputPatchResult::Unsupported(
+            return Ok(ChangedInputPatchResult::StartedUnsupported(
                 "changed patch data does not fit in the previous output range".to_owned(),
             ));
         }
         for preserve_range in &patch.preserve_ranges {
             let Some(data_range) = patch.data.get_mut(preserve_range.clone()) else {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::StartedUnsupported(
                     "changed patch preserve range is out of bounds".to_owned(),
                 ));
             };
             let Some(previous_range) = output_range.get(preserve_range.clone()) else {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::StartedUnsupported(
                     "changed patch preserve range is out of bounds".to_owned(),
                 ));
             };
@@ -1231,12 +1336,12 @@ fn patch_changed_inputs(
         }
         for adjustment in &patch.adjustments {
             let Some(data_range) = patch.data.get_mut(adjustment.range.clone()) else {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::StartedUnsupported(
                     "changed patch adjustment range is out of bounds".to_owned(),
                 ));
             };
             if let Err(reason) = apply_addend_delta(data_range, adjustment.addend_delta) {
-                return Ok(ChangedInputPatchResult::Unsupported(reason));
+                return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
             }
         }
         let (data_out, padding) = output_range.split_at_mut(patch.data.len());
@@ -1277,11 +1382,15 @@ fn patch_changed_inputs(
         changed_inputs.iter().map(|(input_index, _)| *input_index),
     );
     if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
-        return Ok(ChangedInputPatchResult::Unsupported(reason));
+        return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
     }
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
-        return Ok(ChangedInputPatchResult::Unsupported(reason));
+        return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
     }
+    let changed_input_indices = changed_inputs
+        .iter()
+        .map(|(input_index, _)| *input_index)
+        .collect::<Vec<_>>();
     PersistedState {
         args_hash: previous.args_hash,
         link_options_hash: previous.link_options_hash,
@@ -1297,7 +1406,7 @@ fn patch_changed_inputs(
         dynamic_relocations: previous.dynamic_relocations,
         sections_file: previous.sections_file,
     }
-    .write_metadata_update(state_dir)?;
+    .write_metadata_update_for_inputs(state_dir, &changed_input_indices)?;
     clear_incremental_update_marker(state_dir)?;
 
     append_log(
@@ -1327,18 +1436,28 @@ fn patch_sections_from_previous_state(
     let Some(previous_patch) = input.patch.as_ref() else {
         return Err(format!("missing patch metadata for `{}`", path.display()));
     };
-    if previous_patch.sections.is_empty() {
+    let sections = if previous_patch.sections.is_empty() {
+        previous_patch
+            .raw_sections
+            .as_ref()
+            .map(|raw| parse_patch_sections(input.path.as_str(), raw))
+            .transpose()
+            .map_err(|error| format!("{error:?}"))?
+            .unwrap_or_default()
+    } else {
+        previous_patch.sections.clone()
+    };
+    if sections.is_empty() {
         return Err(format!(
             "no patchable sections recorded for `{}`",
             path.display()
         ));
     }
-    let patch_section_keys = previous_patch
-        .sections
+    let patch_section_keys = sections
         .iter()
         .map(|section| (section.input.as_str(), section.section_index))
         .collect::<HashSet<_>>();
-    if patch_section_keys.len() != previous_patch.sections.len() {
+    if patch_section_keys.len() != sections.len() {
         return Err(format!(
             "duplicate patchable section metadata for `{}`",
             path.display()
@@ -1346,8 +1465,7 @@ fn patch_sections_from_previous_state(
     }
     Ok(PreviousPatchState {
         fingerprint: previous_patch.fingerprint.clone(),
-        sections: previous_patch
-            .sections
+        sections: sections
             .iter()
             .map(|section| PatchSection {
                 input: section.input.clone(),
@@ -2094,14 +2212,18 @@ impl CurrentState {
 
 impl PersistedState {
     fn read(state_dir: &Path) -> Result<Option<Self>> {
-        Self::read_impl(state_dir, true)
+        Self::read_impl(state_dir, true, PatchSectionReadMode::Parse)
     }
 
     fn read_metadata(state_dir: &Path) -> Result<Option<Self>> {
-        Self::read_impl(state_dir, false)
+        Self::read_impl(state_dir, false, PatchSectionReadMode::PreserveRaw)
     }
 
-    fn read_impl(state_dir: &Path, load_sections: bool) -> Result<Option<Self>> {
+    fn read_impl(
+        state_dir: &Path,
+        load_sections: bool,
+        patch_section_mode: PatchSectionReadMode,
+    ) -> Result<Option<Self>> {
         let path = state_dir.join(INDEX_FILE);
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
@@ -2109,24 +2231,146 @@ impl PersistedState {
             Err(error) => return Err(error.into()),
         };
 
-        Ok(Some(Self::parse_with_section_loader(
-            &contents,
-            |sections_file| {
+        let mut state =
+            Self::parse_with_section_loader(&contents, patch_section_mode, |sections_file| {
                 if !load_sections {
                     return Ok(None);
                 }
                 read_sections_sidecar(state_dir, sections_file).map(Some)
-            },
-        )?))
+            })?;
+        state.apply_metadata_update(state_dir, patch_section_mode)?;
+        Ok(Some(state))
+    }
+
+    fn read_records_for_input_files(
+        &mut self,
+        state_dir: &Path,
+        input_files: &HashSet<String>,
+    ) -> Result {
+        let Some(sections_file) = self.sections_file.as_deref() else {
+            return Ok(());
+        };
+        let contents = read_sections_sidecar(state_dir, sections_file)?;
+        let records = parse_compact_records_block_for_input_files(contents.lines(), input_files)?;
+        self.sections = records.sections;
+        self.relocations = records.relocations;
+        self.fdes = records.fdes;
+        self.dynamic_relocations = records.dynamic_relocations;
+        Ok(())
+    }
+
+    fn read_patch_metadata_for_input_indices(
+        &mut self,
+        state_dir: &Path,
+        input_indices: &HashSet<usize>,
+    ) -> Result {
+        if input_indices.is_empty() {
+            return Ok(());
+        }
+        let mut remaining = input_indices.clone();
+        self.read_patch_metadata_from_update(state_dir, &mut remaining)?;
+        if !remaining.is_empty() {
+            self.read_patch_metadata_from_index(state_dir, &mut remaining)?;
+        }
+        Ok(())
+    }
+
+    fn read_patch_metadata_from_update(
+        &mut self,
+        state_dir: &Path,
+        input_indices: &mut HashSet<usize>,
+    ) -> Result {
+        let path = metadata_update_path(state_dir);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut lines = contents.lines();
+        let version = lines
+            .next()
+            .context("Missing incremental metadata update header")?;
+        if version != METADATA_UPDATE_VERSION {
+            return Err(crate::error!(
+                "Unsupported incremental metadata update version `{version}`"
+            ));
+        }
+        let _ = parse_link_start_line(lines.next())?;
+        let _ = parse_content_line(lines.next(), "output")?;
+        let _ = parse_build_id_hash_line(lines.next())?;
+        let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
+            .parse()
+            .context("Invalid incremental metadata update input count")?;
+        for _ in 0..input_count {
+            let rest = parse_prefixed_line(lines.next(), "input")?;
+            let (index, input_line) = rest
+                .split_once('\t')
+                .context("Malformed incremental metadata update input")?;
+            let index: usize = index
+                .parse()
+                .context("Invalid incremental metadata update input index")?;
+            if input_indices.remove(&index) {
+                let Some(input) = self.input_files.get_mut(index) else {
+                    return Err(crate::error!(
+                        "Incremental metadata update input index out of bounds"
+                    ));
+                };
+                input.patch = parse_input_line(
+                    &format!("input\t{input_line}"),
+                    PatchSectionReadMode::PreserveRaw,
+                )?
+                .patch;
+            }
+        }
+        if lines.next().is_some() {
+            return Err(crate::error!(
+                "Unexpected trailing incremental metadata update data"
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_patch_metadata_from_index(
+        &mut self,
+        state_dir: &Path,
+        input_indices: &mut HashSet<usize>,
+    ) -> Result {
+        let path = state_dir.join(INDEX_FILE);
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read incremental state `{}`", path.display()))?;
+        let mut lines = contents.lines();
+        for line in lines.by_ref() {
+            if line.starts_with("inputs\t") {
+                let input_count: usize = parse_prefixed_line(Some(line), "inputs")?
+                    .parse()
+                    .context("Invalid incremental input count")?;
+                for index in 0..input_count {
+                    let line = lines.next().context("Missing incremental input record")?;
+                    if input_indices.remove(&index) {
+                        let Some(input) = self.input_files.get_mut(index) else {
+                            return Err(crate::error!("Incremental input index out of bounds"));
+                        };
+                        input.patch =
+                            parse_input_line(line, PatchSectionReadMode::PreserveRaw)?.patch;
+                    }
+                    if input_indices.is_empty() {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Err(crate::error!("Missing incremental input count"))
     }
 
     #[cfg(test)]
     fn parse(contents: &str) -> Result<Self> {
-        Self::parse_with_section_loader(contents, |_| Ok(None))
+        Self::parse_with_section_loader(contents, PatchSectionReadMode::Parse, |_| Ok(None))
     }
 
     fn parse_with_section_loader(
         contents: &str,
+        patch_section_mode: PatchSectionReadMode,
         mut load_sections: impl FnMut(&str) -> Result<Option<String>>,
     ) -> Result<Self> {
         let mut lines = contents.lines().peekable();
@@ -2229,7 +2473,7 @@ impl PersistedState {
         let mut input_files = Vec::with_capacity(input_count);
         for _ in 0..input_count {
             let line = lines.next().context("Missing incremental input record")?;
-            input_files.push(parse_input_line(line)?);
+            input_files.push(parse_input_line(line, patch_section_mode)?);
         }
 
         let mut sections_file = None;
@@ -2341,6 +2585,41 @@ impl PersistedState {
         }
     }
 
+    fn write_metadata_update_for_inputs(
+        &self,
+        state_dir: &Path,
+        input_indices: &[usize],
+    ) -> Result {
+        if self.sections_file.is_none() {
+            return self.write(state_dir);
+        }
+        std::fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "Failed to create incremental state directory `{}`",
+                state_dir.display()
+            )
+        })?;
+
+        let path = metadata_update_path(state_dir);
+        let tmp_path = state_dir.join(format!("{METADATA_UPDATE_FILE}.tmp"));
+        std::fs::write(&tmp_path, self.render_metadata_update(input_indices)).with_context(
+            || {
+                format!(
+                    "Failed to write incremental metadata update `{}`",
+                    tmp_path.display()
+                )
+            },
+        )?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to install incremental metadata update `{}`",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     fn write_index(&self, state_dir: &Path) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
@@ -2357,6 +2636,7 @@ impl PersistedState {
         let _ = std::fs::remove_file(&path);
         std::fs::rename(&tmp_path, &path)
             .with_context(|| format!("Failed to install incremental state `{}`", path.display()))?;
+        let _ = std::fs::remove_file(metadata_update_path(state_dir));
         Ok(())
     }
 
@@ -2394,6 +2674,50 @@ impl PersistedState {
             self.sections_file.as_deref().unwrap_or(SECTIONS_FILE)
         )
         .unwrap();
+        out
+    }
+
+    fn render_metadata_update(&self, input_indices: &[usize]) -> String {
+        let mut out = String::new();
+        writeln!(&mut out, "{METADATA_UPDATE_VERSION}").unwrap();
+        writeln!(
+            &mut out,
+            "link-start\t{}",
+            self.link_start
+                .as_ref()
+                .map_or_else(|| ABSENT_FIELD.to_owned(), FileIdentity::render)
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "output\t{}\t{}\t{}",
+            self.output.len,
+            self.output.hash,
+            self.output.render_identity()
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "build-id-hash\t{}",
+            self.build_id_hashes
+                .as_ref()
+                .map(render_build_id_hash_state)
+                .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+        )
+        .unwrap();
+        let mut input_indices = input_indices.to_vec();
+        input_indices.sort_unstable();
+        input_indices.dedup();
+        writeln!(&mut out, "inputs\t{}", input_indices.len()).unwrap();
+        for index in input_indices {
+            writeln!(
+                &mut out,
+                "input\t{}\t{}",
+                index,
+                render_input_line_rest(&self.input_files[index])
+            )
+            .unwrap();
+        }
         out
     }
 
@@ -2444,26 +2768,58 @@ impl PersistedState {
         .unwrap();
         writeln!(&mut out, "inputs\t{}", self.input_files.len()).unwrap();
         for input in &self.input_files {
-            writeln!(
-                &mut out,
-                "input\t{}\t{}\t{}\t{}\t{}\t{}",
-                input.path,
-                input.content.len,
-                input.content.hash,
-                input.content.render_identity(),
-                input
-                    .patch
-                    .as_ref()
-                    .map_or(ABSENT_FIELD, |patch| patch.fingerprint.as_str()),
-                input
-                    .patch
-                    .as_ref()
-                    .map(render_patch_sections)
-                    .unwrap_or_else(|| ABSENT_FIELD.to_owned())
-            )
-            .unwrap();
+            writeln!(&mut out, "input\t{}", render_input_line_rest(input)).unwrap();
         }
         out
+    }
+
+    fn apply_metadata_update(
+        &mut self,
+        state_dir: &Path,
+        patch_section_mode: PatchSectionReadMode,
+    ) -> Result {
+        let path = metadata_update_path(state_dir);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut lines = contents.lines();
+        let version = lines
+            .next()
+            .context("Missing incremental metadata update header")?;
+        if version != METADATA_UPDATE_VERSION {
+            return Err(crate::error!(
+                "Unsupported incremental metadata update version `{version}`"
+            ));
+        }
+        self.link_start = parse_link_start_line(lines.next())?;
+        self.output = parse_content_line(lines.next(), "output")?;
+        self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
+        let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
+            .parse()
+            .context("Invalid incremental metadata update input count")?;
+        for _ in 0..input_count {
+            let rest = parse_prefixed_line(lines.next(), "input")?;
+            let (index, input_line) = rest
+                .split_once('\t')
+                .context("Malformed incremental metadata update input")?;
+            let index: usize = index
+                .parse()
+                .context("Invalid incremental metadata update input index")?;
+            let Some(input) = self.input_files.get_mut(index) else {
+                return Err(crate::error!(
+                    "Incremental metadata update input index out of bounds"
+                ));
+            };
+            *input = parse_input_line(&format!("input\t{input_line}"), patch_section_mode)?;
+        }
+        if lines.next().is_some() {
+            return Err(crate::error!(
+                "Unexpected trailing incremental metadata update data"
+            ));
+        }
+        Ok(())
     }
 
     fn render_sections(&self) -> String {
@@ -3188,6 +3544,7 @@ where
                     data_hash: section.data_hash.clone(),
                 })
                 .collect(),
+            raw_sections: None,
         });
         if patch.is_some() && input.content.hash.is_empty() {
             input.content.hash = hash_bytes(input_file.data());
@@ -7133,7 +7490,136 @@ fn parse_compact_records_block<'a>(
     })
 }
 
-fn parse_input_line(line: &str) -> Result<FileState> {
+fn parse_compact_records_block_for_input_files<'a>(
+    mut lines: impl Iterator<Item = &'a str>,
+    input_files: &HashSet<String>,
+) -> Result<CompactRecords> {
+    let section_input_count: usize = parse_prefixed_line(lines.next(), "section-inputs")?
+        .parse()
+        .context("Invalid incremental section input count")?;
+    let mut section_inputs = Vec::with_capacity(section_input_count);
+    for _ in 0..section_input_count {
+        let line = lines
+            .next()
+            .context("Missing incremental section input record")?;
+        section_inputs.push(parse_section_input_line(line)?);
+    }
+
+    let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
+        .parse()
+        .context("Invalid incremental section count")?;
+    let mut sections = Vec::new();
+    for _ in 0..section_count {
+        let line = lines.next().context("Missing incremental section record")?;
+        if compact_record_matches_input(line, "section", &section_inputs, input_files)? {
+            sections.push(parse_compact_section_line(line, &section_inputs)?);
+        }
+    }
+
+    let mut relocations = Vec::new();
+    let mut fdes = Vec::new();
+    let mut dynamic_relocations = Vec::new();
+    let mut next_line = lines.next();
+    if let Some(line) = next_line
+        && line.starts_with("relocs\t")
+    {
+        let relocation_count: usize = parse_prefixed_line(Some(line), "relocs")?
+            .parse()
+            .context("Invalid incremental relocation count")?;
+        for _ in 0..relocation_count {
+            let line = lines
+                .next()
+                .context("Missing incremental relocation record")?;
+            if compact_relocation_record_matches_input(line, &section_inputs, input_files)? {
+                relocations.push(parse_compact_relocation_line(line, &section_inputs)?);
+            }
+        }
+        next_line = lines.next();
+    }
+    if let Some(line) = next_line
+        && line.starts_with("fdes\t")
+    {
+        let fde_count: usize = parse_prefixed_line(Some(line), "fdes")?
+            .parse()
+            .context("Invalid incremental FDE count")?;
+        for _ in 0..fde_count {
+            let line = lines.next().context("Missing incremental FDE record")?;
+            if compact_record_matches_input(line, "fde", &section_inputs, input_files)? {
+                fdes.push(parse_compact_fde_line(line, &section_inputs)?);
+            }
+        }
+        next_line = lines.next();
+    }
+    if let Some(line) = next_line
+        && line.starts_with("dynrels\t")
+    {
+        let relocation_count: usize = parse_prefixed_line(Some(line), "dynrels")?
+            .parse()
+            .context("Invalid incremental dynamic relocation count")?;
+        for _ in 0..relocation_count {
+            let line = lines
+                .next()
+                .context("Missing incremental dynamic relocation record")?;
+            if compact_record_matches_input(line, "dynrel", &section_inputs, input_files)? {
+                dynamic_relocations.push(parse_compact_dynamic_relocation_line(
+                    line,
+                    &section_inputs,
+                )?);
+            }
+        }
+        next_line = lines.next();
+    }
+    if next_line.is_some() || lines.next().is_some() {
+        return Err(crate::error!(
+            "Unexpected trailing incremental section data"
+        ));
+    }
+    Ok(CompactRecords {
+        sections,
+        relocations,
+        fdes,
+        dynamic_relocations,
+    })
+}
+
+fn compact_record_matches_input(
+    line: &str,
+    prefix: &str,
+    section_inputs: &[(String, String)],
+    input_files: &HashSet<String>,
+) -> Result<bool> {
+    let rest = parse_prefixed_line(Some(line), prefix)?;
+    let section_input_id = compact_record_section_input_id(rest, prefix)?;
+    let Some((input_file, _)) = section_inputs.get(section_input_id) else {
+        return Err(crate::error!(
+            "Incremental {prefix} input index out of bounds"
+        ));
+    };
+    Ok(input_files.contains(input_file))
+}
+
+fn compact_relocation_record_matches_input(
+    line: &str,
+    section_inputs: &[(String, String)],
+    input_files: &HashSet<String>,
+) -> Result<bool> {
+    if compact_record_matches_input(line, "reloc", section_inputs, input_files)? {
+        return Ok(true);
+    }
+    Ok(input_files
+        .iter()
+        .any(|input_file| line.contains(input_file)))
+}
+
+fn compact_record_section_input_id(rest: &str, prefix: &str) -> Result<usize> {
+    rest.split('\t')
+        .next()
+        .context("Malformed incremental record input index")?
+        .parse()
+        .with_context(|| format!("Invalid incremental {prefix} input index"))
+}
+
+fn parse_input_line(line: &str, patch_section_mode: PatchSectionReadMode) -> Result<FileState> {
     let rest = parse_prefixed_line(Some(line), "input")?;
     let mut parts = rest.split('\t');
     let path = parts
@@ -7154,15 +7640,21 @@ fn parse_input_line(line: &str) -> Result<FileState> {
         .next()
         .filter(|fingerprint| *fingerprint != ABSENT_FIELD);
     let patch_sections = parts.next().filter(|sections| *sections != ABSENT_FIELD);
-    let patch = patch_fingerprint
-        .zip(patch_sections)
-        .map(|(fingerprint, sections)| {
-            parse_patch_sections(&path, sections).map(|sections| FilePatchState {
+    let patch = match patch_fingerprint.zip(patch_sections) {
+        Some((fingerprint, raw_sections)) => {
+            let sections = match patch_section_mode {
+                PatchSectionReadMode::Parse => parse_patch_sections(&path, raw_sections)?,
+                PatchSectionReadMode::PreserveRaw => Vec::new(),
+            };
+            Some(FilePatchState {
                 fingerprint: fingerprint.to_owned(),
                 sections,
+                raw_sections: matches!(patch_section_mode, PatchSectionReadMode::PreserveRaw)
+                    .then(|| raw_sections.to_owned()),
             })
-        })
-        .transpose()?;
+        }
+        None => None,
+    };
     if parts.next().is_some() {
         return Err(crate::error!("Malformed incremental input record"));
     }
@@ -7178,6 +7670,12 @@ fn parse_input_line(line: &str) -> Result<FileState> {
 }
 
 fn render_patch_sections(patch: &FilePatchState) -> String {
+    if patch.sections.is_empty()
+        && let Some(raw_sections) = &patch.raw_sections
+    {
+        return raw_sections.clone();
+    }
+
     patch
         .sections
         .iter()
@@ -7199,6 +7697,25 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn render_input_line_rest(input: &FileState) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        input.path,
+        input.content.len,
+        input.content.hash,
+        input.content.render_identity(),
+        input
+            .patch
+            .as_ref()
+            .map_or(ABSENT_FIELD, |patch| patch.fingerprint.as_str()),
+        input
+            .patch
+            .as_ref()
+            .map(render_patch_sections)
+            .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+    )
 }
 
 fn render_build_id_hash_state(state: &BuildIdHashState) -> String {
@@ -8003,6 +8520,19 @@ fn print_global_log_from(log_dir: &Path, writer: &mut impl std::io::Write) -> Re
 
 fn global_log_path_in(log_dir: &Path) -> PathBuf {
     log_dir.join(GLOBAL_LOG_FILE)
+}
+
+fn metadata_update_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(METADATA_UPDATE_FILE)
+}
+
+fn should_filter_sections_sidecar(state_dir: &Path, sections_file: &str) -> bool {
+    const LARGE_SECTIONS_SIDECAR: u64 = 64 * 1024 * 1024;
+    if validate_sections_file_name(sections_file).is_err() {
+        return false;
+    }
+    std::fs::metadata(state_dir.join(sections_file))
+        .is_ok_and(|metadata| metadata.len() > LARGE_SECTIONS_SIDECAR)
 }
 
 fn user_state_dir() -> Option<PathBuf> {
@@ -10558,6 +11088,7 @@ mod tests {
                     output_size: 0,
                     data_hash: None,
                 }],
+                raw_sections: None,
             }),
         };
 
@@ -10911,6 +11442,7 @@ mod tests {
                     data_hash: None,
                 },
             ],
+            raw_sections: None,
         });
         state.sections.push(section_record("a.o", 1, 100, 12));
 
@@ -10925,6 +11457,60 @@ mod tests {
             hex::encode("a.o"),
         )));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn metadata_only_input_parse_preserves_raw_patch_sections() {
+        let raw_sections = format!(
+            "{}:7:11:100:13:{}:data-hash",
+            hex::encode("a.o"),
+            hex::encode(".text.a")
+        );
+        let line = format!(
+            "input\t{}\t1\t{}\t-\tpatch-hash\t{}",
+            hex::encode("a.o"),
+            hash_bytes(b"a"),
+            raw_sections
+        );
+
+        let parsed = parse_input_line(&line, PatchSectionReadMode::PreserveRaw).unwrap();
+        let patch = parsed.patch.as_ref().unwrap();
+
+        assert_eq!(patch.fingerprint, "patch-hash");
+        assert!(patch.sections.is_empty());
+        assert_eq!(patch.raw_sections.as_deref(), Some(raw_sections.as_str()));
+        assert_eq!(render_patch_sections(patch), raw_sections);
+    }
+
+    #[test]
+    fn changed_input_patch_metadata_is_parsed_lazily() {
+        let raw_sections = format!(
+            "{}:7:11:100:13:{}:data-hash",
+            hex::encode("a.o"),
+            hex::encode(".text.a")
+        );
+        let line = format!(
+            "input\t{}\t1\t{}\t-\tpatch-hash\t{}",
+            hex::encode("a.o"),
+            hash_bytes(b"a"),
+            raw_sections
+        );
+        let parsed = parse_input_line(&line, PatchSectionReadMode::PreserveRaw).unwrap();
+
+        let previous = patch_sections_from_previous_state(&parsed, Path::new("a.o")).unwrap();
+
+        assert_eq!(previous.fingerprint, "patch-hash");
+        assert_eq!(previous.sections.len(), 1);
+        assert_eq!(previous.sections[0].input, hex::encode("a.o"));
+        assert_eq!(previous.sections[0].section_index, 7);
+        assert_eq!(
+            previous.sections[0].section_name.as_deref(),
+            Some(".text.a")
+        );
+        assert_eq!(previous.sections[0].input_size, 11);
+        assert_eq!(previous.sections[0].output_offset, 100);
+        assert_eq!(previous.sections[0].output_size, 13);
+        assert_eq!(previous.sections[0].data_hash.as_deref(), Some("data-hash"));
     }
 
     #[test]
@@ -10951,6 +11537,7 @@ mod tests {
                     data_hash: Some("data-hash".to_owned()),
                 },
             ],
+            raw_sections: None,
         };
         let first = section_record("a.o", 1, 100, 4);
         let second = section_record("a.o", 3, 200, 8);
@@ -10986,6 +11573,7 @@ mod tests {
                     output_size: 4,
                     data_hash: Some("patch-section-hash".to_owned()),
                 }],
+                raw_sections: None,
             }),
         }];
         let sections = vec![section_record("a.o", 1, 100, 4)];
@@ -11027,6 +11615,7 @@ mod tests {
                     output_size: 4,
                     data_hash: Some("patch-section-hash".to_owned()),
                 }],
+                raw_sections: None,
             }),
         }];
         let sections = vec![section_record("a.o", 1, 100, 4)];
@@ -11084,6 +11673,7 @@ mod tests {
                     output_size: 4,
                     data_hash: Some("patch-section-hash".to_owned()),
                 }],
+                raw_sections: None,
             }),
         }];
         let sections = vec![section_record("a.o", 1, 108, 4)];
@@ -11110,7 +11700,7 @@ mod tests {
             hash_bytes(b"a")
         );
 
-        let parsed = parse_input_line(&line).unwrap();
+        let parsed = parse_input_line(&line, PatchSectionReadMode::Parse).unwrap();
         let sections = parsed.patch.unwrap().sections;
 
         assert_eq!(sections.len(), 2);
@@ -11154,6 +11744,7 @@ mod tests {
                 output_size: 8,
                 data_hash: Some("section-hash".to_owned()),
             }],
+            raw_sections: None,
         });
         let rendered = state
             .render()
@@ -11302,7 +11893,7 @@ mod tests {
             hash_bytes(b"a")
         );
 
-        let parsed = parse_input_line(&line).unwrap();
+        let parsed = parse_input_line(&line, PatchSectionReadMode::Parse).unwrap();
 
         assert_eq!(parsed.patch.unwrap().sections, Vec::new());
     }
@@ -11338,6 +11929,7 @@ mod tests {
             dir.path(),
             previous,
             None,
+            true,
             &[(0, missing_input)],
         )
         .unwrap();
@@ -11395,7 +11987,7 @@ mod tests {
             hash_bytes(b"a")
         );
 
-        let parsed = parse_input_line(&line).unwrap();
+        let parsed = parse_input_line(&line, PatchSectionReadMode::Parse).unwrap();
 
         assert!(parsed.patch.is_none());
     }
@@ -11430,6 +12022,193 @@ mod tests {
         let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert!(metadata.sections.is_empty());
         assert!(PersistedState::read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn read_metadata_preserves_patch_sections_without_parsing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "patch-hash".to_owned(),
+            sections: vec![FilePatchSectionState {
+                input: hex::encode("a.o"),
+                section_index: 1,
+                section_name: Some(".text.a".to_owned()),
+                input_size: 4,
+                output_offset: 100,
+                output_size: 8,
+                data_hash: Some("section-hash".to_owned()),
+            }],
+            raw_sections: None,
+        });
+        let raw_sections = render_patch_sections(state.input_files[0].patch.as_ref().unwrap());
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+
+        let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let patch = metadata.input_files[0].patch.as_ref().unwrap();
+
+        assert!(metadata.sections.is_empty());
+        assert!(patch.sections.is_empty());
+        assert_eq!(patch.raw_sections.as_deref(), Some(raw_sections.as_str()));
+        assert!(metadata.render().contains(&raw_sections));
+
+        let full = PersistedState::read(dir.path()).unwrap().unwrap();
+        let full_patch = full.input_files[0].patch.as_ref().unwrap();
+        assert_eq!(full_patch.sections.len(), 1);
+        assert_eq!(full_patch.raw_sections, None);
+    }
+
+    #[test]
+    fn metadata_update_overlay_updates_only_changed_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "old-patch-hash".to_owned(),
+            sections: vec![FilePatchSectionState {
+                input: hex::encode("a.o"),
+                section_index: 1,
+                section_name: Some(".text.a".to_owned()),
+                input_size: 4,
+                output_offset: 100,
+                output_size: 8,
+                data_hash: Some("old-section-hash".to_owned()),
+            }],
+            raw_sections: None,
+        });
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+        let base_index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        let mut updated = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        updated.link_start = Some(FileIdentity {
+            len: 0,
+            dev: 1,
+            ino: 2,
+            modified_sec: 3,
+            modified_nsec: 4,
+            changed_sec: 5,
+            changed_nsec: 6,
+        });
+        updated.output = FileContentState::from_bytes(b"new-output");
+        updated.input_files[0].content = FileContentState::from_bytes(b"aa");
+        updated.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "new-patch-hash".to_owned(),
+            sections: vec![FilePatchSectionState {
+                input: hex::encode("a.o"),
+                section_index: 1,
+                section_name: Some(".text.a".to_owned()),
+                input_size: 4,
+                output_offset: 100,
+                output_size: 8,
+                data_hash: Some("new-section-hash".to_owned()),
+            }],
+            raw_sections: None,
+        });
+
+        updated
+            .write_metadata_update_for_inputs(dir.path(), &[0])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap(),
+            base_index
+        );
+        assert!(metadata_update_path(dir.path()).exists());
+        let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert_eq!(metadata.output, updated.output);
+        assert_eq!(
+            metadata.input_files[0].content,
+            updated.input_files[0].content
+        );
+        assert_eq!(
+            metadata.input_files[0].patch.as_ref().unwrap().fingerprint,
+            "new-patch-hash"
+        );
+        assert_eq!(metadata.input_files[1], state.input_files[1]);
+
+        metadata.write_index(dir.path()).unwrap();
+        assert!(!metadata_update_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn read_records_for_input_files_filters_sections_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(section_record("b.o", 1, 200, 8));
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            4,
+            Some(0x1000),
+            0x1000,
+            Some("target"),
+            None,
+            0,
+            100,
+            8,
+            1,
+            0,
+        ));
+        state.relocations.push(relocation_record(
+            "b.o",
+            1,
+            4,
+            Some(0x2000),
+            0x2000,
+            Some("target"),
+            None,
+            0,
+            200,
+            8,
+            1,
+            0,
+        ));
+        state.fdes.push(fde_record("a.o", 1, 2, 0, 300, 24));
+        state.fdes.push(fde_record("b.o", 1, 2, 0, 400, 24));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 0, 500, 24));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("b.o", 1, 0, 600, 24));
+        state.write(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
+
+        metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap();
+
+        assert_eq!(metadata.sections.len(), 1);
+        assert_eq!(metadata.relocations.len(), 1);
+        assert_eq!(metadata.fdes.len(), 1);
+        assert_eq!(metadata.dynamic_relocations.len(), 1);
+        assert!(metadata.sections_file.is_some());
+        assert!(
+            metadata
+                .sections
+                .iter()
+                .all(|record| record.input_file == hex::encode("a.o"))
+        );
+        assert!(
+            metadata
+                .relocations
+                .iter()
+                .all(|record| record.input_file == hex::encode("a.o"))
+        );
+        assert!(
+            metadata
+                .fdes
+                .iter()
+                .all(|record| record.input_file == hex::encode("a.o"))
+        );
+        assert!(
+            metadata
+                .dynamic_relocations
+                .iter()
+                .all(|record| record.input_file == hex::encode("a.o"))
+        );
     }
 
     #[test]

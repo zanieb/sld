@@ -128,6 +128,14 @@ show Wild incremental speedup against the default linker and mold. When `report 
 paired full and incremental benchmarks, it also prints the incremental speedup over the full Wild
 link for the same project.
 
+The checked-in incremental Linux benchmarks pass `--no-fork` to linkers that support it. This keeps
+Wild and mold timings on the actual linker process and prevents incremental timed runs from racing
+with a still-running forked child that is writing incremental state.
+
+Those same benchmarks pin explicit changed-input object sections. The automatic section selector is
+useful for ad-hoc experiments, but large Rust debug links can contain early objects with anonymous
+patch metadata that should fall back instead of patching.
+
 `expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
 that seeds incremental state, it fails timed Wild runs whose incremental log doesn't contain the
 expected fast-path message, so you don't accidentally measure a full fallback relink.

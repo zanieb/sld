@@ -177,6 +177,8 @@ struct Run {
     /// future.
     pid: u32,
     extra_flags: Vec<String>,
+    #[serde(default)]
+    measure_memory: bool,
     #[serde(with = "duration_serde")]
     elapsed: std::time::Duration,
     pub(crate) max_rss: u64,
@@ -610,6 +612,7 @@ mod tests {
                     runs: vec![Run {
                         pid: 1234,
                         extra_flags: vec!["--incremental".to_owned()],
+                        measure_memory: false,
                         elapsed: Duration::new(1, 2),
                         max_rss: 4096,
                         stime: Duration::new(3, 4),
