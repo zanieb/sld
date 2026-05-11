@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v28";
+const STATE_VERSION: &str = "wild-incremental-state-v29";
+const STATE_VERSION_V28: &str = "wild-incremental-state-v28";
 const STATE_VERSION_V27: &str = "wild-incremental-state-v27";
 const STATE_VERSION_V26: &str = "wild-incremental-state-v26";
 const STATE_VERSION_V25: &str = "wild-incremental-state-v25";
@@ -64,6 +65,7 @@ const USER_STATE_DIR_ENV: &str = "WILD_STATE_DIR";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
+const LINK_START_FILE: &str = "link-start";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
 const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
@@ -103,6 +105,7 @@ struct CurrentState {
     link_options_hash: String,
     input_order_hash: String,
     wild_version: String,
+    link_start: Option<FileIdentity>,
     input_files: Vec<FileState>,
 }
 
@@ -112,6 +115,7 @@ struct PersistedState {
     link_options_hash: Option<String>,
     input_order_hash: Option<String>,
     wild_version: Option<String>,
+    link_start: Option<FileIdentity>,
     output: FileContentState,
     build_id_hashes: Option<BuildIdHashState>,
     input_files: Vec<FileState>,
@@ -255,6 +259,7 @@ pub(crate) fn maybe_prepare(
                 link_options_hash: String::new(),
                 input_order_hash: String::new(),
                 wild_version: String::new(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -378,6 +383,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     timing_phase!("Check incremental fast path");
 
     let state_dir = state_dir_for_output(args.output());
+    let current_link_start = write_link_start_marker(&state_dir)?;
     if let Some(reason) = interrupted_update_relink_reason(&state_dir) {
         append_log(
             &state_dir,
@@ -404,9 +410,21 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
 
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
+    let mut checked_ambiguous_inputs = false;
     for (index, input) in previous.input_files.iter().enumerate() {
         let path = decode_path(&input.path)?;
         if input.content.identity_matches_path(&path)? {
+            if !input
+                .content
+                .identity_is_ambiguous_since(previous.link_start.as_ref())
+            {
+                continue;
+            }
+            checked_ambiguous_inputs = true;
+            if input_content_matches_snapshot(&state_dir, input, &path)? {
+                continue;
+            }
+            changed_inputs.push((index, path));
             continue;
         }
         if input_content_matches_snapshot(&state_dir, input, &path)? {
@@ -443,7 +461,13 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             full_previous.input_files = previous.input_files;
             previous = full_previous;
         }
-        match patch_changed_inputs(args, &state_dir, previous, &changed_inputs)? {
+        match patch_changed_inputs(
+            args,
+            &state_dir,
+            previous,
+            current_link_start,
+            &changed_inputs,
+        )? {
             ChangedInputPatchResult::Patched => return Ok(true),
             ChangedInputPatchResult::Unsupported(reason) => {
                 append_log(
@@ -463,8 +487,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
 
-    if !rewritten_inputs.is_empty() {
+    if !rewritten_inputs.is_empty() || checked_ambiguous_inputs {
+        previous.link_start = current_link_start;
         previous.write_metadata_update(&state_dir)?;
+    }
+    if !rewritten_inputs.is_empty() {
         append_log(
             &state_dir,
             &format!(
@@ -687,6 +714,7 @@ fn patch_changed_inputs(
     args: &impl platform::Args,
     state_dir: &Path,
     previous: PersistedState,
+    current_link_start: Option<FileIdentity>,
     changed_inputs: &[(usize, PathBuf)],
 ) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
@@ -1277,6 +1305,7 @@ fn patch_changed_inputs(
         link_options_hash: previous.link_options_hash,
         input_order_hash: previous.input_order_hash,
         wild_version: previous.wild_version,
+        link_start: current_link_start,
         output,
         build_id_hashes,
         input_files: previous.input_files,
@@ -1906,6 +1935,7 @@ impl PreparedState {
             link_options_hash: Some(self.current.link_options_hash.clone()),
             input_order_hash: Some(self.current.input_order_hash.clone()),
             wild_version: Some(self.current.wild_version.clone()),
+            link_start: self.current.link_start.clone(),
             output,
             build_id_hashes,
             input_files,
@@ -2064,6 +2094,7 @@ impl CurrentState {
             link_options_hash: link_options_hash(args),
             input_order_hash: input_order_hash(file_loader),
             wild_version: wild_version(args),
+            link_start: link_start_marker_identity(&state_dir_for_output(args.output())),
             input_files: fingerprint_loaded_files(file_loader, previous),
         }
     }
@@ -2119,6 +2150,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V28
             && version != STATE_VERSION_V27
             && version != STATE_VERSION_V26
             && version != STATE_VERSION_V25
@@ -2190,6 +2222,14 @@ impl PersistedState {
         if version == STATE_VERSION && wild_version.is_none() {
             return Err(crate::error!("Missing Wild version in incremental state"));
         }
+        let link_start = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("link-start\t"))
+        {
+            parse_link_start_line(lines.next())?
+        } else {
+            None
+        };
         let output = parse_content_line(lines.next(), "output")?;
         let build_id_hashes = if lines
             .peek()
@@ -2215,6 +2255,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V28
             || version == STATE_VERSION_V27
             || version == STATE_VERSION_V26
             || version == STATE_VERSION_V25
@@ -2288,6 +2329,7 @@ impl PersistedState {
             link_options_hash,
             input_order_hash,
             wild_version,
+            link_start,
             output,
             build_id_hashes,
             input_files,
@@ -2393,6 +2435,14 @@ impl PersistedState {
         if let Some(version) = &self.wild_version {
             writeln!(&mut out, "wild-version\t{version}").unwrap();
         }
+        writeln!(
+            &mut out,
+            "link-start\t{}",
+            self.link_start
+                .as_ref()
+                .map_or_else(|| ABSENT_FIELD.to_owned(), FileIdentity::render)
+        )
+        .unwrap();
         writeln!(
             &mut out,
             "output\t{}\t{}\t{}",
@@ -2833,6 +2883,13 @@ impl FileContentState {
         Ok(FileIdentity::from_path(path)?.as_ref() == Some(previous))
     }
 
+    fn identity_is_ambiguous_since(&self, link_start: Option<&FileIdentity>) -> bool {
+        self.identity
+            .as_ref()
+            .zip(link_start)
+            .is_some_and(|(identity, link_start)| identity.may_have_changed_since(link_start))
+    }
+
     fn identity_matches_snapshot_path(&self, path: &Path) -> Result<bool> {
         let Some(previous) = self.identity.as_ref() else {
             return Ok(false);
@@ -2852,6 +2909,20 @@ impl FileContentState {
 }
 
 impl FileIdentity {
+    fn may_have_changed_since(&self, lower_bound: &Self) -> bool {
+        timestamp_on_or_after(
+            self.modified_sec,
+            self.modified_nsec,
+            lower_bound.modified_sec,
+            lower_bound.modified_nsec,
+        ) || timestamp_on_or_after(
+            self.changed_sec,
+            self.changed_nsec,
+            lower_bound.modified_sec,
+            lower_bound.modified_nsec,
+        )
+    }
+
     fn matches_snapshot_identity(&self, other: &Self) -> bool {
         self.len == other.len
             && self.dev == other.dev
@@ -2939,6 +3010,12 @@ impl FileIdentity {
         }
         Ok(Some(identity))
     }
+}
+
+fn timestamp_on_or_after(sec: i64, _nsec: i64, lower_sec: i64, _lower_nsec: i64) -> bool {
+    // Some filesystems report coarse timestamps or fail to advance nanoseconds for rapid
+    // rewrites. Treat the whole filesystem second as ambiguous once it overlaps the link start.
+    sec >= lower_sec
 }
 
 struct LazyOutputBytes<F> {
@@ -6954,6 +7031,11 @@ fn parse_prefixed_line<'a>(line: Option<&'a str>, expected_prefix: &str) -> Resu
     Ok(rest)
 }
 
+fn parse_link_start_line(line: Option<&str>) -> Result<Option<FileIdentity>> {
+    let rest = parse_prefixed_line(line, "link-start")?;
+    FileIdentity::parse(rest)
+}
+
 fn parse_content_line(line: Option<&str>, expected_prefix: &str) -> Result<FileContentState> {
     let rest = parse_prefixed_line(line, expected_prefix)?;
     let mut parts = rest.split('\t');
@@ -7607,13 +7689,6 @@ fn input_content_matches_snapshot(
     current_path: &Path,
 ) -> Result<bool> {
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
-    if !previous_input
-        .content
-        .identity_matches_snapshot_path(&snapshot)
-        .unwrap_or(false)
-    {
-        return Ok(false);
-    }
     files_equal(&snapshot, current_path)
 }
 
@@ -7785,10 +7860,7 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
     ));
     let _ = std::fs::remove_file(&tmp);
 
-    if std::fs::hard_link(path, &tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(false);
-    }
+    copy_snapshot_bytes(path, &tmp)?;
 
     let _ = std::fs::remove_file(&target);
     std::fs::rename(&tmp, &target).with_context(|| {
@@ -7798,6 +7870,25 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
         )
     })?;
     Ok(true)
+}
+
+fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
+    let mut input = std::fs::File::open(source)
+        .with_context(|| format!("Failed to read incremental input `{}`", source.display()))?;
+    let mut output = std::fs::File::create(target).with_context(|| {
+        format!(
+            "Failed to create incremental input snapshot `{}`",
+            target.display()
+        )
+    })?;
+    std::io::copy(&mut input, &mut output).with_context(|| {
+        format!(
+            "Failed to copy incremental input snapshot `{}` to `{}`",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
@@ -7845,6 +7936,28 @@ fn clear_incremental_update_marker(state_dir: &Path) -> Result {
             )
         }),
     }
+}
+
+fn write_link_start_marker(state_dir: &Path) -> Result<Option<FileIdentity>> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = link_start_marker_path(state_dir);
+    std::fs::write(&path, b"link started\n").with_context(|| {
+        format!(
+            "Failed to write incremental link-start marker `{}`",
+            path.display()
+        )
+    })?;
+    Ok(link_start_marker_identity(state_dir))
+}
+
+fn link_start_marker_identity(state_dir: &Path) -> Option<FileIdentity> {
+    FileIdentity::from_path(&link_start_marker_path(state_dir))
+        .ok()
+        .flatten()
+}
+
+fn link_start_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LINK_START_FILE)
 }
 
 fn update_marker_path(state_dir: &Path) -> PathBuf {
@@ -8045,6 +8158,7 @@ mod tests {
                 inputs.iter().map(|(path, _)| *path),
             )),
             wild_version: Some("wild-test".to_owned()),
+            link_start: None,
             output: FileContentState::from_bytes(output),
             build_id_hashes: None,
             input_files: inputs
@@ -8371,7 +8485,7 @@ mod tests {
     }
 
     #[test]
-    fn input_snapshots_are_hard_links() {
+    fn input_snapshots_are_isolated_copies() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
         let input = dir.path().join("input.o");
@@ -8397,13 +8511,8 @@ mod tests {
                 .unwrap()
         );
 
-        #[cfg(unix)]
-        {
-            let input_metadata = std::fs::metadata(&input).unwrap();
-            let snapshot_metadata = std::fs::metadata(&snapshot).unwrap();
-            assert_eq!(input_metadata.dev(), snapshot_metadata.dev());
-            assert_eq!(input_metadata.ino(), snapshot_metadata.ino());
-        }
+        std::fs::write(&input, b"changed").unwrap();
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
     }
 
     #[test]
@@ -11229,6 +11338,7 @@ mod tests {
                 .to_str()
                 .unwrap()])),
             wild_version: Some("wild-test".to_owned()),
+            link_start: None,
             output: FileContentState::from_bytes(b"output"),
             build_id_hashes: None,
             input_files: vec![FileState {
@@ -11247,6 +11357,7 @@ mod tests {
             &crate::args::elf::ElfArgs::default(),
             dir.path(),
             previous,
+            None,
             &[(0, missing_input)],
         )
         .unwrap();
@@ -11594,6 +11705,31 @@ mod tests {
     }
 
     #[test]
+    fn file_identity_is_ambiguous_when_timestamp_overlaps_link_start() {
+        let link_start = identity(0, 1, 2, 10, 10);
+        let before = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 9, 9)),
+        };
+        let same_tick = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 10, 9)),
+        };
+        let changed_same_tick = FileContentState {
+            len: 4,
+            hash: String::new(),
+            identity: Some(identity(4, 1, 2, 9, 10)),
+        };
+
+        assert!(!before.identity_is_ambiguous_since(Some(&link_start)));
+        assert!(same_tick.identity_is_ambiguous_since(Some(&link_start)));
+        assert!(changed_same_tick.identity_is_ambiguous_since(Some(&link_start)));
+        assert!(!same_tick.identity_is_ambiguous_since(None));
+    }
+
+    #[test]
     fn stable_identity_read_records_matching_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("input.o");
@@ -11662,6 +11798,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11686,6 +11823,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11710,6 +11848,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11738,6 +11877,7 @@ mod tests {
             link_options_hash: "new-args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11763,6 +11903,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "new-wild".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11789,6 +11930,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11814,6 +11956,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: state("args", b"output", &[("a.o", b"b")]).input_files,
         };
 
@@ -11839,6 +11982,7 @@ mod tests {
             link_options_hash: "old-exact-args".to_owned(),
             input_order_hash: input_order_hash_for_paths(["a.o", "b.o"]),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: state("new-exact-args", b"output", &[("a.o", b"a"), ("b.o", b"b")])
                 .input_files,
         };
@@ -11865,6 +12009,7 @@ mod tests {
             link_options_hash: "old-exact-args".to_owned(),
             input_order_hash: input_order_hash_for_paths(["a.o"]),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: state("new-exact-args", b"output", &[("a.o", b"a")]).input_files,
         };
 
@@ -11890,6 +12035,7 @@ mod tests {
             link_options_hash: "old-exact-args".to_owned(),
             input_order_hash: input_order_hash_for_paths(["b.o", "a.o"]),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11916,6 +12062,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: input_order_hash_for_paths(["a.o"]),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11939,6 +12086,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -11963,6 +12111,7 @@ mod tests {
             link_options_hash: "args".to_owned(),
             input_order_hash: previous.input_order_hash.clone().unwrap(),
             wild_version: "wild-test".to_owned(),
+            link_start: None,
             input_files: previous.input_files.clone(),
         };
 
@@ -12140,6 +12289,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
@@ -12179,6 +12329,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -12210,6 +12361,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -12256,6 +12408,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -12319,6 +12472,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
@@ -12400,6 +12554,7 @@ mod tests {
                 link_options_hash: "args".to_owned(),
                 input_order_hash: String::new(),
                 wild_version: "wild-test".to_owned(),
+                link_start: None,
                 input_files: Vec::new(),
             },
             reusable_inputs: HashSet::new(),
