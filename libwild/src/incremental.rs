@@ -416,7 +416,7 @@ fn patch_changed_inputs(
                 })
                 .collect::<Vec<_>>();
 
-            let (matched_sections, matched_changed_sections) =
+            let (mut matched_sections, matched_changed_sections) =
                 match match_patch_sections(state_dir, input, &bytes, &sections)? {
                     Some(matched_sections) => (
                         matched_sections.sections,
@@ -501,6 +501,7 @@ fn patch_changed_inputs(
                     current_sections = resolved_sections;
                 }
             }
+            update_matched_patch_current_sections(&mut matched_sections, &current_sections);
 
             (
                 fingerprint,
@@ -810,6 +811,15 @@ fn update_section_records_for_matched_patches(
         changed = true;
     }
     changed
+}
+
+fn update_matched_patch_current_sections(
+    matched_sections: &mut [MatchedPatchSection],
+    current_sections: &[PatchSection],
+) {
+    for (matched, current) in matched_sections.iter_mut().zip(current_sections) {
+        matched.current = current.clone();
+    }
 }
 
 impl PreparedState {
@@ -4013,6 +4023,40 @@ mod tests {
         assert_eq!(records[0].section_index, 7);
         assert_eq!(records[0].size, 16);
         assert_eq!(records[1].section_index, 3);
+    }
+
+    #[test]
+    fn matched_patch_sections_follow_resolved_current_sections() {
+        let input_ref = hex::encode("input.o");
+        let previous = PatchSection {
+            input: input_ref.clone(),
+            section_index: 3,
+            section_name: Some(".data.old".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 16,
+        };
+        let current = PatchSection {
+            input: input_ref,
+            section_index: 7,
+            section_name: Some(".data.old".to_owned()),
+            input_size: 9,
+            output_offset: 64,
+            output_size: 16,
+        };
+        let mut matched_sections = vec![MatchedPatchSection::same(previous.clone())];
+
+        update_matched_patch_current_sections(&mut matched_sections, &[current.clone()]);
+
+        assert_eq!(
+            matched_sections[0].previous.section_index,
+            previous.section_index
+        );
+        assert_eq!(
+            matched_sections[0].current.section_index,
+            current.section_index
+        );
+        assert_eq!(matched_sections[0].current.input_size, current.input_size);
     }
 
     #[test]
