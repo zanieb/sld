@@ -146,6 +146,8 @@ impl PartialEq for FileIdentity {
             && self.ino == other.ino
             && self.modified_sec == other.modified_sec
             && self.modified_nsec == other.modified_nsec
+            && self.changed_sec == other.changed_sec
+            && self.changed_nsec == other.changed_nsec
     }
 }
 
@@ -1468,6 +1470,17 @@ impl FileContentState {
         Ok(FileIdentity::from_path(path)?.as_ref() == Some(previous))
     }
 
+    fn identity_matches_snapshot_path(&self, path: &Path) -> Result<bool> {
+        let Some(previous) = self.identity.as_ref() else {
+            return Ok(false);
+        };
+        // Hard-link snapshots can have ctime changes from link-count updates while still being the
+        // saved snapshot content.
+        Ok(FileIdentity::from_path(path)?
+            .as_ref()
+            .is_some_and(|current| previous.matches_snapshot_identity(current)))
+    }
+
     fn render_identity(&self) -> String {
         self.identity
             .as_ref()
@@ -1476,6 +1489,14 @@ impl FileContentState {
 }
 
 impl FileIdentity {
+    fn matches_snapshot_identity(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && self.modified_sec == other.modified_sec
+            && self.modified_nsec == other.modified_nsec
+    }
+
     fn from_path(path: &Path) -> Result<Option<Self>> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Failed to read metadata for `{}`", path.display()))?;
@@ -1917,7 +1938,7 @@ fn archive_members_match_snapshot(
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
         .content
-        .identity_matches_path(&snapshot)
+        .identity_matches_snapshot_path(&snapshot)
         .unwrap_or(false)
     {
         return Ok(false);
@@ -1983,7 +2004,7 @@ fn match_patch_sections(
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
         .content
-        .identity_matches_path(&snapshot)
+        .identity_matches_snapshot_path(&snapshot)
         .unwrap_or(false)
     {
         return Ok(None);
@@ -2163,7 +2184,7 @@ fn changed_patch_sections(
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
         .content
-        .identity_matches_path(&snapshot)
+        .identity_matches_snapshot_path(&snapshot)
         .unwrap_or(false)
     {
         return Ok(None);
@@ -3210,7 +3231,7 @@ fn input_content_matches_snapshot(
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if !previous_input
         .content
-        .identity_matches_path(&snapshot)
+        .identity_matches_snapshot_path(&snapshot)
         .unwrap_or(false)
     {
         return Ok(false);
@@ -4948,19 +4969,19 @@ mod tests {
     }
 
     #[test]
-    fn file_identity_ignores_changed_time() {
+    fn file_identity_compares_changed_time() {
         let first = FileContentState {
             len: 4,
             hash: String::new(),
             identity: Some(identity(4, 1, 2, 3, 5)),
         };
-        let same = FileContentState {
+        let changed = FileContentState {
             len: 4,
             hash: String::new(),
             identity: Some(identity(4, 1, 2, 3, 6)),
         };
 
-        assert_eq!(first, same);
+        assert_ne!(first, changed);
     }
 
     #[test]
