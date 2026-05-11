@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         help="native macOS wild binary",
     )
     parser.add_argument(
+        "--rustup-toolchain",
+        default="stable",
+        help="RUSTUP_TOOLCHAIN value for cargo validation runs; use empty string to avoid setting it",
+    )
+    parser.add_argument(
         "--container",
         default="container",
         help="Apple container CLI executable",
@@ -100,6 +105,8 @@ def repo_root() -> Path:
 
 def validation_args(args: argparse.Namespace) -> list[str]:
     command = ["--limit", str(args.limit), "--timeout", str(args.timeout)]
+    if args.rustup_toolchain:
+        command.extend(["--rustup-toolchain", args.rustup_toolchain])
     for crate in args.crates:
         command.extend(["--crate", crate])
     if args.jobs:
