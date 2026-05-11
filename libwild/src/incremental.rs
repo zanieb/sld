@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v19";
+const STATE_VERSION: &str = "wild-incremental-state-v20";
+const STATE_VERSION_V19: &str = "wild-incremental-state-v19";
 const STATE_VERSION_V18: &str = "wild-incremental-state-v18";
 const STATE_VERSION_V17: &str = "wild-incremental-state-v17";
 const STATE_VERSION_V16: &str = "wild-incremental-state-v16";
@@ -197,6 +198,7 @@ pub(crate) struct DynamicRelocationRecord {
     input_file: String,
     input: String,
     section_index: u32,
+    relocation_offset: u64,
     output_offset: u64,
     size: u64,
 }
@@ -1148,6 +1150,7 @@ impl PreparedState {
         &self,
         input: InputRef<'_>,
         section_index: object::SectionIndex,
+        relocation_offset: u64,
         output_offset: u64,
         size: u64,
     ) {
@@ -1160,6 +1163,7 @@ impl PreparedState {
             .push(DynamicRelocationRecord::new(
                 input,
                 section_index,
+                relocation_offset,
                 output_offset,
                 size,
             ));
@@ -1431,6 +1435,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V19
             && version != STATE_VERSION_V18
             && version != STATE_VERSION_V17
             && version != STATE_VERSION_V16
@@ -1517,6 +1522,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V19
             || version == STATE_VERSION_V18
             || version == STATE_VERSION_V17
             || version == STATE_VERSION_V16
@@ -1792,9 +1798,10 @@ impl PersistedState {
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
             writeln!(
                 &mut out,
-                "dynrel\t{}\t{}\t{}\t{}",
+                "dynrel\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
+                relocation.relocation_offset,
                 relocation.output_offset,
                 relocation.size
             )
@@ -1905,6 +1912,7 @@ impl DynamicRelocationRecord {
     fn new(
         input: InputRef<'_>,
         section_index: object::SectionIndex,
+        relocation_offset: u64,
         output_offset: u64,
         size: u64,
     ) -> Self {
@@ -1912,6 +1920,7 @@ impl DynamicRelocationRecord {
             input_file: encode_path(&input.file.filename),
             input: encode_input_ref(input),
             section_index: section_index.0 as u32,
+            relocation_offset,
             output_offset,
             size,
         }
@@ -3999,32 +4008,39 @@ fn parse_compact_dynamic_relocation_line(
     section_inputs: &[(String, String)],
 ) -> Result<DynamicRelocationRecord> {
     let rest = parse_prefixed_line(Some(line), "dynrel")?;
-    let mut parts = rest.split('\t');
+    let parts = rest.split('\t').collect::<Vec<_>>();
     let section_input_id: usize = parts
-        .next()
+        .first()
+        .copied()
         .context("Malformed incremental dynamic relocation input index")?
         .parse()
         .context("Invalid incremental dynamic relocation input index")?;
     let section_index = parts
-        .next()
+        .get(1)
+        .copied()
         .context("Malformed incremental dynamic relocation section index")?
         .parse()
         .context("Invalid incremental dynamic relocation section index")?;
-    let output_offset = parts
-        .next()
-        .context("Malformed incremental dynamic relocation output offset")?
+    let (relocation_offset, output_offset_index, size_index) = match parts.len() {
+        4 => (0, 2, 3),
+        5 => {
+            let relocation_offset = parts[2]
+                .parse()
+                .context("Invalid incremental dynamic relocation input offset")?;
+            (relocation_offset, 3, 4)
+        }
+        _ => {
+            return Err(crate::error!(
+                "Malformed incremental dynamic relocation record"
+            ));
+        }
+    };
+    let output_offset = parts[output_offset_index]
         .parse()
         .context("Invalid incremental dynamic relocation output offset")?;
-    let size = parts
-        .next()
-        .context("Malformed incremental dynamic relocation size")?
+    let size = parts[size_index]
         .parse()
         .context("Invalid incremental dynamic relocation size")?;
-    if parts.next().is_some() {
-        return Err(crate::error!(
-            "Malformed incremental dynamic relocation record"
-        ));
-    }
     let (input_file, input) = section_inputs
         .get(section_input_id)
         .context("Incremental dynamic relocation input index out of bounds")?;
@@ -4032,6 +4048,7 @@ fn parse_compact_dynamic_relocation_line(
         input_file: input_file.clone(),
         input: input.clone(),
         section_index,
+        relocation_offset,
         output_offset,
         size,
     })
@@ -4554,6 +4571,7 @@ mod tests {
     fn dynamic_relocation_record(
         input: &str,
         section_index: u32,
+        relocation_offset: u64,
         output_offset: u64,
         size: u64,
     ) -> DynamicRelocationRecord {
@@ -4561,6 +4579,7 @@ mod tests {
             input_file: hex::encode(input),
             input: hex::encode(input),
             section_index,
+            relocation_offset,
             output_offset,
             size,
         }
@@ -5736,12 +5755,12 @@ mod tests {
         state.sections.push(section_record("a.o", 1, 100, 12));
         state
             .dynamic_relocations
-            .push(dynamic_relocation_record("a.o", 1, 300, 24));
+            .push(dynamic_relocation_record("a.o", 1, 8, 300, 24));
 
         let rendered = state.render();
 
         assert!(rendered.contains("\ndynrels\t1\n"));
-        assert!(rendered.contains("\ndynrel\t0\t1\t300\t24\n"));
+        assert!(rendered.contains("\ndynrel\t0\t1\t8\t300\t24\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
 
@@ -6052,6 +6071,22 @@ mod tests {
 
         assert_eq!(parsed.fdes.len(), 1);
         assert!(parsed.dynamic_relocations.is_empty());
+    }
+
+    #[test]
+    fn v19_state_version_is_accepted_without_dynamic_relocation_offsets() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 0, 300, 24));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V19, 1)
+            .replace("\ndynrel\t0\t1\t0\t300\t24\n", "\ndynrel\t0\t1\t300\t24\n");
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.dynamic_relocations, state.dynamic_relocations);
     }
 
     #[test]
@@ -7188,14 +7223,15 @@ mod tests {
             reused_sections: AtomicUsize::new(0),
         };
 
-        state.record_dynamic_relocation(input, object::SectionIndex(3), 256, 24);
-        state.record_dynamic_relocation(input, object::SectionIndex(3), 280, 0);
+        state.record_dynamic_relocation(input, object::SectionIndex(3), 8, 256, 24);
+        state.record_dynamic_relocation(input, object::SectionIndex(3), 16, 280, 0);
 
         assert_eq!(
             *state.current_dynamic_relocations.lock().unwrap(),
             vec![DynamicRelocationRecord::new(
                 input,
                 object::SectionIndex(3),
+                8,
                 256,
                 24
             )]
