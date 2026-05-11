@@ -6,8 +6,6 @@
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
 //#TestIncrementalChangedInput:incremental-dynamic-relocation.c.o
 //#TestIncrementalChangedSection:.rela.data.rel.incremental_dynamic
 //#TestIncrementalChangedSectionOffset:16
