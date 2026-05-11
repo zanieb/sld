@@ -199,8 +199,42 @@ impl Display for BenchmarkDisplay<'_> {
                 units = self.mode.unit_name(),
             )?;
         }
+        if self.mode == ReportMode::Time {
+            write_wild_speedups(f, self.benchmark, self.mode)?;
+        }
         Ok(())
     }
+}
+
+fn write_wild_speedups(
+    f: &mut std::fmt::Formatter<'_>,
+    benchmark: &BenchmarkResult,
+    mode: ReportMode,
+) -> std::fmt::Result {
+    let Some(wild) = benchmark
+        .batches
+        .iter()
+        .find(|batch| batch.bin.identifier.kind == LinkerKind::Wild)
+    else {
+        return Ok(());
+    };
+    let wild_mean = mean(wild, mode);
+    if wild_mean <= 0.0 {
+        return Ok(());
+    }
+
+    for batch in &benchmark.batches {
+        if batch.bin.identifier.kind == LinkerKind::Wild {
+            continue;
+        }
+        writeln!(
+            f,
+            "  Wild speedup over {bin}: {speedup:.2}x",
+            bin = batch.bin,
+            speedup = mean(batch, mode) / wild_mean,
+        )?;
+    }
+    Ok(())
 }
 
 fn produce_chart(
@@ -404,6 +438,91 @@ impl Display for ReportMode {
         match self {
             ReportMode::Time => write!(f, "time"),
             ReportMode::Memory => write!(f, "memory"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BenchmarkDisplay;
+    use super::ReportMode;
+    use crate::BatchResult;
+    use crate::Benchmark;
+    use crate::BenchmarkResult;
+    use crate::Bin;
+    use crate::LinkerIdentifier;
+    use crate::LinkerKind;
+    use crate::Run;
+    use crate::config::BenchConfig;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[test]
+    fn time_stats_include_wild_speedup_against_other_linkers() {
+        let benchmark = benchmark_result(vec![
+            batch(LinkerKind::Wild, Duration::from_millis(25)),
+            batch(LinkerKind::Mold, Duration::from_millis(100)),
+            batch(LinkerKind::Bfd, Duration::from_millis(250)),
+        ]);
+
+        let display = BenchmarkDisplay {
+            benchmark: &benchmark,
+            mode: ReportMode::Time,
+        }
+        .to_string();
+
+        assert!(display.contains("Wild speedup over Mold 1.0.0: 4.00x"));
+        assert!(display.contains("Wild speedup over GNU ld 1.0.0: 10.00x"));
+    }
+
+    #[test]
+    fn memory_stats_do_not_report_speedup() {
+        let benchmark = benchmark_result(vec![
+            batch(LinkerKind::Wild, Duration::from_millis(25)),
+            batch(LinkerKind::Mold, Duration::from_millis(100)),
+        ]);
+
+        let display = BenchmarkDisplay {
+            benchmark: &benchmark,
+            mode: ReportMode::Memory,
+        }
+        .to_string();
+
+        assert!(!display.contains("speedup"));
+    }
+
+    fn benchmark_result(batches: Vec<BatchResult>) -> BenchmarkResult {
+        BenchmarkResult {
+            config: Benchmark {
+                name: "changed-incremental".to_owned(),
+                path: PathBuf::from("/tmp/save/run-with"),
+                config: BenchConfig::default(),
+            },
+            batches,
+        }
+    }
+
+    fn batch(kind: LinkerKind, elapsed: Duration) -> BatchResult {
+        BatchResult {
+            bin: Bin {
+                index: kind as u32,
+                path: PathBuf::from("/bin/linker"),
+                identifier: LinkerIdentifier {
+                    kind,
+                    version: "1.0.0".to_owned(),
+                    variant: None,
+                    hash: None,
+                    effective_version: vec![1, 0, 0],
+                },
+            },
+            runs: vec![Run {
+                pid: 1,
+                extra_flags: Vec::new(),
+                elapsed,
+                max_rss: 1024,
+                stime: Duration::ZERO,
+                utime: Duration::ZERO,
+            }],
         }
     }
 }
