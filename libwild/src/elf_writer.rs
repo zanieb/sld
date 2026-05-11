@@ -3854,12 +3854,17 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
         // Weak undefined symbol referenced from a read-only section. Fill in as zero.
         Ok(0)
     } else if resolution.flags.is_interposable() && section_info.is_writable {
+        let dynamic_symbol_index = resolution.dynamic_symbol_index()?;
         let output_offset = table_writer.write_dynamic_symbol_relocation_with_offset::<A>(
             place,
             addend,
-            resolution.dynamic_symbol_index()?,
+            dynamic_symbol_index,
             DynamicRelocationKind::Absolute,
         )?;
+        let output_r_info = dynamic_relocation_r_info(
+            dynamic_symbol_index,
+            A::get_dynamic_relocation_type(DynamicRelocationKind::Absolute),
+        );
         record_dynamic_relocation_for_section(
             incremental,
             object_layout,
@@ -3867,6 +3872,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             relocation_offset,
             output_offset,
             elf::RELA_ENTRY_SIZE,
+            Some((place, output_r_info)),
         );
 
         Ok(0)
@@ -3878,6 +3884,10 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             place,
             resolution.raw_value as i64 + addend,
         )?;
+        let output_r_info = dynamic_relocation_r_info(
+            0,
+            A::get_dynamic_relocation_type(DynamicRelocationKind::Irelative),
+        );
         record_dynamic_relocation_for_section(
             incremental,
             object_layout,
@@ -3885,6 +3895,7 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             relocation_offset,
             output_offset,
             elf::RELA_ENTRY_SIZE,
+            Some((place, output_r_info)),
         );
         Ok(0)
     } else if table_writer.output_kind.is_relocatable() && !resolution.is_absolute() {
@@ -3904,6 +3915,15 @@ fn write_absolute_relocation<'data, A: Arch<Platform = Elf>>(
             relocation_offset,
             written.output_offset,
             written.size,
+            (written.size == elf::RELA_ENTRY_SIZE).then(|| {
+                (
+                    place,
+                    dynamic_relocation_r_info(
+                        0,
+                        A::get_dynamic_relocation_type(DynamicRelocationKind::Relative),
+                    ),
+                )
+            }),
         );
         Ok(written.value)
     } else {
@@ -3925,16 +3945,22 @@ fn record_dynamic_relocation_for_section(
     relocation_offset: u64,
     output_offset: u64,
     size: u64,
+    output_info: Option<(u64, u64)>,
 ) {
     if let Some(section_index) = section_info.source_section_index {
-        incremental.record_dynamic_relocation(
+        incremental.record_dynamic_relocation_with_output_info(
             object_layout.input,
             section_index,
             relocation_offset,
             output_offset,
             size,
+            output_info,
         );
     }
+}
+
+fn dynamic_relocation_r_info(symbol_index: u32, relocation_type: u32) -> u64 {
+    (u64::from(symbol_index) << 32) | u64::from(relocation_type)
 }
 
 fn write_prelude<'data, A: Arch<Platform = Elf>>(

@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v27";
+const STATE_VERSION: &str = "wild-incremental-state-v28";
+const STATE_VERSION_V27: &str = "wild-incremental-state-v27";
 const STATE_VERSION_V26: &str = "wild-incremental-state-v26";
 const STATE_VERSION_V25: &str = "wild-incremental-state-v25";
 const STATE_VERSION_V24: &str = "wild-incremental-state-v24";
@@ -236,6 +237,8 @@ pub(crate) struct DynamicRelocationRecord {
     relocation_offset: u64,
     output_offset: u64,
     size: u64,
+    output_r_offset: Option<u64>,
+    output_r_info: Option<u64>,
 }
 
 pub(crate) fn maybe_prepare(
@@ -864,7 +867,25 @@ fn patch_changed_inputs(
                 } else {
                     false
                 };
-                if !allows_dynamic_relocation_removal {
+                let dynamic_relocation_added = dynamic_relocation_patches
+                    .iter()
+                    .any(|patch| patch.input_range.is_some());
+                let allows_dynamic_relocation_addition = if dynamic_relocation_added {
+                    if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                        object_diff_allows_dynamic_relocation_addition(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            &dynamic_relocation_patches,
+                        )?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !allows_dynamic_relocation_removal && !allows_dynamic_relocation_addition {
                     return Ok(ChangedInputPatchResult::Unsupported(format!(
                         "changed bytes outside patchable sections in `{}`",
                         path.display()
@@ -961,9 +982,10 @@ fn patch_changed_inputs(
             previous.sections_file = None;
         }
         if !removed_dynamic_relocations.is_empty() {
-            previous
-                .dynamic_relocations
-                .retain(|record| !removed_dynamic_relocations.contains(record));
+            previous.dynamic_relocations.retain(|record| {
+                !removed_dynamic_relocations.contains(record)
+                    || record.has_restorable_rela_output_info()
+            });
             previous.sections_file = None;
         }
         previous.input_files[*input_index].content = input_content;
@@ -1645,13 +1667,14 @@ impl PreparedState {
             ));
     }
 
-    pub(crate) fn record_dynamic_relocation(
+    pub(crate) fn record_dynamic_relocation_with_output_info(
         &self,
         input: InputRef<'_>,
         section_index: object::SectionIndex,
         relocation_offset: u64,
         output_offset: u64,
         size: u64,
+        output_info: Option<(u64, u64)>,
     ) {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
@@ -1665,6 +1688,7 @@ impl PreparedState {
                 relocation_offset,
                 output_offset,
                 size,
+                output_info,
             ));
     }
 
@@ -1949,6 +1973,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V27
             && version != STATE_VERSION_V26
             && version != STATE_VERSION_V25
             && version != STATE_VERSION_V24
@@ -2044,6 +2069,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V27
             || version == STATE_VERSION_V26
             || version == STATE_VERSION_V25
             || version == STATE_VERSION_V24
@@ -2382,16 +2408,33 @@ impl PersistedState {
         for relocation in &self.dynamic_relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-            writeln!(
-                &mut out,
-                "dynrel\t{}\t{}\t{}\t{}\t{}",
-                section_input_id,
-                relocation.section_index,
-                relocation.relocation_offset,
-                relocation.output_offset,
-                relocation.size
-            )
-            .unwrap();
+            if let (Some(output_r_offset), Some(output_r_info)) =
+                (relocation.output_r_offset, relocation.output_r_info)
+            {
+                writeln!(
+                    &mut out,
+                    "dynrel\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    section_input_id,
+                    relocation.section_index,
+                    relocation.relocation_offset,
+                    relocation.output_offset,
+                    relocation.size,
+                    output_r_offset,
+                    output_r_info
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    &mut out,
+                    "dynrel\t{}\t{}\t{}\t{}\t{}",
+                    section_input_id,
+                    relocation.section_index,
+                    relocation.relocation_offset,
+                    relocation.output_offset,
+                    relocation.size
+                )
+                .unwrap();
+            }
         }
         out
     }
@@ -2547,7 +2590,11 @@ impl DynamicRelocationRecord {
         relocation_offset: u64,
         output_offset: u64,
         size: u64,
+        output_info: Option<(u64, u64)>,
     ) -> Self {
+        let (output_r_offset, output_r_info) = output_info
+            .map(|(r_offset, r_info)| (Some(r_offset), Some(r_info)))
+            .unwrap_or((None, None));
         Self {
             input_file: encode_path(&input.file.filename),
             input: encode_input_ref(input),
@@ -2555,7 +2602,15 @@ impl DynamicRelocationRecord {
             relocation_offset,
             output_offset,
             size,
+            output_r_offset,
+            output_r_info,
         }
+    }
+
+    fn has_restorable_rela_output_info(&self) -> bool {
+        self.size == crate::elf::RELA_ENTRY_SIZE
+            && self.output_r_offset.is_some()
+            && self.output_r_info.is_some()
     }
 }
 
@@ -4100,6 +4155,15 @@ fn dynamic_relocation_patches_for_input_bytes(
             continue;
         };
         let mut data = vec![0; record.size as usize];
+        let preserve_ranges = if let (Some(output_r_offset), Some(output_r_info)) =
+            (record.output_r_offset, record.output_r_info)
+        {
+            data[0..8].copy_from_slice(&output_r_offset.to_le_bytes());
+            data[8..16].copy_from_slice(&output_r_info.to_le_bytes());
+            Vec::new()
+        } else {
+            vec![0..16]
+        };
         data[16..24].copy_from_slice(addend);
         patches.push(DynamicRelocationPatch {
             record: record.clone(),
@@ -4108,7 +4172,7 @@ fn dynamic_relocation_patches_for_input_bytes(
                 output_offset: record.output_offset,
                 size: record.size,
                 data,
-                preserve_ranges: vec![0..16],
+                preserve_ranges,
                 adjustments: Vec::new(),
             },
         });
@@ -4210,6 +4274,120 @@ fn object_diff_allows_dynamic_relocation_removal(
         let data = section
             .data()
             .context("Failed to read current dynamic relocation removal section data")?;
+        current_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    Ok(previous_sections_by_name == current_sections_by_name)
+}
+
+fn object_diff_allows_dynamic_relocation_addition(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    dynamic_relocation_patches: &[DynamicRelocationPatch],
+) -> Result<bool> {
+    if dynamic_relocation_patches.is_empty()
+        || dynamic_relocation_patches
+            .iter()
+            .all(|patch| patch.input_range.is_none())
+        || dynamic_relocation_patches.iter().any(|patch| {
+            patch.record.input_file != input_file_path
+                || patch.record.input != input_file_path
+                || !patch.record.has_restorable_rela_output_info()
+        })
+        || matched_sections.iter().any(|section| {
+            section.previous.input != input_file_path || section.current.input != input_file_path
+        })
+    {
+        return Ok(false);
+    }
+
+    let Some(previous_section_headers) = elf_section_headers(previous_bytes) else {
+        return Ok(false);
+    };
+    let Some(current_section_headers) = elf_section_headers(current_bytes) else {
+        return Ok(false);
+    };
+    let mut added_offsets_by_section = HashMap::<u32, HashSet<u64>>::new();
+    for patch in dynamic_relocation_patches
+        .iter()
+        .filter(|patch| patch.input_range.is_some())
+    {
+        added_offsets_by_section
+            .entry(patch.record.section_index)
+            .or_default()
+            .insert(patch.record.relocation_offset);
+    }
+    if added_offsets_by_section.is_empty() {
+        return Ok(false);
+    }
+
+    for (section_index, added_offsets) in &added_offsets_by_section {
+        let previous_entries =
+            rela_entries_for_section(previous_bytes, &previous_section_headers, *section_index)
+                .unwrap_or_default();
+        if !previous_entries.is_empty() {
+            return Ok(false);
+        }
+        let current_entries =
+            rela_entries_for_section(current_bytes, &current_section_headers, *section_index)
+                .unwrap_or_default();
+        if current_entries.is_empty()
+            || current_entries
+                .iter()
+                .any(|entry| !added_offsets.contains(&entry.offset))
+        {
+            return Ok(false);
+        }
+    }
+
+    let previous_file = object::File::parse(previous_bytes)
+        .context("Failed to parse previous dynamic relocation addition input")?;
+    let current_file = object::File::parse(current_bytes)
+        .context("Failed to parse current dynamic relocation addition input")?;
+    let previous_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.previous.section_index as usize))
+        .collect::<HashSet<_>>();
+    let current_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.current.section_index as usize))
+        .collect::<HashSet<_>>();
+
+    let mut previous_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in previous_file.sections() {
+        if previous_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_dynamic_relocation_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read previous dynamic relocation addition section data")?;
+        previous_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    let mut current_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in current_file.sections() {
+        if current_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_dynamic_relocation_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read current dynamic relocation addition section data")?;
         current_sections_by_name
             .entry(name.to_owned())
             .or_default()
@@ -6031,26 +6209,50 @@ fn parse_compact_dynamic_relocation_line(
         .context("Malformed incremental dynamic relocation section index")?
         .parse()
         .context("Invalid incremental dynamic relocation section index")?;
-    let (relocation_offset, output_offset_index, size_index) = match parts.len() {
-        4 => (0, 2, 3),
-        5 => {
-            let relocation_offset = parts[2]
-                .parse()
-                .context("Invalid incremental dynamic relocation input offset")?;
-            (relocation_offset, 3, 4)
-        }
-        _ => {
-            return Err(crate::error!(
-                "Malformed incremental dynamic relocation record"
-            ));
-        }
-    };
+    let (relocation_offset, output_offset_index, size_index, output_info_indices) =
+        match parts.len() {
+            4 => (0, 2, 3, None),
+            5 => {
+                let relocation_offset = parts[2]
+                    .parse()
+                    .context("Invalid incremental dynamic relocation input offset")?;
+                (relocation_offset, 3, 4, None)
+            }
+            7 => {
+                let relocation_offset = parts[2]
+                    .parse()
+                    .context("Invalid incremental dynamic relocation input offset")?;
+                (relocation_offset, 3, 4, Some((5, 6)))
+            }
+            _ => {
+                return Err(crate::error!(
+                    "Malformed incremental dynamic relocation record"
+                ));
+            }
+        };
     let output_offset = parts[output_offset_index]
         .parse()
         .context("Invalid incremental dynamic relocation output offset")?;
     let size = parts[size_index]
         .parse()
         .context("Invalid incremental dynamic relocation size")?;
+    let (output_r_offset, output_r_info) =
+        if let Some((r_offset_index, r_info_index)) = output_info_indices {
+            (
+                Some(
+                    parts[r_offset_index]
+                        .parse()
+                        .context("Invalid incremental dynamic relocation output r_offset")?,
+                ),
+                Some(
+                    parts[r_info_index]
+                        .parse()
+                        .context("Invalid incremental dynamic relocation output r_info")?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
     let (input_file, input) = section_inputs
         .get(section_input_id)
         .context("Incremental dynamic relocation input index out of bounds")?;
@@ -6061,6 +6263,8 @@ fn parse_compact_dynamic_relocation_line(
         relocation_offset,
         output_offset,
         size,
+        output_r_offset,
+        output_r_info,
     })
 }
 
@@ -6593,7 +6797,25 @@ mod tests {
             relocation_offset,
             output_offset,
             size,
+            output_r_offset: None,
+            output_r_info: None,
         }
+    }
+
+    fn dynamic_relocation_record_with_output_info(
+        input: &str,
+        section_index: u32,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        output_r_offset: u64,
+        output_r_info: u64,
+    ) -> DynamicRelocationRecord {
+        let mut record =
+            dynamic_relocation_record(input, section_index, relocation_offset, output_offset, size);
+        record.output_r_offset = Some(output_r_offset);
+        record.output_r_info = Some(output_r_info);
+        record
     }
 
     fn relocation_record(
@@ -7549,6 +7771,108 @@ mod tests {
         assert_eq!(patches[0].patch.size, 24);
         assert_eq!(patches[0].patch.data, vec![0; 24]);
         assert!(patches[0].patch.preserve_ranges.is_empty());
+    }
+
+    #[test]
+    fn dynamic_relocation_patch_restores_recorded_output_info() {
+        let bytes = relocated_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let relocation = dynamic_relocation_record_with_output_info(
+            "input.o",
+            1,
+            4,
+            300,
+            24,
+            0x400040,
+            0x100000006,
+        );
+
+        let patches =
+            dynamic_relocation_patches_for_input(&bytes, &input_ref, [&relocation]).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].patch.preserve_ranges,
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(&patches[0].patch.data[0..8], &0x400040_u64.to_le_bytes());
+        assert_eq!(
+            &patches[0].patch.data[8..16],
+            &0x100000006_u64.to_le_bytes()
+        );
+        assert_eq!(&patches[0].patch.data[16..24], &bytes[0x90..0x98]);
+    }
+
+    #[test]
+    fn object_diff_allows_dynamic_relocation_addition_from_metadata_only_change() {
+        let current = relocated_data_elf();
+        let mut previous = current.clone();
+        let rela_header = 0x100 + 128;
+        previous[rela_header + 32..rela_header + 40].copy_from_slice(&0_u64.to_le_bytes());
+        let input_ref = encode_path(Path::new("input.o"));
+        let relocation = dynamic_relocation_record_with_output_info(
+            "input.o",
+            1,
+            4,
+            300,
+            24,
+            0x400040,
+            0x100000006,
+        );
+        let patches =
+            dynamic_relocation_patches_for_input(&current, &input_ref, [&relocation]).unwrap();
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+
+        assert!(
+            object_diff_allows_dynamic_relocation_addition(
+                &previous,
+                &current,
+                &input_ref,
+                &[MatchedPatchSection::same(patch_section)],
+                &patches,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn object_diff_rejects_dynamic_relocation_addition_without_free_slot_info() {
+        let current = relocated_data_elf();
+        let mut previous = current.clone();
+        let rela_header = 0x100 + 128;
+        previous[rela_header + 32..rela_header + 40].copy_from_slice(&0_u64.to_le_bytes());
+        let input_ref = encode_path(Path::new("input.o"));
+        let relocation = dynamic_relocation_record("input.o", 1, 4, 300, 24);
+        let patches =
+            dynamic_relocation_patches_for_input(&current, &input_ref, [&relocation]).unwrap();
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: None,
+        };
+
+        assert!(
+            !object_diff_allows_dynamic_relocation_addition(
+                &previous,
+                &current,
+                &input_ref,
+                &[MatchedPatchSection::same(patch_section)],
+                &patches,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -8762,12 +9086,40 @@ mod tests {
         state
             .dynamic_relocations
             .push(dynamic_relocation_record("a.o", 1, 8, 300, 24));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record_with_output_info(
+                "a.o",
+                1,
+                16,
+                324,
+                24,
+                0x400040,
+                0x100000006,
+            ));
 
         let rendered = state.render();
 
-        assert!(rendered.contains("\ndynrels\t1\n"));
+        assert!(rendered.contains("\ndynrels\t2\n"));
         assert!(rendered.contains("\ndynrel\t0\t1\t8\t300\t24\n"));
+        assert!(rendered.contains("\ndynrel\t0\t1\t16\t324\t24\t4194368\t4294967302\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v27_state_version_is_accepted_without_dynamic_relocation_output_info() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 8, 300, 24));
+        let rendered = state.render().replacen(STATE_VERSION, STATE_VERSION_V27, 1);
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.dynamic_relocations, state.dynamic_relocations);
+        assert_eq!(parsed.dynamic_relocations[0].output_r_offset, None);
+        assert_eq!(parsed.dynamic_relocations[0].output_r_info, None);
     }
 
     #[test]
@@ -10416,8 +10768,22 @@ mod tests {
             reused_sections: AtomicUsize::new(0),
         };
 
-        state.record_dynamic_relocation(input, object::SectionIndex(3), 8, 256, 24);
-        state.record_dynamic_relocation(input, object::SectionIndex(3), 16, 280, 0);
+        state.record_dynamic_relocation_with_output_info(
+            input,
+            object::SectionIndex(3),
+            8,
+            256,
+            24,
+            None,
+        );
+        state.record_dynamic_relocation_with_output_info(
+            input,
+            object::SectionIndex(3),
+            16,
+            280,
+            0,
+            None,
+        );
 
         assert_eq!(
             *state.current_dynamic_relocations.lock().unwrap(),
@@ -10426,7 +10792,8 @@ mod tests {
                 object::SectionIndex(3),
                 8,
                 256,
-                24
+                24,
+                None
             )]
         );
     }

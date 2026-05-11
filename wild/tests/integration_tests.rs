@@ -209,6 +209,10 @@
 //! incremental link intentionally reserves capacity and the changed incremental output should
 //! preserve that older layout.
 //!
+//! TestIncrementalChangedRestore:{bool} Whether the changed-input test should restore the changed
+//! input object, then check that a second incremental update returns to the original output.
+//! Defaults to false.
+//!
 //! TestIncrementalChangedSectionPrefix:{section_name}=0x{hex_bytes} Checks that the changed-input
 //! incremental output section starts with the specified bytes.
 //!
@@ -836,6 +840,7 @@ struct Config {
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
     test_incremental_changed_compare_full: bool,
+    test_incremental_changed_restore: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_incremental_state_contains: Vec<String>,
@@ -1534,6 +1539,7 @@ impl Config {
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
             test_incremental_changed_compare_full: true,
+            test_incremental_changed_restore: false,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
             test_incremental_state_contains: Vec::new(),
@@ -2009,6 +2015,9 @@ fn process_directive(
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChangedRestore" => {
+            config.test_incremental_changed_restore = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChangedSectionPrefix" => {
             let (section_name, expected_bytes) =
                 parse_section_bytes_directive("TestIncrementalChangedSectionPrefix", arg.trim())?;
@@ -2466,6 +2475,16 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.test_incremental_changed_restore
+                && config.test_incremental_changed_compare_full
+            {
+                bail!(
+                    "Incremental changed-restore test for {} requires \
+                    TestIncrementalChangedCompareFull:false because the full relink overwrites the \
+                    incremental output before the restore step",
+                    self.name()
+                );
+            }
 
             let mut _restore_changed_inputs = Vec::with_capacity(changed_inputs.len());
             let changed_sections = config.incremental_changed_sections();
@@ -2482,6 +2501,15 @@ impl ProgramInputs {
                     let replacement_config = config.config_for_deps();
                     let changed_source =
                         FilenameArgumentPair::new(&changed_source, changed_comp_args.clone());
+                    let pre_replacement_path = append_to_path(&changed_input.path, ".previous");
+                    std::fs::rename(&changed_input.path, &pre_replacement_path).with_context(
+                        || {
+                            format!(
+                                "Failed to move incremental input `{}` aside before rebuilding it",
+                                changed_input.path.display()
+                            )
+                        },
+                    )?;
                     let replacement = build_obj_impl(
                         &changed_source,
                         &replacement_config,
@@ -2497,16 +2525,25 @@ impl ProgramInputs {
                         )
                     })?;
                     if replacement.path != changed_input.path {
-                        std::fs::copy(&replacement.path, &changed_input.path).with_context(
-                            || {
-                                format!(
-                                    "Failed to replace incremental input `{}` with `{}`",
-                                    changed_input.path.display(),
-                                    replacement.path.display()
-                                )
-                            },
-                        )?;
+                        let tmp_path = append_to_path(&changed_input.path, ".replacement");
+                        std::fs::copy(&replacement.path, &tmp_path).with_context(|| {
+                            format!(
+                                "Failed to copy incremental replacement `{}` to `{}`",
+                                replacement.path.display(),
+                                tmp_path.display()
+                            )
+                        })?;
+                        std::fs::rename(&tmp_path, &changed_input.path).with_context(|| {
+                            format!(
+                                "Failed to replace incremental input `{}` with `{}`",
+                                changed_input.path.display(),
+                                tmp_path.display()
+                            )
+                        })?;
                     }
+                    // Make the compiler-produced replacement a fresh file before Wild snapshots it.
+                    rewrite_file_with_same_contents(&changed_input.path)?;
+                    let _ = std::fs::remove_file(&pre_replacement_path);
                 } else {
                     for changed_section in &changed_sections {
                         if let Some(growth) = config.test_incremental_changed_grow_section {
@@ -2717,6 +2754,93 @@ impl ProgramInputs {
                     self.name(),
                     log
                 );
+            }
+            if config.test_incremental_changed_restore {
+                let patched_input_message =
+                    format!("patched {} changed input file", changed_inputs.len());
+                let patched_input_count_before = log.matches(&patched_input_message).count();
+                let patched_sections_message = " changed input sections before loading inputs";
+                let patched_section_count_before = log.matches(patched_sections_message).count();
+                for restore in &_restore_changed_inputs {
+                    restore.restore()?;
+                }
+
+                let link_output_restored =
+                    Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+                let restored_content =
+                    std::fs::read(&link_output_restored.binary).with_context(|| {
+                        format!(
+                            "Failed to read restored incremental output: {}",
+                            link_output_restored.binary.display()
+                        )
+                    })?;
+                if restored_content != final_content {
+                    let diffs = sections_with_diffs(&restored_content, &final_content)?;
+                    bail!(
+                        "Incremental test failed for {}: restored changed-input output differs \
+                        from the original incremental output. Diffs:\n{diffs:#?}",
+                        self.name()
+                    );
+                }
+
+                let restored_log = std::fs::read_to_string(&log_path).with_context(|| {
+                    format!("Failed to read incremental log `{}`", log_path.display())
+                })?;
+                if config.test_incremental_changed_expect_patch {
+                    if restored_log.matches(&patched_input_message).count()
+                        <= patched_input_count_before
+                    {
+                        bail!(
+                            "Incremental test failed for {}: restored changed-input relink did \
+                            not patch the changed input before loading all inputs. Log:\n{}",
+                            self.name(),
+                            restored_log
+                        );
+                    }
+                    if restored_log.matches(patched_sections_message).count()
+                        <= patched_section_count_before
+                    {
+                        bail!(
+                            "Incremental test failed for {}: restored changed-input relink did \
+                            not narrow the update to changed sections. Log:\n{}",
+                            self.name(),
+                            restored_log
+                        );
+                    }
+                }
+
+                let reuse_count_before_restored_repeat =
+                    restored_log.matches(reuse_message).count();
+                let link_output_restored_repeat =
+                    Linker::Wild.link(self.name(), inputs, &incremental_config, cross_arch)?;
+                let restored_repeat_content = std::fs::read(&link_output_restored_repeat.binary)
+                    .with_context(|| {
+                        format!(
+                            "Failed to read repeated restored incremental output: {}",
+                            link_output_restored_repeat.binary.display()
+                        )
+                    })?;
+                if restored_repeat_content != restored_content {
+                    bail!(
+                        "Incremental test failed for {}: repeated restored-input link changed \
+                        output",
+                        self.name()
+                    );
+                }
+                let restored_repeat_log =
+                    std::fs::read_to_string(&log_path).with_context(|| {
+                        format!("Failed to read incremental log `{}`", log_path.display())
+                    })?;
+                if restored_repeat_log.matches(reuse_message).count()
+                    <= reuse_count_before_restored_repeat
+                {
+                    bail!(
+                        "Incremental test failed for {}: repeated restored-input link did not \
+                        reuse the updated incremental state. Log:\n{}",
+                        self.name(),
+                        restored_repeat_log
+                    );
+                }
             }
         }
 
@@ -2949,11 +3073,24 @@ impl RestoreFileOnDrop {
             contents,
         })
     }
+
+    fn restore(&self) -> Result {
+        let tmp_path = append_to_path(&self.path, ".restore");
+        std::fs::write(&tmp_path, &self.contents)
+            .with_context(|| format!("Failed to write restored object `{}`", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &self.path).with_context(|| {
+            format!(
+                "Failed to replace `{}` with restored object `{}`",
+                self.path.display(),
+                tmp_path.display()
+            )
+        })
+    }
 }
 
 impl Drop for RestoreFileOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.path, &self.contents);
+        let _ = self.restore();
     }
 }
 
