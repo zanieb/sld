@@ -2026,7 +2026,7 @@ impl platform::Args for ElfArgs {
     }
 
     fn should_gc_sections(&self) -> bool {
-        self.gc_sections
+        self.gc_sections && !self.common.incremental
     }
 
     fn should_merge_sections(&self) -> bool {
@@ -2522,6 +2522,24 @@ mod tests {
         for flag in SILENTLY_IGNORED_FLAGS {
             assert!(!flag.starts_with('-'));
         }
+    }
+
+    #[test]
+    fn incremental_disables_section_gc() {
+        let args = parse_args(std::iter::empty::<&str>());
+        assert!(args.should_gc_sections());
+
+        let args = parse_args(["--incremental"]);
+        assert!(args.gc_sections);
+        assert!(!args.should_gc_sections());
+
+        let args = parse_args(["--incremental", "--gc-sections"]);
+        assert!(args.gc_sections);
+        assert!(!args.should_gc_sections());
+
+        let args = parse_args(["--incremental", "--no-gc-sections"]);
+        assert!(!args.gc_sections);
+        assert!(!args.should_gc_sections());
     }
 
     // Helper: parse a small set of args and return the resulting ElfArgs.
