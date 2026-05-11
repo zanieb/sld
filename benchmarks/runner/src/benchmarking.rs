@@ -533,6 +533,10 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
+    if bin.identifier.kind == LinkerKind::Wild && !bench.config.expect_wild_log.is_empty() {
+        verify_wild_incremental_log(&output_path, &bench.config.expect_wild_log)?;
+    }
+
     // However long we took to run, sleep for half of that. If the linker forked on startup, then
     // this gives the subprocess a chance to shutdown in the background before we run the next
     // command.
@@ -558,6 +562,27 @@ fn output_path_for_bin(tmp: &Path, bin: &Bin) -> std::path::PathBuf {
     file_name.push(suffix);
     path.set_file_name(file_name);
     path
+}
+
+fn verify_wild_incremental_log(output_path: &Path, expected: &[String]) -> Result {
+    let path = incremental_log_path(output_path);
+    let log = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read Wild incremental log `{}`", path.display()))?;
+    for expected in expected {
+        if !log.contains(expected) {
+            bail!(
+                "Wild incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn incremental_log_path(output_path: &Path) -> std::path::PathBuf {
+    let mut state_dir = output_path.as_os_str().to_owned();
+    state_dir.push(".incr");
+    std::path::PathBuf::from(state_dir).join("log")
 }
 
 fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> {
@@ -627,9 +652,11 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
 mod tests {
     use super::ensure_relative_path;
     use super::grow_elf_section;
+    use super::incremental_log_path;
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
     use super::output_path_for_bin;
+    use super::verify_wild_incremental_log;
     use crate::Benchmark;
     use crate::Bin;
     use crate::LinkerIdentifier;
@@ -735,6 +762,33 @@ mod tests {
             object.section_by_name(".data").unwrap().data().unwrap(),
             &[1, 2, 3, 4, 0x80]
         );
+    }
+
+    #[test]
+    fn wild_incremental_log_expectations_must_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let log_path = incremental_log_path(&output);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            "full relink: no previous incremental state\npatched 1 changed input file before loading inputs\n",
+        )
+        .unwrap();
+
+        verify_wild_incremental_log(
+            &output,
+            &[
+                "patched 1 changed input file".to_owned(),
+                "before loading inputs".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        let error = verify_wild_incremental_log(&output, &["reused existing output".to_owned()])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("did not contain expected text"));
     }
 
     #[test]

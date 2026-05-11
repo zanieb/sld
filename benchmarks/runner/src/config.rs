@@ -32,6 +32,9 @@ pub(crate) struct BenchConfig {
     /// Paths relative to the save-dir to mutate before each timed run.
     #[serde(default)]
     pub(crate) mutate_files: Vec<Mutation>,
+    /// Strings that must appear in Wild's incremental log after each Wild run.
+    #[serde(default)]
+    pub(crate) expect_wild_log: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -137,6 +140,27 @@ mutate_files = [{ path = "changed.o", section = ".data", grow = 1 }]
                 section: ".data".to_owned(),
                 grow: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn parses_incremental_log_expectations() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+wild_extra_flags = ["--incremental"]
+expect_wild_log = ["patched ", "before loading inputs"]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(
+            bench.expect_wild_log,
+            ["patched ".to_owned(), "before loading inputs".to_owned()]
         );
     }
 }
