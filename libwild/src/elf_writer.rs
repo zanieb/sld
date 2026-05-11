@@ -357,9 +357,19 @@ fn write_sframe_section(sframe_buffer: &mut [u8], layout: &ElfLayout) -> Result 
 
 fn sort_eh_frame_hdr_entries(eh_frame_hdr: &mut [u8]) {
     timing_phase!("Sort .eh_frame_hdr");
-    let entry_bytes = &mut eh_frame_hdr[size_of::<elf::EhFrameHdr>()..];
+    if eh_frame_hdr.len() < size_of::<elf::EhFrameHdr>() {
+        return;
+    }
+    let (header_bytes, entry_bytes) = eh_frame_hdr.split_at_mut(size_of::<elf::EhFrameHdr>());
+    let header = elf::EhFrameHdr::mut_from_bytes(header_bytes).unwrap();
+    let Ok(entry_count) = usize::try_from(header.entry_count) else {
+        return;
+    };
     let entries = <[elf::EhFrameHdrEntry]>::mut_from_bytes(entry_bytes).unwrap();
-    entries.par_sort_by_key(|e| e.frame_ptr);
+    let Some(active_entries) = entries.get_mut(..entry_count) else {
+        return;
+    };
+    active_entries.par_sort_by_key(|e| e.frame_ptr);
 }
 
 fn write_program_headers(
@@ -4012,7 +4022,7 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
     }
 
     write_merged_strings(prelude, buffers, layout, incremental);
-    record_generated_dynamic_relocation_sections(incremental, layout);
+    record_generated_sections(incremental, layout);
 
     write_interp(prelude, buffers);
 
@@ -4034,11 +4044,10 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
     Ok(())
 }
 
-fn record_generated_dynamic_relocation_sections(
-    incremental: &PreparedState,
-    layout: &ElfLayout<'_>,
-) {
+fn record_generated_sections(incremental: &PreparedState, layout: &ElfLayout<'_>) {
     for (name, part_id) in [
+        ("generated:.eh_frame", part_id::EH_FRAME),
+        ("generated:.eh_frame_hdr", part_id::EH_FRAME_HDR),
         ("generated:.rela.dyn.relative", part_id::RELA_DYN_RELATIVE),
         ("generated:.rela.dyn.general", part_id::RELA_DYN_GENERAL),
         ("generated:.relr.dyn", part_id::RELR_DYN),
@@ -4443,6 +4452,26 @@ fn write_epilogue<A: Arch<Platform = Elf>>(
     build_id_buffer.fill(0);
 
     write_compressed_debug_sections(layout, buffers);
+
+    if epilogue.format_specific.eh_frame_padding > 0 {
+        let padding = usize::try_from(epilogue.format_specific.eh_frame_padding)
+            .context(".eh_frame incremental padding overflowed usize")?;
+        table_writer.take_eh_frame_data(padding)?.fill(0);
+        table_writer.eh_frame_start_address += epilogue.format_specific.eh_frame_padding;
+        table_writer.eh_frame_start_file_offset += epilogue.format_specific.eh_frame_padding;
+    }
+    if epilogue.format_specific.eh_frame_hdr_padding > 0 {
+        let padding = usize::try_from(epilogue.format_specific.eh_frame_hdr_padding)
+            .context(".eh_frame_hdr incremental padding overflowed usize")?;
+        if padding > table_writer.eh_frame_hdr.len() {
+            return Err(insufficient_allocation(".eh_frame_hdr"));
+        }
+        table_writer
+            .eh_frame_hdr
+            .split_off_mut(..padding)
+            .unwrap()
+            .fill(0);
+    }
 
     Ok(())
 }
@@ -5256,12 +5285,12 @@ fn write_eh_frame_hdr(table_writer: &mut TableWriter, layout: &ElfLayout) -> Res
 }
 
 fn eh_frame_hdr_entry_count(layout: &ElfLayout) -> Result<u32> {
-    let hdr_sec = layout.section_layouts.get(output_section_id::EH_FRAME_HDR);
-    u32::try_from(
-        (hdr_sec.mem_size - size_of::<elf::EhFrameHdr>() as u64)
-            / size_of::<elf::EhFrameHdrEntry>() as u64,
-    )
-    .context(".eh_frame_hdr entries overflowed 32 bits")
+    let count = layout
+        .group_layouts
+        .iter()
+        .map(|group| group.format_specific.exception_frame_count)
+        .sum::<usize>();
+    u32::try_from(count).context(".eh_frame_hdr entries overflowed 32 bits")
 }
 
 /// Returns the address of .eh_frame relative to the location in .eh_frame_hdr where the frame

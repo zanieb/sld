@@ -695,6 +695,7 @@ fn patch_changed_inputs(
     let mut patches = Vec::new();
     let mut output_symbol_patches = Vec::new();
     let mut eh_frame_hdr_changes = Vec::new();
+    let mut fde_add_candidates = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut patched_section_count = 0;
     for (input_index, path) in changed_inputs {
@@ -726,6 +727,7 @@ fn patch_changed_inputs(
             current_sections,
             resolved_patches,
             fde_eh_frame_hdr_changes,
+            input_fde_add_candidates,
             added_dynamic_relocations,
             removed_dynamic_relocations,
             removed_fdes,
@@ -840,6 +842,21 @@ fn patch_changed_inputs(
             } else {
                 Vec::new()
             };
+            let input_fde_add_candidates =
+                if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                    added_fde_candidates_for_input(
+                        &bytes,
+                        previous_bytes,
+                        input.path.as_str(),
+                        &matched_sections,
+                        previous
+                            .fdes
+                            .iter()
+                            .filter(|record| record.input_file == input.path),
+                    )?
+                } else {
+                    Vec::new()
+                };
             let Some(fingerprint) = patch_fingerprint_with_extra_ranges(
                 &bytes,
                 input.path.as_str(),
@@ -853,6 +870,11 @@ fn patch_changed_inputs(
                         eh_frame_patches
                             .iter()
                             .flat_map(|patch| patch.input_ranges.iter().map(Clone::clone)),
+                    )
+                    .chain(
+                        input_fde_add_candidates
+                            .iter()
+                            .flat_map(|candidate| candidate.input_ranges.iter().cloned()),
                     ),
             )?
             else {
@@ -916,9 +938,25 @@ fn patch_changed_inputs(
                 } else {
                     false
                 };
+                let allows_fde_addition = if !input_fde_add_candidates.is_empty() {
+                    if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
+                        object_diff_allows_fde_addition(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            &input_fde_add_candidates,
+                        )?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 if !allows_dynamic_relocation_removal
                     && !allows_dynamic_relocation_addition
                     && !allows_fde_removal
+                    && !allows_fde_addition
                 {
                     return Ok(ChangedInputPatchResult::Unsupported(format!(
                         "changed bytes outside patchable sections in `{}`",
@@ -995,7 +1033,7 @@ fn patch_changed_inputs(
                 .iter()
                 .filter_map(|change| match change {
                     EhFrameHdrChange::Remove(fde) => Some(fde.clone()),
-                    EhFrameHdrChange::Adjust(_) => None,
+                    EhFrameHdrChange::Adjust(_) | EhFrameHdrChange::Add(_) => None,
                 })
                 .collect::<HashSet<_>>();
 
@@ -1016,6 +1054,7 @@ fn patch_changed_inputs(
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
+                input_fde_add_candidates,
                 added_dynamic_relocations,
                 removed_dynamic_relocations,
                 removed_fdes,
@@ -1069,6 +1108,7 @@ fn patch_changed_inputs(
         });
         patches.extend(resolved_patches);
         eh_frame_hdr_changes.extend(fde_eh_frame_hdr_changes);
+        fde_add_candidates.extend(input_fde_add_candidates);
     }
 
     if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
@@ -1101,6 +1141,20 @@ fn patch_changed_inputs(
     })?;
     match output_symbol_value_patches(&output, &output_symbol_patches)? {
         Ok(symbol_patches) => patches.extend(symbol_patches),
+        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+    }
+    match fde_add_patches_for_output(&output, &fde_add_candidates, &previous.fdes)? {
+        Ok(resolved_fdes) => {
+            patched_section_count += resolved_fdes.len();
+            for resolved in resolved_fdes {
+                previous.fdes.push(resolved.record);
+                patches.push(resolved.patch);
+                if let Some(change) = resolved.eh_frame_hdr_change {
+                    eh_frame_hdr_changes.push(change);
+                }
+                previous.sections_file = None;
+            }
+        }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
     match eh_frame_hdr_patches_for_fde_changes(&output, &eh_frame_hdr_changes)? {
@@ -1345,10 +1399,32 @@ struct FdeRelocationPatch {
     eh_frame_hdr_change: Option<EhFrameHdrChange>,
 }
 
+struct FdeAddCandidate {
+    input_ranges: Vec<std::ops::Range<usize>>,
+    input_file: String,
+    input: String,
+    target_section_index: u32,
+    eh_frame_section_index: u32,
+    input_offset: u64,
+    target_section_offset: u64,
+    target_output_offset: u64,
+    fde_data: Vec<u8>,
+    pc_begin_range: std::ops::Range<usize>,
+    cie_input_offset: u64,
+    cie_reference_fde_output_offset: u64,
+}
+
+struct ResolvedFdeAdd {
+    patch: SectionPatch,
+    record: FdeRecord,
+    eh_frame_hdr_change: Option<EhFrameHdrChange>,
+}
+
 #[derive(Clone)]
 enum EhFrameHdrChange {
     Adjust(EhFrameHdrDelta),
     Remove(FdeRecord),
+    Add(EhFrameHdrEntryPatch),
 }
 
 #[derive(Clone)]
@@ -4649,7 +4725,7 @@ fn object_diff_allows_fde_removal(
         .iter()
         .filter_map(|patch| match &patch.eh_frame_hdr_change {
             Some(EhFrameHdrChange::Remove(fde)) => Some(fde),
-            Some(EhFrameHdrChange::Adjust(_)) => None,
+            Some(EhFrameHdrChange::Adjust(_)) | Some(EhFrameHdrChange::Add(_)) => None,
             None => None,
         })
         .collect::<Vec<_>>();
@@ -4657,6 +4733,7 @@ fn object_diff_allows_fde_removal(
         || eh_frame_patches.iter().any(|patch| {
             patch.patch.is_some()
                 || matches!(patch.eh_frame_hdr_change, Some(EhFrameHdrChange::Adjust(_)))
+                || matches!(patch.eh_frame_hdr_change, Some(EhFrameHdrChange::Add(_)))
         })
         || removed_fdes
             .iter()
@@ -4717,6 +4794,76 @@ fn object_diff_allows_fde_removal(
         let data = section
             .data()
             .context("Failed to read current FDE removal section data")?;
+        current_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    Ok(previous_sections_by_name == current_sections_by_name)
+}
+
+fn object_diff_allows_fde_addition(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    added_fdes: &[FdeAddCandidate],
+) -> Result<bool> {
+    if added_fdes.is_empty()
+        || added_fdes
+            .iter()
+            .any(|fde| fde.input_file != input_file_path || fde.input != input_file_path)
+        || matched_sections.iter().any(|section| {
+            section.previous.input != input_file_path || section.current.input != input_file_path
+        })
+    {
+        return Ok(false);
+    }
+
+    let previous_file = object::File::parse(previous_bytes)
+        .context("Failed to parse previous FDE addition input")?;
+    let current_file =
+        object::File::parse(current_bytes).context("Failed to parse current FDE addition input")?;
+    let previous_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.previous.section_index as usize))
+        .collect::<HashSet<_>>();
+    let current_patch_indices = matched_sections
+        .iter()
+        .map(|section| object::SectionIndex(section.current.section_index as usize))
+        .collect::<HashSet<_>>();
+
+    let mut previous_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in previous_file.sections() {
+        if previous_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_fde_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read previous FDE addition section data")?;
+        previous_sections_by_name
+            .entry(name.to_owned())
+            .or_default()
+            .push(data.to_vec());
+    }
+
+    let mut current_sections_by_name = HashMap::<String, Vec<Vec<u8>>>::new();
+    for section in current_file.sections() {
+        if current_patch_indices.contains(&section.index()) {
+            continue;
+        }
+        let name = section.name().unwrap_or_default();
+        if section_name_is_metadata_for_fde_removal(name) {
+            continue;
+        }
+        let data = section
+            .data()
+            .context("Failed to read current FDE addition section data")?;
         current_sections_by_name
             .entry(name.to_owned())
             .or_default()
@@ -4850,6 +4997,525 @@ fn fde_relocation_patches_for_input<'a>(
         )?);
     }
     Ok(patches)
+}
+
+fn added_fde_candidates_for_input<'a>(
+    current_bytes: &[u8],
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    records: impl IntoIterator<Item = &'a FdeRecord>,
+) -> Result<Vec<FdeAddCandidate>> {
+    let records = records.into_iter().collect::<Vec<_>>();
+    let mut records_by_input = HashMap::<&str, Vec<&FdeRecord>>::new();
+    for record in records {
+        records_by_input
+            .entry(record.input.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    let mut candidates = Vec::new();
+    for (input_ref, records) in records_by_input {
+        let Some(current_input_bytes) =
+            patch_input_bytes(current_bytes, input_file_path, input_ref)?
+        else {
+            continue;
+        };
+        let Some(previous_input_bytes) =
+            patch_input_bytes(previous_bytes, input_file_path, input_ref)?
+        else {
+            continue;
+        };
+        candidates.extend(added_fde_candidates_for_input_bytes(
+            current_input_bytes.bytes,
+            current_input_bytes.file_offset,
+            previous_input_bytes.bytes,
+            input_file_path,
+            input_ref,
+            matched_sections,
+            records,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn added_fde_candidates_for_input_bytes(
+    current_bytes: &[u8],
+    current_file_offset: usize,
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    input_ref: &str,
+    matched_sections: &[MatchedPatchSection],
+    records: Vec<&FdeRecord>,
+) -> Result<Vec<FdeAddCandidate>> {
+    let Some(current_section_headers) = elf_section_headers(current_bytes) else {
+        return Ok(Vec::new());
+    };
+    let current_file =
+        object::File::parse(current_bytes).context("Failed to parse current FDE addition input")?;
+    let previous_file = object::File::parse(previous_bytes)
+        .context("Failed to parse previous FDE addition input")?;
+    let current_eh_frame_section_index = current_file
+        .section_by_name(".eh_frame")
+        .map(|section| section.index().0 as u32);
+
+    let mut matched_current_fdes = HashSet::<(u32, u64)>::new();
+    let mut cie_reference_fde_output_offsets = HashMap::<u64, u64>::new();
+    for record in records {
+        let Some(current_record) = current_fde_record_for_previous_record(
+            &previous_file,
+            &current_file,
+            record,
+            current_eh_frame_section_index,
+        )?
+        else {
+            continue;
+        };
+        let mut current_record = current_record;
+        let current_input_offset = fde_input_range_for_target_section(
+            current_bytes,
+            &current_section_headers,
+            current_record.eh_frame_section_index,
+            current_record.section_index,
+        )
+        .map(|(_, input_offset)| input_offset)
+        .unwrap_or(current_record.input_offset);
+        current_record.input_offset = current_input_offset;
+        matched_current_fdes.insert((current_record.section_index, current_input_offset));
+        if let Some(current_fde_range) = fde_input_range(
+            current_bytes.len(),
+            &current_section_headers,
+            &current_record,
+        ) && let Some(cie_input_offset) = fde_cie_input_offset(
+            &current_bytes[current_fde_range],
+            current_record.input_offset,
+        ) {
+            cie_reference_fde_output_offsets
+                .entry(cie_input_offset)
+                .or_insert(record.output_offset);
+        }
+    }
+
+    let target_output_offsets = matched_sections
+        .iter()
+        .filter(|section| section.current.input == input_ref)
+        .map(|section| (section.current.section_index, section.current.output_offset))
+        .collect::<HashMap<_, _>>();
+
+    let mut candidates = Vec::new();
+    for candidate in fde_candidates_for_input_bytes(current_bytes, current_file_offset)? {
+        if matched_current_fdes.contains(&(candidate.target_section_index, candidate.input_offset))
+        {
+            continue;
+        }
+        let Some(target_output_offset) = target_output_offsets
+            .get(&candidate.target_section_index)
+            .copied()
+        else {
+            continue;
+        };
+        let Some(cie_reference_fde_output_offset) = cie_reference_fde_output_offsets
+            .get(&candidate.cie_input_offset)
+            .copied()
+        else {
+            continue;
+        };
+        candidates.push(FdeAddCandidate {
+            target_output_offset,
+            cie_reference_fde_output_offset,
+            input_file: input_file_path.to_owned(),
+            input: input_ref.to_owned(),
+            ..candidate
+        });
+    }
+    Ok(candidates)
+}
+
+fn fde_candidates_for_input_bytes(
+    bytes: &[u8],
+    file_offset: usize,
+) -> Result<Vec<FdeAddCandidate>> {
+    let Some(section_headers) = elf_section_headers(bytes) else {
+        return Ok(Vec::new());
+    };
+    let file = object::File::parse(bytes).context("Failed to parse FDE addition input")?;
+    let Some(eh_frame_section) = file.section_by_name(".eh_frame") else {
+        return Ok(Vec::new());
+    };
+    let eh_frame_section_index = eh_frame_section.index().0 as u32;
+    let data = eh_frame_section
+        .data()
+        .context("Failed to read FDE addition .eh_frame data")?;
+    let Some(section_header) = section_headers.get(eh_frame_section_index as usize) else {
+        return Ok(Vec::new());
+    };
+    let section_start = usize::try_from(section_header.sh_offset)
+        .context("FDE addition .eh_frame offset is too large")?;
+    let relas = rela_entries_for_section(bytes, &section_headers, eh_frame_section_index)
+        .unwrap_or_default();
+
+    let mut candidates = Vec::new();
+    let mut offset = 0usize;
+    while offset + 8 <= data.len() {
+        let length = usize::try_from(
+            read_u32_le(&data[offset..offset + 4])
+                .context("FDE addition .eh_frame entry length is truncated")?,
+        )
+        .context("FDE addition .eh_frame entry length is too large")?;
+        if length == 0 {
+            break;
+        }
+        let Some(size) = length.checked_add(4) else {
+            break;
+        };
+        let Some(next_offset) = offset.checked_add(size) else {
+            break;
+        };
+        if next_offset > data.len() {
+            break;
+        }
+        let entry = &data[offset..next_offset];
+        let cie_id =
+            read_u32_le(&entry[4..8]).context("FDE addition .eh_frame CIE pointer is truncated")?;
+        if cie_id != 0 {
+            let input_offset = offset as u64;
+            let pc_begin_offset = input_offset + crate::elf::FDE_PC_BEGIN_OFFSET as u64;
+            let relas_in_fde = relas
+                .iter()
+                .filter(|entry| {
+                    entry.offset >= input_offset && entry.offset < input_offset + size as u64
+                })
+                .collect::<Vec<_>>();
+            let Some(pc_begin_rela) = relas_in_fde
+                .iter()
+                .find(|entry| entry.offset == pc_begin_offset)
+            else {
+                offset = next_offset;
+                continue;
+            };
+            if relas_in_fde.len() != 1 {
+                offset = next_offset;
+                continue;
+            }
+            let Some((target_section_index, target_section_offset, pc_begin_range)) =
+                fde_pc_begin_target(&file, eh_frame_section.index(), pc_begin_rela)?
+            else {
+                offset = next_offset;
+                continue;
+            };
+            let cie_pointer_pos = input_offset + 4;
+            let Some(cie_input_offset) = cie_pointer_pos.checked_sub(u64::from(cie_id)) else {
+                offset = next_offset;
+                continue;
+            };
+            let entry_start = section_start + offset;
+            candidates.push(FdeAddCandidate {
+                input_ranges: std::iter::once(
+                    file_offset + entry_start..file_offset + section_start + next_offset,
+                )
+                .chain(relas_in_fde.iter().map(|entry| {
+                    file_offset + entry.addend_range.start..file_offset + entry.addend_range.end
+                }))
+                .collect(),
+                input_file: String::new(),
+                input: String::new(),
+                target_section_index: target_section_index.0 as u32,
+                eh_frame_section_index,
+                input_offset,
+                target_section_offset,
+                target_output_offset: 0,
+                fde_data: entry.to_vec(),
+                pc_begin_range,
+                cie_input_offset,
+                cie_reference_fde_output_offset: 0,
+            });
+        }
+        offset = next_offset;
+    }
+    Ok(candidates)
+}
+
+fn fde_pc_begin_target(
+    file: &object::File<'_>,
+    eh_frame_section_index: object::SectionIndex,
+    entry: &RelaPatchEntry,
+) -> Result<Option<(object::SectionIndex, u64, std::ops::Range<usize>)>> {
+    let eh_frame = file
+        .section_by_index(eh_frame_section_index)
+        .context("Missing FDE addition .eh_frame section")?;
+    let relocation = eh_frame
+        .relocations()
+        .find_map(|(offset, relocation)| (offset == entry.offset).then_some(relocation));
+    let Some(relocation) = relocation else {
+        return Ok(None);
+    };
+    if relocation.kind() != object::RelocationKind::Relative
+        || relocation.encoding() != object::RelocationEncoding::Generic
+        || relocation.size() != 32
+        || relocation.has_implicit_addend()
+    {
+        return Ok(None);
+    }
+    let pc_begin_range = crate::elf::FDE_PC_BEGIN_OFFSET..crate::elf::FDE_PC_BEGIN_OFFSET + 4;
+
+    match relocation.target() {
+        object::RelocationTarget::Symbol(symbol_index) => {
+            let symbol = file
+                .symbol_by_index(symbol_index)
+                .context("Missing FDE addition pc-begin symbol")?;
+            let Some(section_index) = symbol.section_index() else {
+                return Ok(None);
+            };
+            let Some(offset) = (symbol.address() as i128)
+                .checked_add(i128::from(relocation.addend()))
+                .and_then(|value| u64::try_from(value).ok())
+            else {
+                return Ok(None);
+            };
+            Ok(Some((section_index, offset, pc_begin_range)))
+        }
+        object::RelocationTarget::Section(section_index) => {
+            let Some(offset) = u64::try_from(relocation.addend()).ok() else {
+                return Ok(None);
+            };
+            Ok(Some((section_index, offset, pc_begin_range)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn fde_add_patches_for_output(
+    output: &[u8],
+    candidates: &[FdeAddCandidate],
+    existing_fdes: &[FdeRecord],
+) -> Result<std::result::Result<Vec<ResolvedFdeAdd>, String>> {
+    if candidates.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let file = object::File::parse(output)
+        .context("Failed to parse output for incremental FDE addition")?;
+    let Some(eh_frame) = file.section_by_name(".eh_frame") else {
+        return Ok(Err(
+            "output has no .eh_frame for incremental FDE addition".to_owned()
+        ));
+    };
+    let Some((eh_frame_offset, eh_frame_size)) = eh_frame.file_range() else {
+        return Ok(Err("output .eh_frame has no file range".to_owned()));
+    };
+    let Ok(eh_frame_start) = usize::try_from(eh_frame_offset) else {
+        return Ok(Err("output .eh_frame offset is too large".to_owned()));
+    };
+    let Ok(eh_frame_size) = usize::try_from(eh_frame_size) else {
+        return Ok(Err("output .eh_frame size is too large".to_owned()));
+    };
+    let Some(eh_frame_end) = eh_frame_start.checked_add(eh_frame_size) else {
+        return Ok(Err("output .eh_frame range overflowed".to_owned()));
+    };
+    let Some(eh_frame_bytes) = output.get(eh_frame_start..eh_frame_end) else {
+        return Ok(Err("output .eh_frame range is out of bounds".to_owned()));
+    };
+    let Some(terminator_offset_in_section) = eh_frame_terminator_offset(eh_frame_bytes) else {
+        return Ok(Err(
+            "output .eh_frame has no terminator for FDE addition".to_owned()
+        ));
+    };
+
+    let eh_frame_hdr_address = file
+        .section_by_name(".eh_frame_hdr")
+        .map(|section| section.address());
+    let Some(mut output_offset) = eh_frame_offset.checked_add(terminator_offset_in_section as u64)
+    else {
+        return Ok(Err(
+            "output .eh_frame terminator offset overflowed".to_owned()
+        ));
+    };
+    let mut resolved = Vec::new();
+    for candidate in candidates {
+        let target_section_address =
+            match output_address_for_file_offset(&file, candidate.target_output_offset) {
+                Some(address) => address,
+                None => {
+                    return Ok(Err(
+                        "could not resolve FDE addition target output address".to_owned()
+                    ));
+                }
+            };
+        let Some(target_address) =
+            target_section_address.checked_add(candidate.target_section_offset)
+        else {
+            return Ok(Err(
+                "FDE addition target output address overflowed".to_owned()
+            ));
+        };
+        let Some(fde_address) = output_offset
+            .checked_sub(eh_frame_offset)
+            .and_then(|section_offset| eh_frame.address().checked_add(section_offset))
+        else {
+            return Ok(Err("FDE addition output address overflowed".to_owned()));
+        };
+        let output_cie_offset =
+            match output_cie_offset_for_fde(output, candidate.cie_reference_fde_output_offset) {
+                Some(offset) => offset,
+                None => {
+                    return Ok(Err(
+                        "could not resolve FDE addition CIE output offset".to_owned()
+                    ));
+                }
+            };
+        let Some(cie_pointer) = output_offset
+            .checked_add(4)
+            .and_then(|pointer_pos| pointer_pos.checked_sub(output_cie_offset))
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return Ok(Err("FDE addition CIE pointer overflowed".to_owned()));
+        };
+
+        let mut data = candidate.fde_data.clone();
+        data[4..8].copy_from_slice(&cie_pointer.to_le_bytes());
+        let field_address = fde_address + crate::elf::FDE_PC_BEGIN_OFFSET as u64;
+        let Some(pc_begin) = i128::from(target_address)
+            .checked_sub(i128::from(field_address))
+            .and_then(|value| i32::try_from(value).ok())
+        else {
+            return Ok(Err("FDE addition pc-begin relocation overflowed".to_owned()));
+        };
+        let Some(pc_begin_range) = data.get_mut(candidate.pc_begin_range.clone()) else {
+            return Ok(Err(
+                "FDE addition pc-begin range is out of bounds".to_owned()
+            ));
+        };
+        pc_begin_range.copy_from_slice(&pc_begin.to_le_bytes());
+
+        let record = FdeRecord {
+            input_file: candidate.input_file.clone(),
+            input: candidate.input.clone(),
+            section_index: candidate.target_section_index,
+            eh_frame_section_index: candidate.eh_frame_section_index,
+            input_offset: candidate.input_offset,
+            output_offset,
+            size: data.len() as u64,
+        };
+        let eh_frame_hdr_change = if let Some(eh_frame_hdr_address) = eh_frame_hdr_address {
+            let Some(frame_ptr) = i128::from(target_address)
+                .checked_sub(i128::from(eh_frame_hdr_address))
+                .and_then(|value| i32::try_from(value).ok())
+            else {
+                return Ok(Err(
+                    "FDE addition .eh_frame_hdr frame pointer overflowed".to_owned()
+                ));
+            };
+            let Some(frame_info_ptr) = i128::from(fde_address)
+                .checked_sub(i128::from(eh_frame_hdr_address))
+                .and_then(|value| i32::try_from(value).ok())
+            else {
+                return Ok(Err(
+                    "FDE addition .eh_frame_hdr frame-info pointer overflowed".to_owned(),
+                ));
+            };
+            Some(EhFrameHdrChange::Add(EhFrameHdrEntryPatch {
+                frame_ptr,
+                frame_info_ptr,
+            }))
+        } else {
+            None
+        };
+
+        resolved.push(ResolvedFdeAdd {
+            patch: SectionPatch {
+                output_offset,
+                size: data.len() as u64,
+                data,
+                preserve_ranges: Vec::new(),
+                adjustments: Vec::new(),
+            },
+            record,
+            eh_frame_hdr_change,
+        });
+        let Some(next_output_offset) =
+            output_offset.checked_add(resolved.last().unwrap().patch.size)
+        else {
+            return Ok(Err("FDE addition output offset overflowed".to_owned()));
+        };
+        output_offset = next_output_offset;
+    }
+
+    let Some(required_end) = output_offset.checked_add(4) else {
+        return Ok(Err("FDE addition terminator offset overflowed".to_owned()));
+    };
+    if required_end > eh_frame_offset + eh_frame_size as u64 {
+        return Ok(Err("no free .eh_frame space for FDE addition".to_owned()));
+    }
+    if !eh_frame_bytes[terminator_offset_in_section..required_end as usize - eh_frame_start]
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Ok(Err("FDE addition .eh_frame space is not empty".to_owned()));
+    }
+
+    let mut combined_data = Vec::new();
+    for resolved in &resolved {
+        combined_data.extend(&resolved.patch.data);
+    }
+    combined_data.extend(0_u32.to_le_bytes());
+    if let Some(first) = resolved.first_mut() {
+        first.patch = SectionPatch {
+            output_offset: eh_frame_offset + terminator_offset_in_section as u64,
+            size: combined_data.len() as u64,
+            data: combined_data,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+    }
+    for extra in resolved.iter_mut().skip(1) {
+        extra.patch = SectionPatch {
+            output_offset: extra.record.output_offset,
+            size: 0,
+            data: Vec::new(),
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+    }
+
+    let mut previous = existing_fdes.iter().cloned().collect::<HashSet<_>>();
+    for resolved_fde in &resolved {
+        if !previous.insert(resolved_fde.record.clone()) {
+            return Ok(Err("duplicate incremental FDE addition record".to_owned()));
+        }
+    }
+    Ok(Ok(resolved))
+}
+
+fn eh_frame_terminator_offset(eh_frame: &[u8]) -> Option<usize> {
+    let mut offset = 0usize;
+    while offset + 4 <= eh_frame.len() {
+        let length = usize::try_from(read_u32_le(eh_frame.get(offset..offset + 4)?)?).ok()?;
+        if length == 0 {
+            return Some(offset);
+        }
+        offset = offset.checked_add(length.checked_add(4)?)?;
+    }
+    None
+}
+
+fn output_cie_offset_for_fde(output: &[u8], fde_output_offset: u64) -> Option<u64> {
+    let pointer_pos = usize::try_from(fde_output_offset.checked_add(4)?).ok()?;
+    let cie_pointer = u64::from(read_u32_le(output.get(pointer_pos..pointer_pos + 4)?)?);
+    fde_output_offset.checked_add(4)?.checked_sub(cie_pointer)
+}
+
+fn output_address_for_file_offset(file: &object::File<'_>, file_offset: u64) -> Option<u64> {
+    for section in file.sections() {
+        let Some((section_offset, section_size)) = section.file_range() else {
+            continue;
+        };
+        if file_offset >= section_offset
+            && file_offset < section_offset.saturating_add(section_size)
+        {
+            return Some(section.address() + (file_offset - section_offset));
+        }
+    }
+    None
 }
 
 fn fde_relocation_patches_for_input_bytes(
@@ -5132,6 +5798,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
 
     let mut changed_indices = Vec::new();
     let mut removed_indices = Vec::new();
+    let mut added_entries = Vec::new();
     for change in changes {
         match change {
             EhFrameHdrChange::Adjust(delta) => {
@@ -5171,6 +5838,9 @@ fn eh_frame_hdr_patches_for_fde_changes(
                 };
                 removed_indices.push(index);
             }
+            EhFrameHdrChange::Add(entry) => {
+                added_entries.push(entry.clone());
+            }
         }
     }
 
@@ -5187,6 +5857,50 @@ fn eh_frame_hdr_patches_for_fde_changes(
     changed_indices.dedup();
     removed_indices.sort_unstable();
     removed_indices.dedup();
+
+    if !added_entries.is_empty() {
+        for index in removed_indices.iter().rev() {
+            entries.remove(*index);
+        }
+        if entries.len() + added_entries.len() > entry_capacity {
+            return Ok(Err(
+                "no free .eh_frame_hdr entries for FDE addition".to_owned()
+            ));
+        }
+        entries.extend(added_entries);
+        entries.sort_by_key(|entry| entry.frame_ptr);
+        if !entries
+            .windows(2)
+            .all(|window| window[0].frame_ptr <= window[1].frame_ptr)
+        {
+            return Ok(Err(
+                "changed .eh_frame_hdr entries would no longer be sorted".to_owned(),
+            ));
+        }
+        let entry_count = u32::try_from(entries.len())
+            .map_err(|_| "changed .eh_frame_hdr entry count overflowed".to_owned())?;
+        let mut patches = vec![SectionPatch {
+            output_offset: (eh_frame_hdr_start + 8) as u64,
+            size: 4,
+            data: entry_count.to_le_bytes().to_vec(),
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        }];
+        let mut data = Vec::with_capacity(entries.len() * entry_size);
+        for entry in &entries {
+            data.extend(entry.frame_ptr.to_le_bytes());
+            data.extend(entry.frame_info_ptr.to_le_bytes());
+        }
+        data.resize(entry_capacity * entry_size, 0);
+        patches.push(SectionPatch {
+            output_offset: (eh_frame_hdr_start + header_size) as u64,
+            size: data.len() as u64,
+            data,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        return Ok(Ok(patches));
+    }
 
     if removed_indices.is_empty() {
         return Ok(Ok(changed_indices
@@ -5289,6 +6003,7 @@ fn eh_frame_hdr_index_for_fde(
     Ok(index)
 }
 
+#[derive(Clone)]
 struct EhFrameHdrEntryPatch {
     frame_ptr: i32,
     frame_info_ptr: i32,
@@ -5412,6 +6127,15 @@ fn fde_bytes_match_ignoring_cie_pointer(current: &[u8], previous: &[u8]) -> bool
     current.len() == previous.len()
         && current.get(..4) == previous.get(..4)
         && current.get(8..) == previous.get(8..)
+}
+
+fn fde_cie_input_offset(fde_data: &[u8], fde_input_offset: u64) -> Option<u64> {
+    let cie_id = read_u32_le(fde_data.get(4..8)?)?;
+    (cie_id != 0).then_some(
+        fde_input_offset
+            .checked_add(4)?
+            .checked_sub(u64::from(cie_id))?,
+    )
 }
 
 fn fde_contains_relocation(record: &FdeRecord, relocation_offset: u64) -> bool {
@@ -8986,6 +9710,150 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_hdr_patch_adds_fde_entry() {
+        let output = eh_frame_hdr_output_elf_with_capacity(&[(-48, 0x50), (8, 0x70)], 3);
+        let patches = eh_frame_hdr_patches_for_fde_changes(
+            &output,
+            &[EhFrameHdrChange::Add(EhFrameHdrEntryPatch {
+                frame_ptr: -16,
+                frame_info_ptr: -32,
+            })],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0].output_offset, 0x88);
+        assert_eq!(patches[0].size, 4);
+        assert_eq!(patches[0].data, 3_u32.to_le_bytes());
+        assert_eq!(
+            patches[1].output_offset,
+            (0x80 + std::mem::size_of::<crate::elf::EhFrameHdr>()) as u64
+        );
+        assert_eq!(patches[1].size, 24);
+        assert_eq!(
+            patches[1].data,
+            [
+                (-48_i32).to_le_bytes().as_slice(),
+                (-48_i32).to_le_bytes().as_slice(),
+                (-16_i32).to_le_bytes().as_slice(),
+                (-32_i32).to_le_bytes().as_slice(),
+                8_i32.to_le_bytes().as_slice(),
+                (-16_i32).to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn eh_frame_hdr_patch_rejects_added_fde_without_capacity() {
+        let output = eh_frame_hdr_output_elf(&[(-48, 0x50), (8, 0x70)]);
+        let result = eh_frame_hdr_patches_for_fde_changes(
+            &output,
+            &[EhFrameHdrChange::Add(EhFrameHdrEntryPatch {
+                frame_ptr: -16,
+                frame_info_ptr: -32,
+            })],
+        )
+        .unwrap();
+        let Err(error) = result else {
+            panic!("expected .eh_frame_hdr addition to be rejected");
+        };
+
+        assert!(error.contains("no free .eh_frame_hdr entries"));
+    }
+
+    #[test]
+    fn fde_add_patch_uses_free_eh_frame_tail() {
+        let mut output = eh_frame_hdr_output_elf_with_capacity(&[(-48, 0x48)], 2);
+        output[0x40..0x48].copy_from_slice(&[
+            4, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE id
+        ]);
+        output[0x48..0x58].copy_from_slice(&[
+            12, 0, 0, 0, // FDE length
+            12, 0, 0, 0, // output CIE pointer
+            0, 0, 0, 0, // relocated pc begin
+            4, 0, 0, 0, // pc range
+        ]);
+
+        let previous = vec![fde_record("input.o", 1, 2, 0, 0x48, 16)];
+        let candidate = FdeAddCandidate {
+            input_ranges: vec![0..16],
+            input_file: "input.o".to_owned(),
+            input: "input.o".to_owned(),
+            target_section_index: 1,
+            eh_frame_section_index: 2,
+            input_offset: 16,
+            target_section_offset: 0,
+            target_output_offset: 0x40,
+            fde_data: vec![12, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0],
+            pc_begin_range: 8..12,
+            cie_input_offset: 0,
+            cie_reference_fde_output_offset: 0x48,
+        };
+
+        let resolved = fde_add_patches_for_output(&output, &[candidate], &previous)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].record.output_offset, 0x58);
+        assert_eq!(resolved[0].record.size, 16);
+        assert_eq!(resolved[0].patch.output_offset, 0x58);
+        assert_eq!(resolved[0].patch.size, 20);
+        assert_eq!(&resolved[0].patch.data[4..8], &28_u32.to_le_bytes());
+        assert_eq!(&resolved[0].patch.data[8..12], &(-32_i32).to_le_bytes());
+        assert_eq!(&resolved[0].patch.data[16..20], &0_u32.to_le_bytes());
+        assert!(matches!(
+            resolved[0].eh_frame_hdr_change,
+            Some(EhFrameHdrChange::Add(EhFrameHdrEntryPatch {
+                frame_ptr: -64,
+                frame_info_ptr: -40,
+            }))
+        ));
+    }
+
+    #[test]
+    fn fde_add_patch_rejects_without_free_eh_frame_tail() {
+        let mut output = eh_frame_hdr_output_elf_with_capacity(&[(-48, 0x48)], 2);
+        output[0x40..0x48].copy_from_slice(&[
+            4, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE id
+        ]);
+        output[0x48..0x58].copy_from_slice(&[
+            12, 0, 0, 0, // FDE length
+            12, 0, 0, 0, // output CIE pointer
+            0, 0, 0, 0, // relocated pc begin
+            4, 0, 0, 0, // pc range
+        ]);
+        output[0x160..0x168].copy_from_slice(&0x1c_u64.to_le_bytes());
+
+        let previous = vec![fde_record("input.o", 1, 2, 0, 0x48, 16)];
+        let candidate = FdeAddCandidate {
+            input_ranges: vec![0..16],
+            input_file: "input.o".to_owned(),
+            input: "input.o".to_owned(),
+            target_section_index: 1,
+            eh_frame_section_index: 2,
+            input_offset: 16,
+            target_section_offset: 0,
+            target_output_offset: 0x40,
+            fde_data: vec![12, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0],
+            pc_begin_range: 8..12,
+            cie_input_offset: 0,
+            cie_reference_fde_output_offset: 0x48,
+        };
+
+        let result = fde_add_patches_for_output(&output, &[candidate], &previous).unwrap();
+        let Err(error) = result else {
+            panic!("expected .eh_frame addition to be rejected");
+        };
+
+        assert!(error.contains("no free .eh_frame space"));
+    }
+
+    #[test]
     fn resolve_current_patch_sections_updates_section_size_after_growth() {
         let mut bytes = growable_data_elf();
         bytes[0x44] = 5;
@@ -9119,6 +9987,14 @@ mod tests {
     }
 
     fn eh_frame_hdr_output_elf(entries: &[(i32, u64)]) -> Vec<u8> {
+        eh_frame_hdr_output_elf_with_capacity(entries, entries.len())
+    }
+
+    fn eh_frame_hdr_output_elf_with_capacity(
+        entries: &[(i32, u64)],
+        entry_capacity: usize,
+    ) -> Vec<u8> {
+        assert!(entry_capacity >= entries.len());
         let mut bytes = vec![0; 0x220];
         let shstrtab = b"\0.eh_frame\0.eh_frame_hdr\0.shstrtab\0";
         let shstrtab_offset = 0xd0;
@@ -9127,7 +10003,7 @@ mod tests {
         let eh_frame_address = 0x400040_u64;
         let eh_frame_hdr_offset = 0x80_u64;
         let eh_frame_hdr_address = 0x400080_u64;
-        let eh_frame_hdr_size = std::mem::size_of::<crate::elf::EhFrameHdr>() + entries.len() * 8;
+        let eh_frame_hdr_size = std::mem::size_of::<crate::elf::EhFrameHdr>() + entry_capacity * 8;
         bytes[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
 
         bytes[0..4].copy_from_slice(b"\x7fELF");

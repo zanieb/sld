@@ -472,6 +472,7 @@ impl platform::Platform for Elf {
         GroupLayoutExt {
             eh_frame_start_address: *memory_offsets.get(part_id::EH_FRAME),
             rela_dyn_general_padding: common.format_specific.rela_dyn_general_padding,
+            exception_frame_count: common.format_specific.exception_frame_count,
         }
     }
 
@@ -1088,6 +1089,8 @@ impl platform::Platform for Elf {
             gnu_hash_layout,
             verdefs: Default::default(),
             build_id_size,
+            eh_frame_padding: 0,
+            eh_frame_hdr_padding: 0,
         }
     }
 
@@ -1235,6 +1238,8 @@ impl platform::Platform for Elf {
         dynsym_start_index: u32,
         dynamic_symbol_defs: &[DynamicSymbolDefinition<Self>],
     ) -> Result {
+        memory_offsets.increment(part_id::EH_FRAME, epilogue_state.eh_frame_padding);
+
         memory_offsets.increment(
             part_id::DYNSYM,
             dynamic_symbol_defs.len() as u64 * elf::SYMTAB_ENTRY_SIZE,
@@ -1291,6 +1296,25 @@ impl platform::Platform for Elf {
     ) -> Result {
         if args.hash_style.includes_sysv() {
             allocate_sysv_hash(state, current_sizes, extra_sizes, dynamic_symbol_defs)?;
+        }
+        let eh_frame_padding = incremental_eh_frame_padding(
+            *current_sizes.get(part_id::EH_FRAME),
+            args.common().incremental,
+            args.common().incremental_padding_percent,
+        );
+        if eh_frame_padding > 0 {
+            state.eh_frame_padding += eh_frame_padding;
+            extra_sizes.increment(part_id::EH_FRAME, eh_frame_padding);
+        }
+        let eh_frame_hdr_padding = incremental_eh_frame_hdr_padding(
+            *current_sizes.get(part_id::EH_FRAME_HDR),
+            args.common().incremental,
+            args.common().incremental_padding_percent,
+            args.should_write_eh_frame_hdr,
+        );
+        if eh_frame_hdr_padding > 0 {
+            state.eh_frame_hdr_padding += eh_frame_hdr_padding;
+            extra_sizes.increment(part_id::EH_FRAME_HDR, eh_frame_hdr_padding);
         }
         Ok(())
     }
@@ -3997,6 +4021,8 @@ pub(crate) struct EpilogueLayoutExt {
     pub(crate) sysv_hash_layout: Option<SysvHashLayout>,
     pub(crate) gnu_hash_layout: Option<GnuHashLayout>,
     pub(crate) verdefs: Option<Vec<VersionDef>>,
+    pub(crate) eh_frame_padding: u64,
+    pub(crate) eh_frame_hdr_padding: u64,
     build_id_size: Option<usize>,
 }
 
@@ -4178,6 +4204,7 @@ impl<'data> ExceptionFrames<'data> {
 pub(crate) struct GroupLayoutExt {
     pub(crate) eh_frame_start_address: u64,
     pub(crate) rela_dyn_general_padding: u64,
+    pub(crate) exception_frame_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -4206,6 +4233,46 @@ fn incremental_rela_dyn_general_padding(
     bytes
         .div_ceil(crate::elf::RELA_ENTRY_SIZE)
         .saturating_mul(crate::elf::RELA_ENTRY_SIZE)
+}
+
+fn incremental_eh_frame_padding(
+    current_size: u64,
+    incremental: bool,
+    incremental_padding_percent: u32,
+) -> u64 {
+    incremental_section_padding(current_size, incremental, incremental_padding_percent, 4)
+}
+
+fn incremental_eh_frame_hdr_padding(
+    current_size: u64,
+    incremental: bool,
+    incremental_padding_percent: u32,
+    should_write_eh_frame_hdr: bool,
+) -> u64 {
+    if !should_write_eh_frame_hdr || current_size <= size_of::<EhFrameHdr>() as u64 {
+        return 0;
+    }
+    incremental_section_padding(
+        current_size - size_of::<EhFrameHdr>() as u64,
+        incremental,
+        incremental_padding_percent,
+        size_of::<EhFrameHdrEntry>() as u64,
+    )
+}
+
+fn incremental_section_padding(
+    current_size: u64,
+    incremental: bool,
+    incremental_padding_percent: u32,
+    alignment: u64,
+) -> u64 {
+    if !incremental || incremental_padding_percent == 0 || current_size == 0 {
+        return 0;
+    }
+
+    let bytes = (u128::from(current_size) * u128::from(incremental_padding_percent)).div_ceil(100);
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    bytes.max(1).div_ceil(alignment).saturating_mul(alignment)
 }
 
 /// Return whether all DT_NEEDED entries for this shared object correspond to input files that
