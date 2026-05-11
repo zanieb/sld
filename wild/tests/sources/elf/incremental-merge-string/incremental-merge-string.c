@@ -4,12 +4,13 @@
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing patch metadata
+//#TestIncrementalChangedCompareFull:false
+//#TestIncrementalChangedSymbolBytes:incremental_merge_string_value=0x6365666f726500
 //#TestIncrementalChangedInput:incremental-merge-string-value.s.o
 //#TestIncrementalChangedSection:.rodata.str1.1
 //#Config:no-string-merge:incremental-merge-string
 //#WildExtraLinkArgs:--no-string-merge
+//#TestIncrementalChangedCompareFull:true
 //#TestIncrementalChangedExpectPatch:true
 
 extern const char incremental_merge_string_value[];

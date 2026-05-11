@@ -3721,7 +3721,7 @@ fn write_prelude<'data, A: Arch<Platform = Elf>>(
         write_eh_frame_hdr(table_writer, layout)?;
     }
 
-    write_merged_strings(prelude, buffers, layout);
+    write_merged_strings(prelude, buffers, layout, incremental);
     record_generated_dynamic_relocation_sections(incremental, layout);
 
     write_interp(prelude, buffers);
@@ -3774,10 +3774,24 @@ fn write_merged_strings(
     prelude: &PreludeLayout<Elf>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &ElfLayout,
+    incremental: &PreparedState,
 ) {
     layout.merged_strings.for_each(|section_id, merged| {
         if merged.len() > 0 {
-            let buffer = buffers.get_mut(section_id.part_id_with_alignment(crate::alignment::MIN));
+            let part_id = section_id.part_id_with_alignment(crate::alignment::MIN);
+            let section_file_offset = layout.section_part_layouts.get(part_id).file_offset as u64;
+            for record in &merged.patch_records {
+                incremental.try_reuse_section(
+                    record.input,
+                    record.section_index,
+                    section_file_offset + record.output_offset,
+                    record.size,
+                    true,
+                    false,
+                );
+            }
+
+            let buffer = buffers.get_mut(part_id);
 
             write_merged_strings_to_buffer(merged, buffer);
         }

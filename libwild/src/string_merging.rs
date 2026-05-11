@@ -32,6 +32,7 @@ use crate::error::Context as _;
 use crate::error::Result;
 use crate::hash::PassThroughHashMap;
 use crate::hash::PreHashed;
+use crate::input_data::InputRef;
 use crate::input_section_id::SectionIdRange;
 use crate::output_section_id::OutputSections;
 use crate::output_section_map::OutputSectionMap;
@@ -134,6 +135,8 @@ impl std::ops::Sub<LinearInputOffset> for LinearInputOffset {
 
 #[derive(Clone, Copy)]
 struct StringMergeInputSection<'data> {
+    input: InputRef<'data>,
+    section_index: object::SectionIndex,
     section_data: &'data [u8],
 
     /// The sum of the sizes of the input sections prior to this one with the same `part_id`.
@@ -169,6 +172,18 @@ pub(crate) struct MergedStringsSection<'data> {
 
     /// Offsets of strings that didn't fit in `string_offsets`.
     overflowed_string_offsets: HashMap<LinearInputOffset, BucketOffset>,
+
+    /// Input merge sections that are safe to treat as a contiguous direct patch range.
+    #[debug(skip)]
+    pub(crate) patch_records: Vec<MergeStringPatchRecord<'data>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MergeStringPatchRecord<'data> {
+    pub(crate) input: InputRef<'data>,
+    pub(crate) section_index: object::SectionIndex,
+    pub(crate) output_offset: u64,
+    pub(crate) size: u64,
 }
 
 impl Default for MergedStringsSection<'_> {
@@ -178,6 +193,7 @@ impl Default for MergedStringsSection<'_> {
             bucket_offsets: [0; MERGE_STRING_BUCKETS],
             string_offsets: Default::default(),
             overflowed_string_offsets: HashMap::new(),
+            patch_records: Vec::new(),
         }
     }
 }
@@ -323,6 +339,8 @@ fn group_merge_string_sections_by_output<'data, P: Platform>(
                 input_sections
                     .get_mut(section_id)
                     .push(StringMergeInputSection {
+                        input: obj.common.input,
+                        section_index: extra.index,
                         section_data: extra.section_data,
                         start_input_offset: *starting_offset,
                         is_string: extra.is_strings,
@@ -432,57 +450,64 @@ impl<'data> MergedStringsSection<'data> {
         reuse_pool: &ReusePool,
         args: &impl platform::Args,
     ) -> Result {
-        let mut resources =
-            create_split_resources(&mut self.string_offsets, input_sections, reuse_pool, args);
-
-        rayon::in_place_scope(|s| {
-            // Spawn some number of tasks to process input section groups. As these tasks complete,
-            // they'll spawn bucket processing tasks to take those inputs. As the bucket processing
-            // tasks complete, they will, as capacity permits, spawn additional input processing
-            // tasks. This continues until the last inputs and the last buckets have been processed.
-            try_spawn_input_processing(&resources, s);
-        });
-
-        // Check if we got any errors. We only look at the first error.
-        if let Some(error) = resources.errors.pop() {
-            return Err(error);
-        }
-
         {
-            verbose_timing_phase!("Handle overflows");
+            let mut resources =
+                create_split_resources(&mut self.string_offsets, input_sections, reuse_pool, args);
 
-            // Handle any offsets that didn't fit in their respective blocks in the offset map.
-            let overflow = core::mem::take(&mut resources.overflowed_offsets);
-            overflow
+            rayon::in_place_scope(|s| {
+                // Spawn some number of tasks to process input section groups. As these tasks complete,
+                // they'll spawn bucket processing tasks to take those inputs. As the bucket processing
+                // tasks complete, they will, as capacity permits, spawn additional input processing
+                // tasks. This continues until the last inputs and the last buckets have been processed.
+                try_spawn_input_processing(&resources, s);
+            });
+
+            // Check if we got any errors. We only look at the first error.
+            if let Some(error) = resources.errors.pop() {
+                return Err(error);
+            }
+
+            {
+                verbose_timing_phase!("Handle overflows");
+
+                // Handle any offsets that didn't fit in their respective blocks in the offset map.
+                let overflow = core::mem::take(&mut resources.overflowed_offsets);
+                overflow
+                    .into_iter()
+                    .flat_map(|cell| cell.into_inner())
+                    .for_each(|o| {
+                        self.overflowed_string_offsets.insert(o.input, o.output);
+                    });
+            }
+
+            verbose_timing_phase!("Finalise merged section");
+
+            // Move our buckets out of `resources` and convert it to a regular Vec.
+            let mut buckets = resources
+                .finished_buckets
                 .into_iter()
-                .flat_map(|cell| cell.into_inner())
-                .for_each(|o| {
-                    self.overflowed_string_offsets.insert(o.input, o.output);
-                });
+                .map(|b| *b)
+                .collect_vec();
+            buckets.sort_by_key(|b| b.index);
+            self.buckets = buckets;
+
+            // Compute the starting offset of each bucket.
+            for i in 1..MERGE_STRING_BUCKETS {
+                self.bucket_offsets[i] =
+                    self.bucket_offsets[i - 1] + u64::from(self.buckets[i - 1].next_offset);
+            }
+
+            resources.finished_shards.into_iter().for_each(|shard| {
+                resources
+                    .offset_writer
+                    .return_shard(shard.into_inner().unwrap());
+            });
         }
 
-        verbose_timing_phase!("Finalise merged section");
-
-        // Move our buckets out of `resources` and convert it to a regular Vec.
-        let mut buckets = resources
-            .finished_buckets
-            .into_iter()
-            .map(|b| *b)
-            .collect_vec();
-        buckets.sort_by_key(|b| b.index);
-        self.buckets = buckets;
-
-        // Compute the starting offset of each bucket.
-        for i in 1..MERGE_STRING_BUCKETS {
-            self.bucket_offsets[i] =
-                self.bucket_offsets[i - 1] + u64::from(self.buckets[i - 1].next_offset);
-        }
-
-        resources.finished_shards.into_iter().for_each(|shard| {
-            resources
-                .offset_writer
-                .return_shard(shard.into_inner().unwrap());
-        });
+        self.patch_records = input_sections
+            .iter()
+            .filter_map(|section| self.patch_record_for_input_section(section).transpose())
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(())
     }
@@ -507,6 +532,80 @@ impl<'data> MergedStringsSection<'data> {
 
     pub(crate) fn string_count(&self) -> usize {
         self.buckets.iter().map(|b| b.strings.len()).sum()
+    }
+
+    fn patch_record_for_input_section(
+        &self,
+        input_section: &StringMergeInputSection<'data>,
+    ) -> Result<Option<MergeStringPatchRecord<'data>>> {
+        if input_section.section_data.is_empty() {
+            return Ok(None);
+        }
+
+        let mut input_offset = input_section.start_input_offset;
+        let mut remaining = input_section.section_data;
+        let mut first_output_offset = None;
+        let mut next_output_offset = 0;
+
+        loop {
+            let string = if input_section.is_string {
+                if remaining.is_empty() {
+                    break;
+                }
+                MergeString::take_string_hashed(&mut remaining)?
+            } else {
+                if remaining.is_empty() {
+                    break;
+                }
+                MergeString::take_hashed(&mut remaining)
+            };
+            let Some(output_offset) = self.output_offset_if_owned(input_offset, string.bytes)?
+            else {
+                return Ok(None);
+            };
+
+            match first_output_offset {
+                Some(_) if output_offset != next_output_offset => return Ok(None),
+                Some(_) => {}
+                None => first_output_offset = Some(output_offset),
+            }
+            next_output_offset = output_offset + string.bytes.len() as u64;
+            input_offset = input_offset + string.bytes.len() as u64;
+        }
+
+        let Some(output_offset) = first_output_offset else {
+            return Ok(None);
+        };
+        Ok(Some(MergeStringPatchRecord {
+            input: input_section.input,
+            section_index: input_section.section_index,
+            output_offset,
+            size: input_section.section_data.len() as u64,
+        }))
+    }
+
+    fn output_offset_if_owned(
+        &self,
+        input_offset: LinearInputOffset,
+        string: &[u8],
+    ) -> Result<Option<u64>> {
+        let Some(bucket_offset) = self.string_offset_at_input(input_offset) else {
+            return Ok(None);
+        };
+        let bucket = &self.buckets[bucket_offset.bucket()];
+        let offset_in_bucket = bucket_offset.offset_in_bucket();
+        if !bucket.owns_string_at(offset_in_bucket, string) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.bucket_offsets[bucket_offset.bucket()] + offset_in_bucket,
+        ))
+    }
+
+    fn string_offset_at_input(&self, input_offset: LinearInputOffset) -> Option<BucketOffset> {
+        self.string_offsets
+            .get(input_offset.0)
+            .or_else(|| self.overflowed_string_offsets.get(&input_offset).copied())
     }
 }
 
@@ -921,6 +1020,21 @@ impl BucketOffset {
 }
 
 impl<'data> MergeStringsSectionBucket<'data> {
+    fn owns_string_at(&self, offset: u64, string: &[u8]) -> bool {
+        let mut current_offset = 0;
+        for candidate in &self.strings {
+            if current_offset == offset {
+                return candidate.len() == string.len()
+                    && std::ptr::eq(candidate.as_ptr(), string.as_ptr());
+            }
+            if current_offset > offset {
+                return false;
+            }
+            current_offset += candidate.len() as u64;
+        }
+        false
+    }
+
     fn process_split_output(
         &mut self,
         strings_to_merge: &mut [StringToMerge<'data, '_>],
@@ -1058,15 +1172,7 @@ fn find_string(
     strings_section: &MergedStringsSection<'_>,
 ) -> Result<BucketOffset> {
     let linear_input_offset = merge_slot.start_input_offset + input_offset;
-    let string_offset = strings_section
-        .string_offsets
-        .get(linear_input_offset.0)
-        .or_else(|| {
-            strings_section
-                .overflowed_string_offsets
-                .get(&linear_input_offset)
-                .copied()
-        });
+    let string_offset = strings_section.string_offset_at_input(linear_input_offset);
 
     if let Some(string_offset) = string_offset {
         return Ok(string_offset);
@@ -1077,15 +1183,7 @@ fn find_string(
     // to be very rare, we don't bother for now.
     for i in 1..=input_offset {
         let linear_input_offset = merge_slot.start_input_offset + (input_offset - i);
-        let string_offset = strings_section
-            .string_offsets
-            .get(linear_input_offset.0)
-            .or_else(|| {
-                strings_section
-                    .overflowed_string_offsets
-                    .get(&linear_input_offset)
-                    .copied()
-            });
+        let string_offset = strings_section.string_offset_at_input(linear_input_offset);
 
         if let Some(string_offset) = string_offset {
             return Ok(BucketOffset(string_offset.0 + i as u32));
