@@ -972,6 +972,17 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
 
     parser
         .declare_with_param()
+        .long("incremental-padding-percent")
+        .help("Add this percentage of extra capacity after patchable input sections")
+        .execute(|args, _modifier_stack, value| {
+            args.common_mut().incremental_padding_percent = value
+                .parse()
+                .with_context(|| format!("Invalid --incremental-padding-percent `{value}`"))?;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("entry")
         .short("e")
         .help("Set the entry point")

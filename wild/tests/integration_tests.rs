@@ -154,6 +154,10 @@
 //! testing runs wild twice with incremental linking enabled and verifies that the second run reuses
 //! the existing output.
 //!
+//! TestIncrementalCompareFull:{bool} Whether the first incremental output should be byte-compared
+//! to a normal full link. Defaults to true. Disable this when the initial incremental link
+//! intentionally reserves capacity and should preserve that layout for later updates.
+//!
 //! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
 //! then checking that the changed-input incremental link matches a full relink.
 //!
@@ -174,6 +178,17 @@
 //!
 //! TestIncrementalChangedGrowSection:{bytes} Whether the changed-input test should grow the
 //! selected ELF section by the supplied number of bytes instead of mutating an existing byte.
+//!
+//! TestIncrementalChangedCompareFull:{bool} Whether the changed-input incremental output should be
+//! byte-compared to a fresh full relink. Defaults to true. Disable this when the initial
+//! incremental link intentionally reserves capacity and the changed incremental output should
+//! preserve that older layout.
+//!
+//! TestIncrementalChangedSectionPrefix:{section_name}=0x{hex_bytes} Checks that the changed-input
+//! incremental output section starts with the specified bytes.
+//!
+//! TestIncrementalChangedSymbolBytes:{symbol_name}=0x{hex_bytes} Checks that bytes at the changed
+//! incremental output symbol address match the specified bytes.
 //!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
@@ -775,6 +790,7 @@ struct Config {
     requires_linker_plugin: bool,
     test_update_in_place: bool,
     test_incremental: bool,
+    test_incremental_compare_full: bool,
     test_incremental_changed: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
@@ -782,6 +798,9 @@ struct Config {
     test_incremental_changed_input: Option<String>,
     test_incremental_changed_section: String,
     test_incremental_changed_grow_section: Option<u64>,
+    test_incremental_changed_compare_full: bool,
+    test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
+    test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1213,6 +1232,12 @@ struct ExpectedSectionBytes {
     expected_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedSymbolBytes {
+    symbol_name: String,
+    expected_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct OutputFileMatch {
     filename: String,
@@ -1351,6 +1376,7 @@ impl Config {
             requires_rust_musl: false,
             test_update_in_place: false,
             test_incremental: false,
+            test_incremental_compare_full: true,
             test_incremental_changed: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
@@ -1358,6 +1384,9 @@ impl Config {
             test_incremental_changed_input: None,
             test_incremental_changed_section: ".data".to_owned(),
             test_incremental_changed_grow_section: None,
+            test_incremental_changed_compare_full: true,
+            test_incremental_changed_section_prefix: None,
+            test_incremental_changed_symbol_bytes: None,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -1381,6 +1410,24 @@ fn parse_single_config(src_path: &Path, default_config: &Config) -> Result<Confi
     }
 
     Ok(config)
+}
+
+fn parse_section_bytes_directive(directive: &str, arg: &str) -> Result<(String, Vec<u8>)> {
+    parse_named_bytes_directive(directive, arg)
+}
+
+fn parse_named_bytes_directive(directive: &str, arg: &str) -> Result<(String, Vec<u8>)> {
+    let (name, hex_str) = arg
+        .split_once('=')
+        .with_context(|| format!("{directive} requires name=0xhex_bytes, got `{arg}`"))?;
+    let hex_str = hex_str
+        .trim()
+        .strip_prefix("0x")
+        .with_context(|| format!("{directive} value must start with 0x, got `{hex_str}`"))?;
+    let expected_bytes =
+        hex::decode(hex_str).with_context(|| format!("Invalid hex in {directive}: {hex_str}"))?;
+
+    Ok((name.to_owned(), expected_bytes))
 }
 
 fn parse_configs(src_filename: &Path, default_config: &Config) -> Result<Vec<Config>> {
@@ -1536,20 +1583,13 @@ fn process_directive(
             .contains_strings
             .push(arg.trim().to_owned()),
         "ExpectSectionBytes" => {
-            let (section_name, hex_str) = arg.trim().split_once('=').with_context(|| {
-                format!("ExpectSectionBytes requires section_name=0xhex_bytes, got `{arg}`")
-            })?;
-            let hex_str = hex_str.trim().strip_prefix("0x").with_context(|| {
-                format!("ExpectSectionBytes value must start with 0x, got `{hex_str}`")
-            })?;
-            let expected_bytes = hex::decode(hex_str)
-                .with_context(|| format!("Invalid hex in ExpectSectionBytes: {hex_str}"))?;
-
+            let (section_name, expected_bytes) =
+                parse_section_bytes_directive("ExpectSectionBytes", arg.trim())?;
             config
                 .assertions
                 .expected_section_bytes
                 .push(ExpectedSectionBytes {
-                    section_name: section_name.to_owned(),
+                    section_name,
                     expected_bytes,
                 });
         }
@@ -1729,6 +1769,9 @@ fn process_directive(
         "TestIncremental" => {
             config.test_incremental = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalCompareFull" => {
+            config.test_incremental_compare_full = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
         }
@@ -1752,6 +1795,25 @@ fn process_directive(
                 arg.parse()
                     .context("Invalid TestIncrementalChangedGrowSection")?,
             );
+        }
+        "TestIncrementalChangedCompareFull" => {
+            config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedSectionPrefix" => {
+            let (section_name, expected_bytes) =
+                parse_section_bytes_directive("TestIncrementalChangedSectionPrefix", arg.trim())?;
+            config.test_incremental_changed_section_prefix = Some(ExpectedSectionBytes {
+                section_name,
+                expected_bytes,
+            });
+        }
+        "TestIncrementalChangedSymbolBytes" => {
+            let (symbol_name, expected_bytes) =
+                parse_named_bytes_directive("TestIncrementalChangedSymbolBytes", arg.trim())?;
+            config.test_incremental_changed_symbol_bytes = Some(ExpectedSymbolBytes {
+                symbol_name,
+                expected_bytes,
+            });
         }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
@@ -1998,7 +2060,7 @@ impl ProgramInputs {
             )
         })?;
 
-        if original_content != baseline_content {
+        if config.test_incremental_compare_full && original_content != baseline_content {
             let diffs = sections_with_diffs(&original_content, &baseline_content)?;
             bail!(
                 "Incremental test failed for {}: first incremental output differs from a full \
@@ -2148,21 +2210,52 @@ impl ProgramInputs {
                 );
             }
 
-            let link_output_4 = Linker::Wild.link(self.name(), inputs, config, cross_arch)?;
-            let full_content = std::fs::read(&link_output_4.binary).with_context(|| {
-                format!(
-                    "Failed to read full relink output: {}",
-                    link_output_4.binary.display()
+            if let Some(expected) = &config.test_incremental_changed_section_prefix {
+                assert_output_section_prefix(
+                    &changed_content,
+                    &expected.section_name,
+                    &expected.expected_bytes,
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "Incremental test failed for {}: changed-input output section prefix \
+                        assertion failed",
+                        self.name()
+                    )
+                })?;
+            }
+            if let Some(expected) = &config.test_incremental_changed_symbol_bytes {
+                assert_output_symbol_bytes(
+                    &changed_content,
+                    &expected.symbol_name,
+                    &expected.expected_bytes,
+                )
+                .with_context(|| {
+                    format!(
+                        "Incremental test failed for {}: changed-input output symbol bytes \
+                        assertion failed",
+                        self.name()
+                    )
+                })?;
+            }
 
-            if changed_content != full_content {
-                let diffs = sections_with_diffs(&changed_content, &full_content)?;
-                bail!(
-                    "Incremental test failed for {}: changed-input incremental output differs \
-                    from a full relink of the same mutated inputs. Diffs:\n{diffs:#?}",
-                    self.name()
-                );
+            if config.test_incremental_changed_compare_full {
+                let link_output_4 = Linker::Wild.link(self.name(), inputs, config, cross_arch)?;
+                let full_content = std::fs::read(&link_output_4.binary).with_context(|| {
+                    format!(
+                        "Failed to read full relink output: {}",
+                        link_output_4.binary.display()
+                    )
+                })?;
+
+                if changed_content != full_content {
+                    let diffs = sections_with_diffs(&changed_content, &full_content)?;
+                    bail!(
+                        "Incremental test failed for {}: changed-input incremental output differs \
+                        from a full relink of the same mutated inputs. Diffs:\n{diffs:#?}",
+                        self.name()
+                    );
+                }
             }
 
             let log = std::fs::read_to_string(&log_path).with_context(|| {
@@ -2578,6 +2671,70 @@ fn sections_with_diffs(bytes_a: &[u8], bytes_b: &[u8]) -> Result<Vec<SectionDiff
     sections.sort_by_key(|s| s.section_start);
 
     Ok(sections)
+}
+
+fn assert_output_section_prefix(
+    output: &[u8],
+    section_name: &str,
+    expected_prefix: &[u8],
+) -> Result {
+    let file = object::File::parse(output).context("Failed to parse changed incremental output")?;
+    let section = file
+        .section_by_name(section_name)
+        .with_context(|| format!("Missing {section_name} section in changed incremental output"))?;
+    let actual = section
+        .data()
+        .with_context(|| format!("Failed to read {section_name} section data"))?;
+    ensure!(
+        actual.starts_with(expected_prefix),
+        "{section_name} starts with 0x{}, expected prefix 0x{}",
+        hex::encode(&actual[..actual.len().min(expected_prefix.len())]),
+        hex::encode(expected_prefix),
+    );
+    Ok(())
+}
+
+fn assert_output_symbol_bytes(output: &[u8], symbol_name: &str, expected_bytes: &[u8]) -> Result {
+    let file = object::File::parse(output).context("Failed to parse changed incremental output")?;
+    for symbol in file.symbols() {
+        if symbol.name().ok() != Some(symbol_name) {
+            continue;
+        }
+        let object::SymbolSection::Section(section_index) = symbol.section() else {
+            bail!("{symbol_name} is not defined in an output section");
+        };
+        let section = file
+            .section_by_index(section_index)
+            .with_context(|| format!("Failed to find section for {symbol_name}"))?;
+        let section_data = section
+            .data()
+            .with_context(|| format!("Failed to read section data for {symbol_name}"))?;
+        let offset = symbol
+            .address()
+            .checked_sub(section.address())
+            .with_context(|| {
+                format!("{symbol_name} address is before its containing section address")
+            })?;
+        let offset = usize::try_from(offset)
+            .with_context(|| format!("{symbol_name} section offset is too large"))?;
+        let end = offset
+            .checked_add(expected_bytes.len())
+            .with_context(|| format!("{symbol_name} expected byte range overflowed"))?;
+        let actual_bytes = section_data.get(offset..end).with_context(|| {
+            format!(
+                "{symbol_name} byte range {offset}..{end} is outside section {}",
+                section.name().unwrap_or("<invalid>")
+            )
+        })?;
+        ensure!(
+            actual_bytes == expected_bytes,
+            "{symbol_name} bytes are 0x{}, expected 0x{}",
+            hex::encode(actual_bytes),
+            hex::encode(expected_bytes),
+        );
+        return Ok(());
+    }
+    bail!("Missing {symbol_name} symbol in changed incremental output");
 }
 
 struct SectionDiff {

@@ -74,9 +74,10 @@ save-dir. A string entry appends one zero byte to the listed file before every t
 entry with `path` and `section` flips the first byte of that ELF section instead, which is useful
 when the benchmark should prove that changed inputs also change the linked output. A table entry
 with `grow` increases the ELF section size by that many bytes, provided there is padding before the
-next object structure. The warmup run is not mutated, so it seeds the initial incremental state;
-each timed run then measures a real changed-input relink. Use a scratch copy of the save-dir, since
-this intentionally mutates inputs.
+next object structure. To let the linked output absorb grown sections instead of relying only on
+alignment padding, pass `--incremental-padding-percent=N` in `wild_extra_flags`. The warmup run is
+not mutated, so it seeds the initial incremental state; each timed run then measures a real
+changed-input relink. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
 
 ```toml
 [bench.ripgrep-incremental-changed]
@@ -98,7 +99,7 @@ mutate_files = [{ path = "path/to/input.o", section = ".data" }]
 [bench.ripgrep-incremental-grown-data]
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
+wild_extra_flags = ["--incremental", "--incremental-padding-percent=25"]
 mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
 ```
 

@@ -1535,6 +1535,16 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     allocated && !content_ordered
 }
 
+pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
+    !matches!(name, b".init" | b".fini")
+        && !name.starts_with(b".eh_frame")
+        && !name.starts_with(b".init_array")
+        && !name.starts_with(b".fini_array")
+        && !name.starts_with(b".preinit_array")
+        && !name.starts_with(b".ctors")
+        && !name.starts_with(b".dtors")
+}
+
 fn section_direct_patch_preserve_ranges<'data>(
     section: &impl object::ObjectSection<'data>,
     section_data_len: usize,
@@ -1543,22 +1553,12 @@ fn section_direct_patch_preserve_ranges<'data>(
         || !section
             .name()
             .ok()
-            .is_none_or(section_name_allows_direct_patching)
+            .is_none_or(|name| section_name_allows_direct_patching(name.as_bytes()))
     {
         return None;
     }
 
     relocation_preserve_ranges(section, section_data_len)
-}
-
-fn section_name_allows_direct_patching(name: &str) -> bool {
-    !matches!(name, ".init" | ".fini")
-        && !name.starts_with(".eh_frame")
-        && !name.starts_with(".init_array")
-        && !name.starts_with(".fini_array")
-        && !name.starts_with(".preinit_array")
-        && !name.starts_with(".ctors")
-        && !name.starts_with(".dtors")
 }
 
 fn relocation_preserve_ranges<'data>(
@@ -4033,18 +4033,18 @@ mod tests {
 
     #[test]
     fn strictly_ordered_or_no_gap_sections_are_not_directly_patchable() {
-        assert!(section_name_allows_direct_patching(".text.foo"));
-        assert!(section_name_allows_direct_patching(".data.foo"));
-        assert!(!section_name_allows_direct_patching(".eh_frame"));
-        assert!(!section_name_allows_direct_patching(".eh_frame_hdr"));
-        assert!(!section_name_allows_direct_patching(".init"));
-        assert!(!section_name_allows_direct_patching(".fini"));
-        assert!(!section_name_allows_direct_patching(".init_array"));
-        assert!(!section_name_allows_direct_patching(".init_array.100"));
-        assert!(!section_name_allows_direct_patching(".fini_array"));
-        assert!(!section_name_allows_direct_patching(".preinit_array"));
-        assert!(!section_name_allows_direct_patching(".ctors"));
-        assert!(!section_name_allows_direct_patching(".dtors"));
+        assert!(section_name_allows_direct_patching(b".text.foo"));
+        assert!(section_name_allows_direct_patching(b".data.foo"));
+        assert!(!section_name_allows_direct_patching(b".eh_frame"));
+        assert!(!section_name_allows_direct_patching(b".eh_frame_hdr"));
+        assert!(!section_name_allows_direct_patching(b".init"));
+        assert!(!section_name_allows_direct_patching(b".fini"));
+        assert!(!section_name_allows_direct_patching(b".init_array"));
+        assert!(!section_name_allows_direct_patching(b".init_array.100"));
+        assert!(!section_name_allows_direct_patching(b".fini_array"));
+        assert!(!section_name_allows_direct_patching(b".preinit_array"));
+        assert!(!section_name_allows_direct_patching(b".ctors"));
+        assert!(!section_name_allows_direct_patching(b".dtors"));
     }
 
     #[test]
