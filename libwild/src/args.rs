@@ -75,6 +75,7 @@ pub struct CommonArgs {
     pub(crate) demangle: bool,
     pub(crate) mmap_output_file: bool,
     pub(crate) incremental: bool,
+    pub(crate) incremental_padding_percent: u32,
     pub(crate) validate_output: bool,
     pub(crate) verify_allocation_consistency: bool,
     pub(crate) write_layout: bool,
@@ -283,6 +284,7 @@ impl Default for CommonArgs {
             save_dir: SaveDir::default(),
             mmap_output_file: true,
             incremental: std::env::var(INCREMENTAL_ENV).is_ok_and(|v| v == "1"),
+            incremental_padding_percent: 0,
             prepopulate_maps: false,
             debug_fuel: None,
             should_fork: true,
@@ -1307,6 +1309,15 @@ mod tests {
 
             assert!(!args.common().incremental);
         });
+    }
+
+    #[test]
+    fn parses_incremental_padding_percent() {
+        let mut args = Args::new(|| ["wild", "-flavor", "gnu"].into_iter()).unwrap();
+        args.parse(|| ["wild", "-flavor", "gnu", "--incremental-padding-percent=25"].into_iter())
+            .unwrap();
+
+        assert_eq!(args.common().incremental_padding_percent, 25);
     }
 
     fn with_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {

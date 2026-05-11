@@ -168,6 +168,14 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             args.common.incremental = false;
             Ok(())
         });
+    parser
+        .declare_with_param()
+        .long("incremental-padding-percent")
+        .help("Add this percentage of extra capacity after patchable input sections")
+        .execute(|args, _modifier_stack, value| {
+            args.common.incremental_padding_percent = value.parse()?;
+            Ok(())
+        });
 
     parser
 }

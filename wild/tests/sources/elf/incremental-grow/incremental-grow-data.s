@@ -1,5 +1,4 @@
 .section .data.incremental_grow,"aw",@progbits
-.balign 8
 .globl incremental_grow_value
 incremental_grow_value:
 .byte 1, 2, 3, 4

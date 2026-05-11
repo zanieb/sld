@@ -1207,6 +1207,7 @@ pub(crate) struct Section {
     /// Size in the output. This starts as the input section size, then may be reduced by
     /// relaxation-induced byte deletions during `scan_relaxations`.
     pub(crate) size: u64,
+    extra_capacity: u64,
     pub(crate) flags: ValueFlags,
 }
 
@@ -2702,13 +2703,18 @@ impl<'data, P: Platform> std::fmt::Display for ObjectLayout<'data, P> {
 
 impl Section {
     fn create<'data, P: Platform>(
-        header: &P::SectionHeader,
+        header: &'data P::SectionHeader,
         object_state: &ObjectLayoutState<'data, P>,
-        _part_id: PartId,
+        part_id: PartId,
+        output_sections: &OutputSections<P>,
+        args: &P::Args,
     ) -> Result<Section> {
         let size = object_state.object.section_size(header)?;
+        let extra_capacity =
+            incremental_extra_capacity(header, object_state, part_id, output_sections, args, size);
         let section = Section {
             size,
+            extra_capacity,
             flags: ValueFlags::empty(),
         };
         Ok(section)
@@ -2724,9 +2730,50 @@ impl Section {
         if part_id.should_pack() {
             self.size
         } else {
-            part_id.alignment(output_sections).align_up(self.size)
+            part_id
+                .alignment(output_sections)
+                .align_up(self.size)
+                .saturating_add(self.extra_capacity)
         }
     }
+}
+
+fn incremental_extra_capacity<'data, P: Platform>(
+    header: &'data P::SectionHeader,
+    object_state: &ObjectLayoutState<'data, P>,
+    part_id: PartId,
+    output_sections: &OutputSections<P>,
+    args: &P::Args,
+    size: u64,
+) -> u64 {
+    let common = args.common();
+    if !common.incremental
+        || common.incremental_padding_percent == 0
+        || size == 0
+        || part_id.should_pack()
+        || !section_allows_incremental_padding(header, object_state)
+    {
+        return 0;
+    }
+
+    let bytes = (u128::from(size) * u128::from(common.incremental_padding_percent)).div_ceil(100);
+    let Ok(bytes) = u64::try_from(bytes) else {
+        return u64::MAX;
+    };
+    part_id.alignment(output_sections).align_up(bytes.max(1))
+}
+
+fn section_allows_incremental_padding<'data, P: Platform>(
+    header: &'data P::SectionHeader,
+    object_state: &ObjectLayoutState<'data, P>,
+) -> bool {
+    if !header.is_alloc() || header.is_merge_section() || header.is_no_bits() {
+        return false;
+    }
+    object_state
+        .object
+        .section_name(header)
+        .is_ok_and(crate::incremental::section_name_allows_direct_patching)
 }
 
 pub(crate) fn resolution_flags(rel_kind: RelocationKind) -> ValueFlags {
@@ -3818,7 +3865,13 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
     ) -> Result {
         let part_id = self.section_part_id(section_index, &resources.symbol_db.section_part_ids);
         let header = self.object.section(section_index)?;
-        let section = Section::create(header, self, part_id)?;
+        let section = Section::create(
+            header,
+            self,
+            part_id,
+            resources.output_sections,
+            resources.symbol_db.args,
+        )?;
 
         <A::Platform as Platform>::load_object_section_relocations::<A>(
             self,
@@ -3862,7 +3915,13 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
     ) -> Result {
         let part_id = self.section_part_id(section_index, &resources.symbol_db.section_part_ids);
         let header = self.object.section(section_index)?;
-        let section = Section::create(header, self, part_id)?;
+        let section = Section::create(
+            header,
+            self,
+            part_id,
+            resources.output_sections,
+            resources.symbol_db.args,
+        )?;
 
         // Note: We intentionally do NOT process debug relocations here. On some architectures (like
         // RISC-V and LoongArch64), debug sections reference local symbols (e.g. .LFB0, .LFE0) in
