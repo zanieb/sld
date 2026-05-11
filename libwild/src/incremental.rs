@@ -1334,7 +1334,7 @@ fn direct_copy_patch_sections<'a>(
         if data_out == data && padding.iter().all(|byte| *byte == 0) {
             patch_sections.push(PatchSection {
                 section_index: record.section_index,
-                section_name: section.name().ok().map(str::to_owned),
+                section_name: patch_section_name_for_matching(&section),
                 input_size: data.len() as u64,
                 output_offset: record.output_offset,
                 output_size: record.size,
@@ -1351,6 +1351,20 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let allocated = sh_flags & u64::from(object::elf::SHF_ALLOC) != 0;
     let content_ordered = sh_flags & u64::from(object::elf::SHF_MERGE) != 0;
     allocated && !content_ordered
+}
+
+fn patch_section_name_for_matching<'data>(
+    section: &impl object::ObjectSection<'data>,
+) -> Option<String> {
+    let name = section.name().ok()?;
+    section_name_is_stable_for_patch_matching(name).then(|| name.to_owned())
+}
+
+fn section_name_is_stable_for_patch_matching(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..L")
+        && !name.contains(".L__")
+        && !name.contains("__unnamed_")
 }
 
 fn patch_fingerprint(
@@ -2934,6 +2948,19 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn generated_local_section_names_are_not_stable_for_patch_matching() {
+        assert!(section_name_is_stable_for_patch_matching(".text.symbol"));
+        assert!(section_name_is_stable_for_patch_matching(".data.my_static"));
+        assert!(!section_name_is_stable_for_patch_matching(""));
+        assert!(!section_name_is_stable_for_patch_matching(
+            ".rodata..L__unnamed_75"
+        ));
+        assert!(!section_name_is_stable_for_patch_matching(
+            ".data.rel.ro..L__unnamed_12"
+        ));
     }
 
     #[test]
