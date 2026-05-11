@@ -1257,6 +1257,9 @@ impl std::str::FromStr for CounterKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_flavor() {
@@ -1284,5 +1287,48 @@ mod tests {
 
         assert!(Args::new(|| ["ld.wild", "-flavor", "invalid"].into_iter()).is_err());
         assert!(Args::new(|| ["ld.wild", "-flavor"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn incremental_env_enables_incremental_linking() {
+        with_env_var(INCREMENTAL_ENV, Some("1"), || {
+            let args = Args::new(|| ["wild", "-flavor", "gnu"].into_iter()).unwrap();
+
+            assert!(args.common().incremental);
+        });
+    }
+
+    #[test]
+    fn no_incremental_overrides_incremental_env() {
+        with_env_var(INCREMENTAL_ENV, Some("1"), || {
+            let mut args = Args::new(|| ["wild", "-flavor", "gnu"].into_iter()).unwrap();
+            args.parse(|| ["wild", "-flavor", "gnu", "--no-incremental"].into_iter())
+                .unwrap();
+
+            assert!(!args.common().incremental);
+        });
+    }
+
+    fn with_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os(key);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        unsafe {
+            match old {
+                Some(old) => std::env::set_var(key, old),
+                None => std::env::remove_var(key),
+            }
+        }
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 }
