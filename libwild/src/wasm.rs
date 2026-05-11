@@ -829,7 +829,8 @@ impl platform::Platform for Wasm {
     }
 
     fn finalise_group_layout(
-        memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
+        _common: &crate::layout::CommonGroupState<Self>,
+        _memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> Self::GroupLayoutExt {
     }
 
