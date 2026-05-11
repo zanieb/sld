@@ -60,6 +60,16 @@ def parse_args() -> argparse.Namespace:
         default="1.1.1.1",
         help="DNS server for Linux containers; pass an empty string to use the runtime default",
     )
+    parser.add_argument(
+        "--linux-memory",
+        default="4g",
+        help="memory limit for Linux containers; pass an empty string to use the runtime default",
+    )
+    parser.add_argument(
+        "--linux-cpus",
+        type=int,
+        help="CPU count for Linux containers; omitted uses the runtime default",
+    )
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--test-no-run", action="store_true")
@@ -205,6 +215,10 @@ def run_linux(args: argparse.Namespace, root: Path) -> int:
         "--workdir",
         "/work",
     ]
+    if args.linux_memory:
+        command.extend(["--memory", args.linux_memory])
+    if args.linux_cpus:
+        command.extend(["--cpus", str(args.linux_cpus)])
     if args.linux_dns:
         command.extend(["--dns", args.linux_dns])
     command.extend([args.linux_image, "bash", "-lc", linux_shell_command(args, root)])
