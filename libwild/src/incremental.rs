@@ -3927,6 +3927,41 @@ mod tests {
     }
 
     #[test]
+    fn patch_fingerprint_rejects_relocation_metadata_changes() {
+        let bytes = relocated_data_elf();
+        let input_ref = encode_path(Path::new("input.o"));
+        let patch_section = PatchSection {
+            input: input_ref.clone(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+        };
+        let previous_fingerprint = patch_fingerprint(&bytes, &input_ref, [patch_section.clone()])
+            .unwrap()
+            .unwrap();
+
+        let mut data_changed = bytes.clone();
+        data_changed[0x40] ^= 1;
+        assert_eq!(
+            patch_fingerprint(&data_changed, &input_ref, [patch_section.clone()])
+                .unwrap()
+                .unwrap(),
+            previous_fingerprint
+        );
+
+        let mut relocation_changed = bytes.clone();
+        relocation_changed[0x80] ^= 1;
+        assert_ne!(
+            patch_fingerprint(&relocation_changed, &input_ref, [patch_section])
+                .unwrap()
+                .unwrap(),
+            previous_fingerprint
+        );
+    }
+
+    #[test]
     fn resolve_current_patch_sections_updates_section_size_after_growth() {
         let mut bytes = growable_data_elf();
         bytes[0x44] = 5;
@@ -3983,6 +4018,56 @@ mod tests {
         bytes[shstrtab_header + 4..shstrtab_header + 8].copy_from_slice(&3_u32.to_le_bytes());
         bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0x48_u64.to_le_bytes());
         bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&17_u64.to_le_bytes());
+        bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
+    }
+
+    fn relocated_data_elf() -> Vec<u8> {
+        let mut bytes = vec![0; 0x220];
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0x100_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&4_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&3_u16.to_le_bytes());
+
+        bytes[0x40..0x48].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        bytes[0x80..0x88].copy_from_slice(&4_u64.to_le_bytes());
+        bytes[0x88..0x90].copy_from_slice(&1_u64.to_le_bytes());
+        bytes[0x90..0x98].copy_from_slice(&2_i64.to_le_bytes());
+        bytes[0xa0..0xbc].copy_from_slice(b"\0.data\0.rela.data\0.shstrtab\0");
+
+        let data_header = 0x100 + 64;
+        bytes[data_header..data_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 4..data_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_header + 8..data_header + 16].copy_from_slice(&3_u64.to_le_bytes());
+        bytes[data_header + 24..data_header + 32].copy_from_slice(&0x40_u64.to_le_bytes());
+        bytes[data_header + 32..data_header + 40].copy_from_slice(&8_u64.to_le_bytes());
+        bytes[data_header + 48..data_header + 56].copy_from_slice(&8_u64.to_le_bytes());
+
+        let rela_header = 0x100 + 128;
+        bytes[rela_header..rela_header + 4].copy_from_slice(&7_u32.to_le_bytes());
+        bytes[rela_header + 4..rela_header + 8].copy_from_slice(&4_u32.to_le_bytes());
+        bytes[rela_header + 24..rela_header + 32].copy_from_slice(&0x80_u64.to_le_bytes());
+        bytes[rela_header + 32..rela_header + 40].copy_from_slice(&24_u64.to_le_bytes());
+        bytes[rela_header + 40..rela_header + 44].copy_from_slice(&0_u32.to_le_bytes());
+        bytes[rela_header + 44..rela_header + 48].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[rela_header + 48..rela_header + 56].copy_from_slice(&8_u64.to_le_bytes());
+        bytes[rela_header + 56..rela_header + 64].copy_from_slice(&24_u64.to_le_bytes());
+
+        let shstrtab_header = 0x100 + 192;
+        bytes[shstrtab_header..shstrtab_header + 4].copy_from_slice(&18_u32.to_le_bytes());
+        bytes[shstrtab_header + 4..shstrtab_header + 8].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[shstrtab_header + 24..shstrtab_header + 32].copy_from_slice(&0xa0_u64.to_le_bytes());
+        bytes[shstrtab_header + 32..shstrtab_header + 40].copy_from_slice(&28_u64.to_le_bytes());
         bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
 
         bytes
