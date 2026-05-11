@@ -115,7 +115,7 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
         let mut baseline_outputs = Vec::new();
         for bin in bins {
             let warmup_flags = extra_flags_for_run(bin, bench, false);
-            let warmup_run = run_once(bin, bench, args, &warmup_flags, false)?;
+            let warmup_run = run_once(bin, bench, args, &warmup_flags, false, false)?;
             let baseline_output = if bench.config.expect_output_change && warmup_run.is_some() {
                 let output_path = output_path_for_bin(args.tmp.as_path(), bin);
                 Some(std::fs::read(&output_path).with_context(|| {
@@ -137,10 +137,12 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
                 mutate_inputs(bench)?;
                 for bin_index in group.bin_indexes {
                     let bin = &bins[bin_index];
-                    let extra_flags =
-                        extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
+                    let measure_memory = !args.no_mem && batch_num == 0;
+                    let extra_flags = extra_flags_for_run(bin, bench, measure_memory);
 
-                    if let Some(run) = run_once(bin, bench, args, &extra_flags, true)? {
+                    if let Some(run) =
+                        run_once(bin, bench, args, &extra_flags, true, measure_memory)?
+                    {
                         if let Some(baseline_output) = baseline_outputs
                             .get(bin_index)
                             .and_then(|baseline| baseline.as_deref())
@@ -572,7 +574,7 @@ fn verify(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result {
     for bench in benchmarks {
         println!("Verifying: {bench}");
         for bin in bins {
-            if let Err(error) = run_once(bin, bench, args, &[], false) {
+            if let Err(error) = run_once(bin, bench, args, &[], false, false) {
                 eprintln!("{error}");
                 success = false;
             }
@@ -592,6 +594,7 @@ fn run_once(
     args: &BenchArgs,
     extra_flags: &[String],
     check_wild_log: bool,
+    measure_memory: bool,
 ) -> Result<Option<Run>> {
     if !bench.supports_bin(bin) {
         return Ok(None);
@@ -655,6 +658,7 @@ fn run_once(
     Ok(Some(Run {
         pid,
         extra_flags: extra_flags.to_vec(),
+        measure_memory,
         elapsed,
         max_rss: res_use.rusage.maxrss,
         stime: res_use.rusage.stime,

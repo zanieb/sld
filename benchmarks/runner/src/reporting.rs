@@ -121,7 +121,7 @@ impl ReportMode {
     }
 
     fn should_keep_run(&self, run: &crate::Run) -> bool {
-        run.extra_flags.iter().any(|f| f == "--no-fork") == (self == &ReportMode::Memory)
+        run.measure_memory == (self == &ReportMode::Memory)
     }
 
     fn unit_name(self) -> &'static str {
@@ -589,6 +589,34 @@ mod tests {
     }
 
     #[test]
+    fn no_fork_time_runs_stay_in_time_report() {
+        let mut benchmark =
+            benchmark_result(vec![batch(LinkerKind::Wild, Duration::from_millis(25))]);
+        benchmark.batches[0].runs[0]
+            .extra_flags
+            .push("--no-fork".to_owned());
+
+        let time = ReportMode::Time.filter(&benchmark, &BenchConfig::default());
+        let memory = ReportMode::Memory.filter(&benchmark, &BenchConfig::default());
+
+        assert_eq!(time.batches[0].runs.len(), 1);
+        assert!(memory.batches.is_empty());
+    }
+
+    #[test]
+    fn measured_memory_runs_stay_in_memory_report() {
+        let mut benchmark =
+            benchmark_result(vec![batch(LinkerKind::Wild, Duration::from_millis(25))]);
+        benchmark.batches[0].runs[0].measure_memory = true;
+
+        let time = ReportMode::Time.filter(&benchmark, &BenchConfig::default());
+        let memory = ReportMode::Memory.filter(&benchmark, &BenchConfig::default());
+
+        assert!(time.batches.is_empty());
+        assert_eq!(memory.batches[0].runs.len(), 1);
+    }
+
+    #[test]
     fn incremental_baseline_can_use_current_or_legacy_names() {
         let benchmarks = vec![
             benchmark_result_with_name("ruff", Vec::new()),
@@ -644,6 +672,7 @@ mod tests {
             runs: vec![Run {
                 pid: 1,
                 extra_flags: Vec::new(),
+                measure_memory: false,
                 elapsed,
                 max_rss: 1024,
                 stime: Duration::ZERO,
