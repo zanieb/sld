@@ -113,7 +113,7 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
         }
         for bin in bins {
             let warmup_flags = extra_flags_for_run(bin, bench, false);
-            run_once(bin, bench, args, &warmup_flags)?;
+            run_once(bin, bench, args, &warmup_flags, false)?;
         }
 
         let mut bench_results = Vec::new();
@@ -126,7 +126,7 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
                     let extra_flags =
                         extra_flags_for_run(bin, bench, !args.no_mem && batch_num == 0);
 
-                    if let Some(run) = run_once(bin, bench, args, &extra_flags)? {
+                    if let Some(run) = run_once(bin, bench, args, &extra_flags, true)? {
                         batch_runs[bin_index].push(run);
                     }
                     progress_bar.inc(1);
@@ -463,7 +463,7 @@ fn verify(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result {
     for bench in benchmarks {
         println!("Verifying: {bench}");
         for bin in bins {
-            if let Err(error) = run_once(bin, bench, args, &[]) {
+            if let Err(error) = run_once(bin, bench, args, &[], false) {
                 eprintln!("{error}");
                 success = false;
             }
@@ -482,6 +482,7 @@ fn run_once(
     bench: &Benchmark,
     args: &BenchArgs,
     extra_flags: &[String],
+    check_wild_log: bool,
 ) -> Result<Option<Run>> {
     if !bench.supports_bin(bin) {
         return Ok(None);
@@ -533,7 +534,7 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
-    if bin.identifier.kind == LinkerKind::Wild && !bench.config.expect_wild_log.is_empty() {
+    if should_verify_wild_incremental_log(bin, bench, check_wild_log) {
         verify_wild_incremental_log(&output_path, &bench.config.expect_wild_log)?;
     }
 
@@ -562,6 +563,12 @@ fn output_path_for_bin(tmp: &Path, bin: &Bin) -> std::path::PathBuf {
     file_name.push(suffix);
     path.set_file_name(file_name);
     path
+}
+
+fn should_verify_wild_incremental_log(bin: &Bin, bench: &Benchmark, check_wild_log: bool) -> bool {
+    check_wild_log
+        && bin.identifier.kind == LinkerKind::Wild
+        && !bench.config.expect_wild_log.is_empty()
 }
 
 fn verify_wild_incremental_log(output_path: &Path, expected: &[String]) -> Result {
@@ -656,6 +663,7 @@ mod tests {
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
     use super::output_path_for_bin;
+    use super::should_verify_wild_incremental_log;
     use super::verify_wild_incremental_log;
     use crate::Benchmark;
     use crate::Bin;
@@ -789,6 +797,44 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("did not contain expected text"));
+    }
+
+    #[test]
+    fn wild_incremental_log_expectations_skip_warmup() {
+        let wild = Bin {
+            index: 0,
+            path: PathBuf::from("/bin/wild"),
+            identifier: LinkerIdentifier {
+                kind: LinkerKind::Wild,
+                version: "wild 0.0.0".to_owned(),
+                variant: None,
+                hash: None,
+                effective_version: vec![0, 0, 0],
+            },
+        };
+        let mold = Bin {
+            index: 1,
+            path: PathBuf::from("/bin/mold"),
+            identifier: LinkerIdentifier {
+                kind: LinkerKind::Mold,
+                version: "mold 0.0.0".to_owned(),
+                variant: None,
+                hash: None,
+                effective_version: vec![0, 0, 0],
+            },
+        };
+        let bench = Benchmark {
+            name: "incremental".to_owned(),
+            path: PathBuf::from("/tmp/save/run-with"),
+            config: BenchConfig {
+                expect_wild_log: vec!["reused existing output".to_owned()],
+                ..BenchConfig::default()
+            },
+        };
+
+        assert!(!should_verify_wild_incremental_log(&wild, &bench, false));
+        assert!(should_verify_wild_incremental_log(&wild, &bench, true));
+        assert!(!should_verify_wild_incremental_log(&mold, &bench, true));
     }
 
     #[test]
