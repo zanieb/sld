@@ -1306,6 +1306,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("sections-file\t") {
                 let file = parse_prefixed_line(Some(first_line), "sections-file")?.to_owned();
+                validate_sections_file_name(&file)?;
                 let sections = load_sections(&file)?
                     .map(|contents| parse_compact_sections_block(contents.lines()))
                     .transpose()?
@@ -1511,6 +1512,7 @@ impl PersistedState {
 }
 
 fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
+    validate_sections_file_name(file_name)?;
     let path = state_dir.join(file_name);
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read incremental sections `{}`", path.display()))?;
@@ -1524,6 +1526,22 @@ fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
         }
     }
     Ok(contents)
+}
+
+fn validate_sections_file_name(file_name: &str) -> Result {
+    if file_name == SECTIONS_FILE {
+        return Ok(());
+    }
+    if !file_name.starts_with(SECTIONS_FILE_PREFIX)
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || Path::new(file_name).is_absolute()
+    {
+        return Err(crate::error!(
+            "Invalid incremental sections sidecar name `{file_name}`"
+        ));
+    }
+    Ok(())
 }
 
 impl PartialEq for FileContentState {
@@ -5406,6 +5424,24 @@ mod tests {
             error
                 .to_string()
                 .contains("do not match their content hash")
+        );
+    }
+
+    #[test]
+    fn sections_sidecar_name_must_stay_in_state_dir() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 12));
+        let rendered = format!(
+            "{}sections-file\t../sections\n",
+            state.render_header_and_inputs()
+        );
+
+        let error = PersistedState::parse(&rendered).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid incremental sections sidecar name")
         );
     }
 
