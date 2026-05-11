@@ -439,15 +439,6 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             &state_dir,
             rewritten_inputs.iter().map(|(_, path)| path.as_path()),
         )?;
-        for (input_index, path) in &rewritten_inputs {
-            previous.input_files[*input_index].content =
-                FileContentState::from_path_identity_only(path).with_context(|| {
-                    format!(
-                        "Failed to record rewritten incremental input `{}`",
-                        path.display()
-                    )
-                })?;
-        }
         refresh_input_file_identities_at_indices(
             &mut previous.input_files,
             rewritten_inputs.iter().map(|(input_index, _)| *input_index),
@@ -767,16 +758,7 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             }
-            let previous_snapshot = input_snapshot_path_for_encoded_path(state_dir, &input.path);
-            let previous_snapshot_bytes = if input
-                .content
-                .identity_matches_snapshot_path(&previous_snapshot)
-                .unwrap_or(false)
-            {
-                Some(std::fs::read(&previous_snapshot)?)
-            } else {
-                None
-            };
+            let previous_snapshot_bytes = read_verified_input_snapshot(state_dir, input)?;
             let relocation_target_patches = match relocation_target_patches_for_input(
                 &mut previous.relocations,
                 input,
@@ -932,7 +914,7 @@ fn patch_changed_inputs(
                 };
                 let dynamic_relocation_added = dynamic_relocation_patches
                     .iter()
-                    .any(|patch| patch.input_range.is_some());
+                    .any(|patch| patch.input_range.is_some() && patch.is_new);
                 let allows_dynamic_relocation_addition = if dynamic_relocation_added {
                     if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
                         object_diff_allows_dynamic_relocation_addition(
@@ -3181,7 +3163,7 @@ where
                 .into_iter()
                 .flat_map(|records| records.iter().copied()),
         )?;
-        input.patch = patch_fingerprint_with_extra_ranges(
+        let patch = patch_fingerprint_with_extra_ranges(
             input_file.data(),
             input.path.as_str(),
             patch_sections.iter().cloned(),
@@ -3207,6 +3189,10 @@ where
                 })
                 .collect(),
         });
+        if patch.is_some() && input.content.hash.is_empty() {
+            input.content.hash = hash_bytes(input_file.data());
+        }
+        input.patch = patch;
     }
 
     Ok(())
@@ -3574,19 +3560,8 @@ fn archive_members_match_snapshot(
     if current_members.is_none() && !patch_state_references_archive_member(previous_input) {
         return Ok(true);
     }
-    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
-    if !previous_input
-        .content
-        .identity_matches_snapshot_path(&snapshot)
-        .unwrap_or(false)
-    {
+    let Some(previous_bytes) = read_verified_input_snapshot(state_dir, previous_input)? else {
         return Ok(false);
-    }
-
-    let previous_bytes = match std::fs::read(&snapshot) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
     };
     Ok(archive_member_identifiers(&previous_bytes)? == current_members)
 }
@@ -3709,19 +3684,8 @@ fn match_patch_sections(
     current_bytes: &[u8],
     sections: &[PatchSection],
 ) -> Result<Option<MatchedPatchSections>> {
-    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
-    if !previous_input
-        .content
-        .identity_matches_snapshot_path(&snapshot)
-        .unwrap_or(false)
-    {
+    let Some(previous_bytes) = read_verified_input_snapshot(state_dir, previous_input)? else {
         return Ok(None);
-    }
-
-    let previous_bytes = match std::fs::read(&snapshot) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
     };
 
     let mut sections_by_input = HashMap::<&str, Vec<(usize, &PatchSection)>>::new();
@@ -3890,19 +3854,8 @@ fn changed_patch_sections(
     current_bytes: &[u8],
     sections: &[MatchedPatchSection],
 ) -> Result<Option<Vec<PatchSection>>> {
-    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
-    if !previous_input
-        .content
-        .identity_matches_snapshot_path(&snapshot)
-        .unwrap_or(false)
-    {
+    let Some(previous_bytes) = read_verified_input_snapshot(state_dir, previous_input)? else {
         return Ok(None);
-    }
-
-    let previous_bytes = match std::fs::read(&snapshot) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
     };
 
     let mut changed_sections = Vec::new();
@@ -7692,6 +7645,36 @@ fn input_content_matches_snapshot(
     files_equal(&snapshot, current_path)
 }
 
+fn read_verified_input_snapshot(
+    state_dir: &Path,
+    previous_input: &FileState,
+) -> Result<Option<Vec<u8>>> {
+    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    let bytes = match std::fs::read(&snapshot) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !snapshot_bytes_match_previous_content(&previous_input.content, &snapshot, &bytes)? {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn snapshot_bytes_match_previous_content(
+    previous: &FileContentState,
+    snapshot: &Path,
+    bytes: &[u8],
+) -> Result<bool> {
+    if previous.len != bytes.len() as u64 {
+        return Ok(false);
+    }
+    if !previous.hash.is_empty() {
+        return Ok(previous.hash == hash_bytes(bytes));
+    }
+    previous.identity_matches_snapshot_path(snapshot)
+}
+
 fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     let left = match std::fs::read(left) {
         Ok(bytes) => bytes,
@@ -7721,14 +7704,9 @@ fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileCo
     if bytes.len() as u64 != identity.len {
         return Ok(None);
     }
-    Ok(Some((
-        bytes,
-        FileContentState {
-            len: identity.len,
-            hash: String::new(),
-            identity: Some(identity),
-        },
-    )))
+    let mut content = FileContentState::from_bytes(&bytes);
+    content.identity = Some(identity);
+    Ok(Some((bytes, content)))
 }
 
 fn input_content_mismatch_reason(
@@ -8384,6 +8362,12 @@ mod tests {
         }
     }
 
+    fn content_hash_with_path_identity(path: &Path, bytes: &[u8]) -> FileContentState {
+        let mut content = FileContentState::from_bytes(bytes);
+        content.identity = FileIdentity::from_path(path).unwrap();
+        content
+    }
+
     #[test]
     fn state_dir_appends_suffix() {
         assert_eq!(
@@ -8633,10 +8617,9 @@ mod tests {
         let input = dir.path().join("input.o");
         std::fs::write(&input, &bytes).unwrap();
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
-        let snapshot = input_snapshot_path(&state_dir, &input);
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            content: content_hash_with_path_identity(&input, &bytes),
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -8692,10 +8675,9 @@ mod tests {
         let input = dir.path().join("input.o");
         std::fs::write(&input, &bytes).unwrap();
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
-        let snapshot = input_snapshot_path(&state_dir, &input);
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            content: content_hash_with_path_identity(&input, &bytes),
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -8732,10 +8714,9 @@ mod tests {
         let input = dir.path().join("input.o");
         std::fs::write(&input, &bytes).unwrap();
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
-        let snapshot = input_snapshot_path(&state_dir, &input);
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            content: content_hash_with_path_identity(&input, &bytes),
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -10558,7 +10539,6 @@ mod tests {
         let previous_archive = previous_builder.into_inner().unwrap();
         std::fs::write(&input, &previous_archive).unwrap();
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
-        let snapshot = input_snapshot_path(&state_dir, &input);
         let mut member_ref = input.as_os_str().as_encoded_bytes().to_vec();
         member_ref.push(0);
         member_ref.extend_from_slice(b"member.o");
@@ -10566,7 +10546,7 @@ mod tests {
         member_ref.extend_from_slice(b"8:14");
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&snapshot).unwrap(),
+            content: content_hash_with_path_identity(&input, &previous_archive),
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 sections: vec![FilePatchSectionState {
