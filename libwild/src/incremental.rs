@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v14";
+const STATE_VERSION: &str = "wild-incremental-state-v15";
+const STATE_VERSION_V14: &str = "wild-incremental-state-v14";
 const STATE_VERSION_V13: &str = "wild-incremental-state-v13";
 const STATE_VERSION_V12: &str = "wild-incremental-state-v12";
 const STATE_VERSION_V11: &str = "wild-incremental-state-v11";
@@ -97,6 +98,7 @@ struct PersistedState {
 struct BuildIdHashState {
     output_len: u64,
     nodes: usize,
+    tree_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1234,6 +1236,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V14
             && version != STATE_VERSION_V13
             && version != STATE_VERSION_V12
             && version != STATE_VERSION_V11
@@ -1287,6 +1290,7 @@ impl PersistedState {
 
         let mut sections_file = None;
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V14
             || version == STATE_VERSION_V13
             || version == STATE_VERSION_V12
             || version == STATE_VERSION_V11
@@ -2831,6 +2835,7 @@ fn build_id_hash_state_from_output(
         Some(BuildIdHashState {
             output_len: bytes.len() as u64,
             nodes,
+            tree_hash: Some(build_id_hash_tree_hash(&tree)),
         }),
         Some(tree),
     ))
@@ -2901,6 +2906,7 @@ fn update_build_id_hash_tree(
         zero_range,
         changed_chunks,
     );
+    state.tree_hash = Some(build_id_hash_tree_hash(tree));
     Ok(true)
 }
 
@@ -3002,6 +3008,14 @@ fn build_id_from_hash_tree(
     ))
 }
 
+fn build_id_hash_tree_hash(tree: &[[u8; blake3::OUT_LEN]]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for node in tree {
+        hasher.update(node);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn touched_build_id_chunks(
     ranges: &[std::ops::Range<usize>],
     output_len: usize,
@@ -3066,10 +3080,18 @@ fn read_build_id_hash_tree(
             bytes.len()
         ));
     }
-    Ok(bytes
+    let tree = bytes
         .chunks_exact(blake3::OUT_LEN)
         .map(|chunk| chunk.try_into().unwrap())
-        .collect())
+        .collect::<Vec<_>>();
+    if let Some(expected_hash) = state.tree_hash.as_deref()
+        && build_id_hash_tree_hash(&tree) != expected_hash
+    {
+        return Err(crate::error!(
+            "Incremental build ID hash tree does not match its recorded hash"
+        ));
+    }
+    Ok(tree)
 }
 
 fn write_build_id_hash_tree(state_dir: &Path, tree: Option<&[[u8; blake3::OUT_LEN]]>) -> Result {
@@ -3189,13 +3211,21 @@ fn parse_build_id_hash_line(line: Option<&str>) -> Result<Option<BuildIdHashStat
         .context("Malformed incremental build ID hash node count")?
         .parse()
         .context("Invalid incremental build ID hash node count")?;
+    let tree_hash = parts
+        .next()
+        .filter(|tree_hash| *tree_hash != ABSENT_FIELD)
+        .map(|tree_hash| tree_hash.to_owned());
     if parts.next().is_some() {
         return Err(crate::error!("Malformed incremental build ID hash record"));
     }
     if nodes == 0 {
         return Err(crate::error!("Missing incremental build ID hash nodes"));
     }
-    Ok(Some(BuildIdHashState { output_len, nodes }))
+    Ok(Some(BuildIdHashState {
+        output_len,
+        nodes,
+        tree_hash,
+    }))
 }
 
 fn parse_compact_sections_block<'a>(
@@ -3297,7 +3327,12 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
 }
 
 fn render_build_id_hash_state(state: &BuildIdHashState) -> String {
-    format!("{}\t{}", state.output_len, state.nodes)
+    format!(
+        "{}\t{}\t{}",
+        state.output_len,
+        state.nodes,
+        state.tree_hash.as_deref().unwrap_or(ABSENT_FIELD)
+    )
 }
 
 fn parse_patch_sections(default_input: &str, sections: &str) -> Result<Vec<FilePatchSectionState>> {
@@ -5272,12 +5307,35 @@ mod tests {
         state.build_id_hashes = Some(BuildIdHashState {
             output_len: output_len as u64,
             nodes,
+            tree_hash: Some("tree-hash".to_owned()),
         });
 
         let rendered = state.render();
 
-        assert!(rendered.contains(&format!("\nbuild-id-hash\t{output_len}\t{nodes}\n")));
+        assert!(rendered.contains(&format!(
+            "\nbuild-id-hash\t{output_len}\t{nodes}\ttree-hash\n"
+        )));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn legacy_build_id_hashes_are_accepted_without_tree_hash() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        let output_len = 5 * BUILD_ID_HASH_GROUP_LEN + 100;
+        let nodes = build_id_hash_node_count(output_len).unwrap();
+        state.build_id_hashes = Some(BuildIdHashState {
+            output_len: output_len as u64,
+            nodes,
+            tree_hash: Some("tree-hash".to_owned()),
+        });
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V14, 1)
+            .replace("\ttree-hash\n", "\n");
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.build_id_hashes.unwrap().tree_hash, None);
     }
 
     #[test]
@@ -5836,6 +5894,7 @@ mod tests {
             let state = BuildIdHashState {
                 output_len: output.len() as u64,
                 nodes,
+                tree_hash: Some(build_id_hash_tree_hash(&tree)),
             };
             let mut expected = output;
             expected[build_id_range].fill(0);
@@ -5868,6 +5927,7 @@ mod tests {
         let mut state = BuildIdHashState {
             output_len: output.len() as u64,
             nodes,
+            tree_hash: Some(build_id_hash_tree_hash(&tree)),
         };
 
         let changed_range = 2 * BUILD_ID_HASH_GROUP_LEN + 100..2 * BUILD_ID_HASH_GROUP_LEN + 110;
@@ -5887,6 +5947,32 @@ mod tests {
         assert_eq!(
             build_id_from_hash_tree(&state, &tree).unwrap(),
             blake3::hash(&expected)
+        );
+        assert_eq!(
+            state.tree_hash.as_deref(),
+            Some(build_id_hash_tree_hash(&tree).as_str())
+        );
+    }
+
+    #[test]
+    fn build_id_hash_tree_must_match_state_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_len = 5 * BUILD_ID_HASH_GROUP_LEN + 100;
+        let nodes = build_id_hash_node_count(output_len).unwrap();
+        let tree = vec![[1; blake3::OUT_LEN]; nodes];
+        write_build_id_hash_tree(dir.path(), Some(&tree)).unwrap();
+        let state = BuildIdHashState {
+            output_len: output_len as u64,
+            nodes,
+            tree_hash: Some("wrong-hash".to_owned()),
+        };
+
+        let error = read_build_id_hash_tree(dir.path(), &state).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its recorded hash")
         );
     }
 
