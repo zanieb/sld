@@ -3052,6 +3052,31 @@ fn relocation_record_size(rel_info: &RelocationKindInfo) -> usize {
     }
 }
 
+fn relocation_target_owner<'data>(
+    layout: &ElfLayout<'data>,
+    target_symbol_id: SymbolId,
+) -> Result<
+    Option<(
+        crate::input_data::InputRef<'data>,
+        object::SectionIndex,
+        u64,
+    )>,
+> {
+    let file_id = layout.symbol_db.file_id_for_symbol(target_symbol_id);
+    let FileLayout::Object(object) = layout.file_layout(file_id) else {
+        return Ok(None);
+    };
+    let symbol_index = target_symbol_id.to_input(object.symbol_id_range);
+    let symbol = object.object.symbol(symbol_index)?;
+    let Some(section_index) = object.object.symbol_section(symbol, symbol_index)? else {
+        return Ok(None);
+    };
+    let section_offset = object
+        .object
+        .symbol_offset_in_section(symbol, section_index)?;
+    Ok(Some((object.input, section_index, section_offset)))
+}
+
 #[inline(always)]
 fn get_pair_subtraction_relocation_value<'data, A: Arch<Platform = Elf>, R: Relocation>(
     object_layout: &ObjectLayout<'data, Elf>,
@@ -3176,6 +3201,7 @@ fn apply_relocation<
             .symbol_name(target_symbol_id)
             .ok()
             .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
+        let target = relocation_target_owner(layout, target_symbol_id)?;
         let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
             .context("Incremental relocation target symbol ID overflow")?;
         incremental.record_relocation(
@@ -3189,6 +3215,7 @@ fn apply_relocation<
             addend,
             resolution.raw_value,
             target_name,
+            target,
         );
     }
 

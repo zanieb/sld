@@ -29,7 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "wild-incremental-state-v24";
+const STATE_VERSION: &str = "wild-incremental-state-v25";
+const STATE_VERSION_V24: &str = "wild-incremental-state-v24";
 const STATE_VERSION_V23: &str = "wild-incremental-state-v23";
 const STATE_VERSION_V22: &str = "wild-incremental-state-v22";
 const STATE_VERSION_V21: &str = "wild-incremental-state-v21";
@@ -194,6 +195,7 @@ pub(crate) struct RelocationRecord {
     target_symbol_id: u32,
     target_value: u64,
     target_name: Option<String>,
+    target: Option<RelocationTargetRecord>,
     input_file: String,
     input: String,
     section_index: u32,
@@ -202,6 +204,14 @@ pub(crate) struct RelocationRecord {
     size: u64,
     kind: u32,
     addend: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RelocationTargetRecord {
+    input_file: String,
+    input: String,
+    section_index: u32,
+    section_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1323,6 +1333,7 @@ impl PreparedState {
         addend: i64,
         target_value: u64,
         target_name: Option<String>,
+        target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
     ) {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
@@ -1341,6 +1352,7 @@ impl PreparedState {
                 addend,
                 target_value,
                 target_name,
+                target,
             ));
     }
 
@@ -1647,6 +1659,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V24
             && version != STATE_VERSION_V23
             && version != STATE_VERSION_V22
             && version != STATE_VERSION_V21
@@ -1739,6 +1752,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V24
             || version == STATE_VERSION_V23
             || version == STATE_VERSION_V22
             || version == STATE_VERSION_V21
@@ -2012,9 +2026,27 @@ impl PersistedState {
         for relocation in &self.relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
+            let (target_input_file, target_input, target_section_index, target_section_offset) =
+                relocation
+                    .target
+                    .as_ref()
+                    .map(|target| {
+                        (
+                            target.input_file.as_str(),
+                            target.input.as_str(),
+                            target.section_index.to_string(),
+                            target.section_offset.to_string(),
+                        )
+                    })
+                    .unwrap_or((
+                        ABSENT_FIELD,
+                        ABSENT_FIELD,
+                        ABSENT_FIELD.to_owned(),
+                        ABSENT_FIELD.to_owned(),
+                    ));
             writeln!(
                 &mut out,
-                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
                 relocation.target_symbol_id,
@@ -2024,7 +2056,11 @@ impl PersistedState {
                 relocation.kind,
                 relocation.addend,
                 relocation.target_value,
-                relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD)
+                relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
+                target_input_file,
+                target_input,
+                target_section_index,
+                target_section_offset
             )
             .unwrap();
         }
@@ -2151,11 +2187,15 @@ impl RelocationRecord {
         addend: i64,
         target_value: u64,
         target_name: Option<String>,
+        target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
     ) -> Self {
         Self {
             target_symbol_id,
             target_value,
             target_name,
+            target: target.map(|(input, section_index, section_offset)| {
+                RelocationTargetRecord::new(input, section_index, section_offset)
+            }),
             input_file: encode_path(&input.file.filename),
             input: encode_input_ref(input),
             section_index: section_index.0 as u32,
@@ -2164,6 +2204,17 @@ impl RelocationRecord {
             size,
             kind,
             addend,
+        }
+    }
+}
+
+impl RelocationTargetRecord {
+    fn new(input: InputRef<'_>, section_index: object::SectionIndex, section_offset: u64) -> Self {
+        Self {
+            input_file: encode_path(&input.file.filename),
+            input: encode_input_ref(input),
+            section_index: section_index.0 as u32,
+            section_offset,
         }
     }
 }
@@ -5038,14 +5089,39 @@ fn parse_compact_relocation_line(
         .context("Malformed incremental relocation addend")?
         .parse()
         .context("Invalid incremental relocation addend")?;
-    let (target_value, target_name) = match parts.len() {
-        8 => (0, None),
+    let (target_value, target_name, target) = match parts.len() {
+        8 => (0, None, None),
         10 => {
             let target_value = parts[8]
                 .parse()
                 .context("Invalid incremental relocation target value")?;
             let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
-            (target_value, target_name)
+            (target_value, target_name, None)
+        }
+        14 => {
+            let target_value = parts[8]
+                .parse()
+                .context("Invalid incremental relocation target value")?;
+            let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
+            let target = if parts[10] == ABSENT_FIELD
+                && parts[11] == ABSENT_FIELD
+                && parts[12] == ABSENT_FIELD
+                && parts[13] == ABSENT_FIELD
+            {
+                None
+            } else {
+                Some(RelocationTargetRecord {
+                    input_file: parts[10].to_owned(),
+                    input: parts[11].to_owned(),
+                    section_index: parts[12]
+                        .parse()
+                        .context("Invalid incremental relocation target section index")?,
+                    section_offset: parts[13]
+                        .parse()
+                        .context("Invalid incremental relocation target section offset")?,
+                })
+            };
+            (target_value, target_name, target)
         }
         _ => return Err(crate::error!("Malformed incremental relocation record")),
     };
@@ -5056,6 +5132,7 @@ fn parse_compact_relocation_line(
         target_symbol_id,
         target_value,
         target_name,
+        target,
         input_file: input_file.clone(),
         input: input.clone(),
         section_index,
@@ -5706,6 +5783,7 @@ mod tests {
         target_symbol_id: u32,
         target_value: u64,
         target_name: Option<&str>,
+        target: Option<(&str, u32, u64)>,
         relocation_offset: u64,
         output_offset: u64,
         size: u64,
@@ -5716,6 +5794,14 @@ mod tests {
             target_symbol_id,
             target_value,
             target_name: target_name.map(hex::encode),
+            target: target.map(
+                |(input, section_index, section_offset)| RelocationTargetRecord {
+                    input_file: hex::encode(input),
+                    input: hex::encode(input),
+                    section_index,
+                    section_offset,
+                },
+            ),
             input_file: hex::encode(input),
             input: hex::encode(input),
             section_index,
@@ -7512,6 +7598,7 @@ mod tests {
             42,
             0x1234,
             Some("target"),
+            Some(("a.o", 2, 16)),
             8,
             300,
             8,
@@ -7522,8 +7609,54 @@ mod tests {
         let rendered = state.render();
 
         assert!(rendered.contains("\nrelocs\t1\n"));
-        assert!(rendered.contains("\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t4660\t746172676574\n"));
+        assert!(rendered.contains(
+            "\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t4660\t746172676574\t612e6f\t612e6f\t2\t16\n"
+        ));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v24_state_version_is_accepted_without_relocation_target_owner() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            42,
+            0x1234,
+            Some("target"),
+            Some(("a.o", 2, 16)),
+            8,
+            300,
+            8,
+            1,
+            -4,
+        ));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V24, 1)
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("reloc\t") {
+                    let fields = rest.split('\t').take(10).collect::<Vec<_>>().join("\t");
+                    format!("reloc\t{fields}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.relocations.len(), 1);
+        assert_eq!(parsed.relocations[0].target_value, 0x1234);
+        assert_eq!(
+            parsed.relocations[0].target_name,
+            Some(hex::encode("target"))
+        );
+        assert_eq!(parsed.relocations[0].target, None);
     }
 
     #[test]
@@ -7535,6 +7668,7 @@ mod tests {
             42,
             0x1234,
             Some("target"),
+            Some(("a.o", 2, 16)),
             8,
             300,
             8,
@@ -9097,6 +9231,7 @@ mod tests {
             -16,
             0x1234,
             Some(hex::encode("target")),
+            Some((input, object::SectionIndex(7), 32)),
         );
         state.record_relocation(
             input,
@@ -9108,6 +9243,7 @@ mod tests {
             2,
             0,
             0x5678,
+            None,
             None,
         );
 
@@ -9123,7 +9259,8 @@ mod tests {
                 2,
                 -16,
                 0x1234,
-                Some(hex::encode("target"))
+                Some(hex::encode("target")),
+                Some((input, object::SectionIndex(7), 32))
             )]
         );
     }
