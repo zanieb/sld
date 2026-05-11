@@ -2181,6 +2181,7 @@ impl ProgramInputs {
                 );
             }
 
+            let _restore_changed_input = RestoreFileOnDrop::new(&changed_input.path)?;
             if let Some(growth) = config.test_incremental_changed_grow_section {
                 grow_section_bytes(
                     &changed_input.path,
@@ -2315,6 +2316,28 @@ impl ProgramInputs {
         }
 
         Ok(())
+    }
+}
+
+struct RestoreFileOnDrop {
+    path: PathBuf,
+    contents: Vec<u8>,
+}
+
+impl RestoreFileOnDrop {
+    fn new(path: &Path) -> Result<Self> {
+        let contents =
+            std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+        Ok(Self {
+            path: path.to_owned(),
+            contents,
+        })
+    }
+}
+
+impl Drop for RestoreFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.contents);
     }
 }
 
