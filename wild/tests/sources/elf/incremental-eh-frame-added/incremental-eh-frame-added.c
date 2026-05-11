@@ -1,5 +1,6 @@
 //#Config:incremental-eh-frame-added
 //#Object:incremental-eh-frame-added-unchanged.c
+//#LinkArgs:--eh-frame-hdr --no-gc-sections
 //#RunEnabled:false
 //#DiffEnabled:false
 //#TestIncremental:true
