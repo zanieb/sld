@@ -102,10 +102,21 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let args = self.0;
         let common = args.common.incremental_link_options();
+        let mut dylib_symbol_ordinals = args.dylib_symbol_ordinals.iter().collect::<Vec<_>>();
+        dylib_symbol_ordinals.sort_by(|(left, _), (right, _)| left.cmp(right));
         f.debug_struct("MachOArgs")
             .field("common", &common)
             .field("output", &args.output)
+            .field("lib_search_path", &args.lib_search_path)
+            .field("extra_dylib_paths", &args.extra_dylib_paths)
+            .field("dylib_symbol_ordinals", &dylib_symbol_ordinals)
+            .field("sysroot", &args.sysroot)
             .field("relocation_model", &args.relocation_model)
+            .field("should_output_executable", &args.should_output_executable)
+            .field("is_dynamiclib", &args.is_dynamiclib)
+            .field("should_adhoc_codesign", &args.should_adhoc_codesign)
+            .field("dead_strip", &args.dead_strip)
+            .field("platform_version", &args.platform_version)
             .finish()
     }
 }
@@ -863,6 +874,69 @@ mod tests {
     }
 
     #[test]
+    fn incremental_link_options_include_macho_specific_options() {
+        let baseline = incremental_link_options_after(|_| {});
+
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.lib_search_path
+                    .push(PathBuf::from("/wild/lib").into_boxed_path());
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.extra_dylib_paths
+                    .push(b"/usr/lib/libz.1.dylib".to_vec());
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.dylib_symbol_ordinals
+                    .insert(b"_zlibVersion".to_vec(), 2);
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.sysroot = Some(PathBuf::from("/wild/SDK"));
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.should_output_executable = false;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.is_dynamiclib = true;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.should_adhoc_codesign = !args.should_adhoc_codesign;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.dead_strip = true;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.platform_version.minimum_os = encode_macho_version(13, 0, 0);
+            })
+        );
+    }
+
+    #[test]
     fn direct_dylib_input_records_export_ordinals() {
         let bytes = synthetic_dylib_with_symbol(b"_wild_exported_symbol");
         let metadata = direct_dylib_metadata_from_macho_bytes(&bytes).unwrap();
@@ -890,6 +964,12 @@ mod tests {
     fn assert_one_export(metadata: DirectDylibMetadata, symbol_name: &[u8]) {
         assert_eq!(metadata.exported_symbols.len(), 1);
         assert!(metadata.exported_symbols.contains(symbol_name));
+    }
+
+    fn incremental_link_options_after(mutate: impl FnOnce(&mut MachOArgs)) -> String {
+        let mut args = MachOArgs::default();
+        mutate(&mut args);
+        args.incremental_link_options()
     }
 
     fn synthetic_dylib_with_symbol(symbol_name: &[u8]) -> Vec<u8> {
