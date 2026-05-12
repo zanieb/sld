@@ -2996,6 +2996,14 @@ impl PersistedState {
                 relocation.input_file.as_str(),
                 relocation.input.as_str(),
             );
+            if let Some(target) = &relocation.target {
+                add_section_input(
+                    &mut section_inputs,
+                    &mut section_input_ids,
+                    target.input_file.as_str(),
+                    target.input.as_str(),
+                );
+            }
         }
         for fde in &self.fdes {
             add_section_input(
@@ -3033,27 +3041,25 @@ impl PersistedState {
         for relocation in &self.relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-            let (target_input_file, target_input, target_section_index, target_section_offset) =
-                relocation
-                    .target
-                    .as_ref()
-                    .map(|target| {
-                        (
-                            target.input_file.as_str(),
-                            target.input.as_str(),
-                            target.section_index.to_string(),
-                            target.section_offset.to_string(),
-                        )
-                    })
-                    .unwrap_or((
-                        ABSENT_FIELD,
-                        ABSENT_FIELD,
-                        ABSENT_FIELD.to_owned(),
-                        ABSENT_FIELD.to_owned(),
-                    ));
+            let (target_section_input_id, target_section_index, target_section_offset) = relocation
+                .target
+                .as_ref()
+                .map(|target| {
+                    (
+                        section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
+                            .to_string(),
+                        target.section_index.to_string(),
+                        target.section_offset.to_string(),
+                    )
+                })
+                .unwrap_or((
+                    ABSENT_FIELD.to_owned(),
+                    ABSENT_FIELD.to_owned(),
+                    ABSENT_FIELD.to_owned(),
+                ));
             writeln!(
                 &mut out,
-                "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "reloc2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
                 relocation.target_symbol_id,
@@ -3068,8 +3074,7 @@ impl PersistedState {
                     .unwrap_or_else(|| ABSENT_FIELD.to_owned()),
                 relocation.target_value,
                 relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
-                target_input_file,
-                target_input,
+                target_section_input_id,
                 target_section_index,
                 target_section_offset
             )?;
@@ -3124,7 +3129,7 @@ impl PersistedState {
 }
 
 struct SectionSidecarWriter {
-    file: std::fs::File,
+    file: std::io::BufWriter<std::fs::File>,
     hasher: blake3::Hasher,
     error: Option<std::io::Error>,
 }
@@ -3132,7 +3137,7 @@ struct SectionSidecarWriter {
 impl SectionSidecarWriter {
     fn new(file: std::fs::File) -> Self {
         Self {
-            file,
+            file: std::io::BufWriter::new(file),
             hasher: blake3::Hasher::new(),
             error: None,
         }
@@ -7924,6 +7929,26 @@ fn compact_relocation_record_matches_input(
     section_inputs: &[(String, String)],
     input_files: &HashSet<String>,
 ) -> Result<bool> {
+    if line.starts_with("reloc2\t") {
+        let rest = parse_prefixed_line(Some(line), "reloc2")?;
+        if compact_record_matches_input(line, "reloc2", section_inputs, input_files)? {
+            return Ok(true);
+        }
+        let parts = rest.split('\t').collect::<Vec<_>>();
+        if parts.len() != 14 || parts[11] == ABSENT_FIELD {
+            return Ok(false);
+        }
+        let target_section_input_id: usize = parts[11]
+            .parse()
+            .context("Invalid incremental relocation target input index")?;
+        let Some((target_input_file, _)) = section_inputs.get(target_section_input_id) else {
+            return Err(crate::error!(
+                "Incremental relocation target input index out of bounds"
+            ));
+        };
+        return Ok(input_files.contains(target_input_file));
+    }
+
     if compact_record_matches_input(line, "reloc", section_inputs, input_files)? {
         return Ok(true);
     }
@@ -8199,7 +8224,11 @@ fn parse_compact_relocation_line(
     line: &str,
     section_inputs: &[(String, String)],
 ) -> Result<RelocationRecord> {
-    let rest = parse_prefixed_line(Some(line), "reloc")?;
+    let (is_compact_target, rest) = if line.starts_with("reloc2\t") {
+        (true, parse_prefixed_line(Some(line), "reloc2")?)
+    } else {
+        (false, parse_prefixed_line(Some(line), "reloc")?)
+    };
     let parts = rest.split('\t').collect::<Vec<_>>();
     let section_input_id: usize = parts
         .first()
@@ -8249,73 +8278,114 @@ fn parse_compact_relocation_line(
         .context("Malformed incremental relocation addend")?
         .parse()
         .context("Invalid incremental relocation addend")?;
-    let (written_value, target_value, target_name, target) = match parts.len() {
-        8 => (None, 0, None, None),
-        10 => {
-            let target_value = parts[8]
-                .parse()
-                .context("Invalid incremental relocation target value")?;
-            let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
-            (None, target_value, target_name, None)
+    let (written_value, target_value, target_name, target) = if is_compact_target {
+        if parts.len() != 14 {
+            return Err(crate::error!("Malformed incremental relocation record"));
         }
-        14 => {
-            let target_value = parts[8]
+        let written_value = (parts[8] != ABSENT_FIELD)
+            .then(|| {
+                parts[8]
+                    .parse()
+                    .context("Invalid incremental written relocation value")
+            })
+            .transpose()?;
+        let target_value = parts[9]
+            .parse()
+            .context("Invalid incremental relocation target value")?;
+        let target_name = (parts[10] != ABSENT_FIELD).then(|| parts[10].to_owned());
+        let target = if parts[11] == ABSENT_FIELD
+            && parts[12] == ABSENT_FIELD
+            && parts[13] == ABSENT_FIELD
+        {
+            None
+        } else {
+            let target_section_input_id: usize = parts[11]
                 .parse()
-                .context("Invalid incremental relocation target value")?;
-            let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
-            let target = if parts[10] == ABSENT_FIELD
-                && parts[11] == ABSENT_FIELD
-                && parts[12] == ABSENT_FIELD
-                && parts[13] == ABSENT_FIELD
-            {
-                None
-            } else {
-                Some(RelocationTargetRecord {
-                    input_file: parts[10].to_owned(),
-                    input: parts[11].to_owned(),
-                    section_index: parts[12]
-                        .parse()
-                        .context("Invalid incremental relocation target section index")?,
-                    section_offset: parts[13]
-                        .parse()
-                        .context("Invalid incremental relocation target section offset")?,
-                })
-            };
-            (None, target_value, target_name, target)
+                .context("Invalid incremental relocation target input index")?;
+            let (target_input_file, target_input) = section_inputs
+                .get(target_section_input_id)
+                .context("Incremental relocation target input index out of bounds")?;
+            Some(RelocationTargetRecord {
+                input_file: target_input_file.clone(),
+                input: target_input.clone(),
+                section_index: parts[12]
+                    .parse()
+                    .context("Invalid incremental relocation target section index")?,
+                section_offset: parts[13]
+                    .parse()
+                    .context("Invalid incremental relocation target section offset")?,
+            })
+        };
+        (written_value, target_value, target_name, target)
+    } else {
+        match parts.len() {
+            8 => (None, 0, None, None),
+            10 => {
+                let target_value = parts[8]
+                    .parse()
+                    .context("Invalid incremental relocation target value")?;
+                let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
+                (None, target_value, target_name, None)
+            }
+            14 => {
+                let target_value = parts[8]
+                    .parse()
+                    .context("Invalid incremental relocation target value")?;
+                let target_name = (parts[9] != ABSENT_FIELD).then(|| parts[9].to_owned());
+                let target = if parts[10] == ABSENT_FIELD
+                    && parts[11] == ABSENT_FIELD
+                    && parts[12] == ABSENT_FIELD
+                    && parts[13] == ABSENT_FIELD
+                {
+                    None
+                } else {
+                    Some(RelocationTargetRecord {
+                        input_file: parts[10].to_owned(),
+                        input: parts[11].to_owned(),
+                        section_index: parts[12]
+                            .parse()
+                            .context("Invalid incremental relocation target section index")?,
+                        section_offset: parts[13]
+                            .parse()
+                            .context("Invalid incremental relocation target section offset")?,
+                    })
+                };
+                (None, target_value, target_name, target)
+            }
+            15 => {
+                let written_value = (parts[8] != ABSENT_FIELD)
+                    .then(|| {
+                        parts[8]
+                            .parse()
+                            .context("Invalid incremental written relocation value")
+                    })
+                    .transpose()?;
+                let target_value = parts[9]
+                    .parse()
+                    .context("Invalid incremental relocation target value")?;
+                let target_name = (parts[10] != ABSENT_FIELD).then(|| parts[10].to_owned());
+                let target = if parts[11] == ABSENT_FIELD
+                    && parts[12] == ABSENT_FIELD
+                    && parts[13] == ABSENT_FIELD
+                    && parts[14] == ABSENT_FIELD
+                {
+                    None
+                } else {
+                    Some(RelocationTargetRecord {
+                        input_file: parts[11].to_owned(),
+                        input: parts[12].to_owned(),
+                        section_index: parts[13]
+                            .parse()
+                            .context("Invalid incremental relocation target section index")?,
+                        section_offset: parts[14]
+                            .parse()
+                            .context("Invalid incremental relocation target section offset")?,
+                    })
+                };
+                (written_value, target_value, target_name, target)
+            }
+            _ => return Err(crate::error!("Malformed incremental relocation record")),
         }
-        15 => {
-            let written_value = (parts[8] != ABSENT_FIELD)
-                .then(|| {
-                    parts[8]
-                        .parse()
-                        .context("Invalid incremental written relocation value")
-                })
-                .transpose()?;
-            let target_value = parts[9]
-                .parse()
-                .context("Invalid incremental relocation target value")?;
-            let target_name = (parts[10] != ABSENT_FIELD).then(|| parts[10].to_owned());
-            let target = if parts[11] == ABSENT_FIELD
-                && parts[12] == ABSENT_FIELD
-                && parts[13] == ABSENT_FIELD
-                && parts[14] == ABSENT_FIELD
-            {
-                None
-            } else {
-                Some(RelocationTargetRecord {
-                    input_file: parts[11].to_owned(),
-                    input: parts[12].to_owned(),
-                    section_index: parts[13]
-                        .parse()
-                        .context("Invalid incremental relocation target section index")?,
-                    section_offset: parts[14]
-                        .parse()
-                        .context("Invalid incremental relocation target section offset")?,
-                })
-            };
-            (written_value, target_value, target_name, target)
-        }
-        _ => return Err(crate::error!("Malformed incremental relocation record")),
     };
     let (input_file, input) = section_inputs
         .get(section_input_id)
@@ -9122,18 +9192,56 @@ mod tests {
         }
     }
 
-    fn drop_written_relocation_value_from_line(line: &str) -> String {
-        if let Some(rest) = line.strip_prefix("reloc\t") {
-            let fields = rest
-                .split('\t')
-                .enumerate()
-                .filter_map(|(index, field)| (index != 8).then_some(field))
-                .collect::<Vec<_>>()
-                .join("\t");
-            format!("reloc\t{fields}")
-        } else {
-            line.to_owned()
-        }
+    fn current_relocation_as_v25_line(line: &str) -> String {
+        let Some(rest) = line.strip_prefix("reloc2\t") else {
+            return line.to_owned();
+        };
+        let fields = rest.split('\t').collect::<Vec<_>>();
+        format!(
+            "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5],
+            fields[6],
+            fields[7],
+            fields[9],
+            fields[10],
+            hex::encode("a.o"),
+            hex::encode("a.o"),
+            fields[12],
+            fields[13],
+        )
+    }
+
+    fn current_relocation_as_v24_line(line: &str) -> String {
+        let Some(rest) = line.strip_prefix("reloc2\t") else {
+            return line.to_owned();
+        };
+        let fields = rest.split('\t').collect::<Vec<_>>();
+        format!(
+            "reloc\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5],
+            fields[6],
+            fields[7],
+            fields[9],
+            fields[10],
+        )
+    }
+
+    fn current_relocation_as_v23_line(line: &str) -> String {
+        let Some(rest) = line.strip_prefix("reloc2\t") else {
+            return line.to_owned();
+        };
+        let fields = rest.split('\t').take(8).collect::<Vec<_>>().join("\t");
+        format!("reloc\t{fields}")
     }
 
     fn section_reference(source_section_name: &str, relocation_offset: u64) -> SectionReference {
@@ -11838,7 +11946,7 @@ mod tests {
 
         assert!(rendered.contains("\nrelocs\t1\n"));
         assert!(rendered.contains(
-            "\nreloc\t0\t1\t42\t8\t300\t8\t1\t-4\t22136\t4660\t746172676574\t612e6f\t612e6f\t2\t16\n"
+            "\nreloc2\t0\t1\t42\t8\t300\t8\t1\t-4\t22136\t4660\t746172676574\t0\t2\t16\n"
         ));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
@@ -11864,7 +11972,7 @@ mod tests {
             .render()
             .replacen(STATE_VERSION, STATE_VERSION_V25, 1)
             .lines()
-            .map(drop_written_relocation_value_from_line)
+            .map(current_relocation_as_v25_line)
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
@@ -11911,19 +12019,7 @@ mod tests {
             .render()
             .replacen(STATE_VERSION, STATE_VERSION_V24, 1)
             .lines()
-            .map(|line| {
-                if let Some(rest) = line.strip_prefix("reloc\t") {
-                    let fields = rest
-                        .split('\t')
-                        .enumerate()
-                        .filter_map(|(index, field)| (index != 8 && index < 11).then_some(field))
-                        .collect::<Vec<_>>()
-                        .join("\t");
-                    format!("reloc\t{fields}")
-                } else {
-                    line.to_owned()
-                }
-            })
+            .map(current_relocation_as_v24_line)
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
@@ -11962,14 +12058,7 @@ mod tests {
             .render()
             .replacen(STATE_VERSION, STATE_VERSION_V23, 1)
             .lines()
-            .map(|line| {
-                if let Some(rest) = line.strip_prefix("reloc\t") {
-                    let fields = rest.split('\t').take(8).collect::<Vec<_>>().join("\t");
-                    format!("reloc\t{fields}")
-                } else {
-                    line.to_owned()
-                }
-            })
+            .map(current_relocation_as_v23_line)
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
@@ -12034,7 +12123,11 @@ mod tests {
             .render()
             .replacen(STATE_VERSION, STATE_VERSION_V22, 1)
             .lines()
-            .filter(|line| !line.starts_with("relocs\t") && !line.starts_with("reloc\t"))
+            .filter(|line| {
+                !line.starts_with("relocs\t")
+                    && !line.starts_with("reloc\t")
+                    && !line.starts_with("reloc2\t")
+            })
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
