@@ -15,6 +15,7 @@ use crate::args::VersionMode;
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
+use crate::macho::DylibLoadKind;
 use crate::platform;
 use crate::platform::Args as _;
 use crate::platform::Symbol as _;
@@ -45,6 +46,7 @@ pub struct MachOArgs {
     pub(crate) output: Arc<Path>,
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) extra_dylib_paths: Vec<Vec<u8>>,
+    pub(crate) weak_dylib_paths: BTreeSet<Vec<u8>>,
     pub(crate) dylib_symbol_ordinals: HashMap<Vec<u8>, u8>,
     pub(crate) install_name: Option<Vec<u8>>,
     pub(crate) sysroot: Option<PathBuf>,
@@ -84,6 +86,7 @@ impl Default for MachOArgs {
             output: Arc::from(Path::new("a.out")),
             lib_search_path: Vec::new(),
             extra_dylib_paths: Vec::new(),
+            weak_dylib_paths: BTreeSet::new(),
             dylib_symbol_ordinals: HashMap::new(),
             install_name: None,
             sysroot: None,
@@ -111,6 +114,7 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
             .field("output", &args.output)
             .field("lib_search_path", &args.lib_search_path)
             .field("extra_dylib_paths", &args.extra_dylib_paths)
+            .field("weak_dylib_paths", &args.weak_dylib_paths)
             .field("dylib_symbol_ordinals", &dylib_symbol_ordinals)
             .field("install_name", &args.install_name)
             .field("sysroot", &args.sysroot)
@@ -203,23 +207,29 @@ impl platform::Args for MachOArgs {
 }
 
 impl MachOArgs {
-    fn add_dylib_path(&mut self, path: impl Into<Vec<u8>>) -> Result<u8> {
+    fn add_dylib_path(&mut self, path: impl Into<Vec<u8>>, kind: DylibLoadKind) -> Result<u8> {
         let path = path.into();
         let index = if let Some(index) = self
             .extra_dylib_paths
             .iter()
             .position(|existing| existing == &path)
         {
+            if matches!(kind, DylibLoadKind::Regular) {
+                self.weak_dylib_paths.remove(&path);
+            }
             index
         } else {
+            if matches!(kind, DylibLoadKind::Weak) {
+                self.weak_dylib_paths.insert(path.clone());
+            }
             self.extra_dylib_paths.push(path);
             self.extra_dylib_paths.len() - 1
         };
         u8::try_from(index + 2).context("Mach-O dylib ordinal exceeds u8")
     }
 
-    fn add_framework(&mut self, framework: &str) -> Result {
-        self.add_dylib_path(framework_dylib_path(framework))?;
+    fn add_framework(&mut self, framework: &str, kind: DylibLoadKind) -> Result {
+        self.add_dylib_path(framework_dylib_path(framework), kind)?;
         Ok(())
     }
 
@@ -227,16 +237,19 @@ impl MachOArgs {
         match library {
             "System" | "c" | "m" => {}
             "objc" => {
-                self.add_dylib_path(b"/usr/lib/libobjc.A.dylib".to_vec())?;
+                self.add_dylib_path(b"/usr/lib/libobjc.A.dylib".to_vec(), DylibLoadKind::Regular)?;
             }
             "iconv" => {
-                self.add_dylib_path(b"/usr/lib/libiconv.2.dylib".to_vec())?;
+                self.add_dylib_path(
+                    b"/usr/lib/libiconv.2.dylib".to_vec(),
+                    DylibLoadKind::Regular,
+                )?;
             }
             "c++" => {
-                self.add_dylib_path(b"/usr/lib/libc++.1.dylib".to_vec())?;
+                self.add_dylib_path(b"/usr/lib/libc++.1.dylib".to_vec(), DylibLoadKind::Regular)?;
             }
             "z" => {
-                self.add_dylib_path(b"/usr/lib/libz.1.dylib".to_vec())?;
+                self.add_dylib_path(b"/usr/lib/libz.1.dylib".to_vec(), DylibLoadKind::Regular)?;
             }
             _ => {
                 self.warn_unsupported(&format!("-l{library}"))?;
@@ -252,7 +265,7 @@ impl MachOArgs {
         // Use the path that rustc/clang passed to us as the load command. Most dylibs also carry
         // an install name, but direct Rust dylib inputs often use @rpath install names and rely on
         // the driver environment to make the original path available at runtime.
-        let ordinal = self.add_dylib_path(path.as_bytes().to_vec())?;
+        let ordinal = self.add_dylib_path(path.as_bytes().to_vec(), DylibLoadKind::Regular)?;
 
         for symbol_name in metadata.exported_symbols {
             self.dylib_symbol_ordinals
@@ -611,14 +624,14 @@ fn handle_ld64_multi_arg<S: AsRef<str>, I: Iterator<Item = S>>(
         }
         "-framework" | "--framework" => {
             let framework = input.next().context("-framework requires an argument")?;
-            args.add_framework(framework.as_ref())?;
+            args.add_framework(framework.as_ref(), DylibLoadKind::Regular)?;
             Ok(true)
         }
         "-weak_framework" | "--weak_framework" => {
             let framework = input
                 .next()
                 .context("-weak_framework requires an argument")?;
-            args.add_framework(framework.as_ref())?;
+            args.add_framework(framework.as_ref(), DylibLoadKind::Weak)?;
             Ok(true)
         }
         "-dynamiclib" | "--dynamiclib" | "-dylib" | "--dylib" => {
@@ -658,13 +671,13 @@ fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
                 let framework = values
                     .next()
                     .context("-Wl,-framework requires an argument")?;
-                args.add_framework(framework)?;
+                args.add_framework(framework, DylibLoadKind::Regular)?;
             }
             "-weak_framework" => {
                 let framework = values
                     .next()
                     .context("-Wl,-weak_framework requires an argument")?;
-                args.add_framework(framework)?;
+                args.add_framework(framework, DylibLoadKind::Weak)?;
             }
             "-install_name" => {
                 let value = values
@@ -883,6 +896,36 @@ mod tests {
     }
 
     #[test]
+    fn weak_framework_records_weak_load_command() {
+        let mut args = MachOArgs::default();
+
+        parse(&mut args, ["-weak_framework", "Foundation"].into_iter()).unwrap();
+
+        let foundation = framework_dylib_path("Foundation");
+        assert!(args.extra_dylib_paths.contains(&foundation));
+        assert!(args.weak_dylib_paths.contains(&foundation));
+        let commands = crate::macho::load_dylib_commands(&args).collect::<Vec<_>>();
+        assert_eq!(commands[0].kind, DylibLoadKind::Regular);
+        assert_eq!(commands[1].path, foundation.as_slice());
+        assert_eq!(commands[1].kind, DylibLoadKind::Weak);
+    }
+
+    #[test]
+    fn regular_framework_overrides_weak_framework() {
+        let mut args = MachOArgs::default();
+
+        parse(
+            &mut args,
+            ["-weak_framework", "Foundation", "-framework", "Foundation"].into_iter(),
+        )
+        .unwrap();
+
+        let foundation = framework_dylib_path("Foundation");
+        assert!(args.extra_dylib_paths.contains(&foundation));
+        assert!(!args.weak_dylib_paths.contains(&foundation));
+    }
+
+    #[test]
     fn non_incremental_links_unlink_existing_outputs_by_default() {
         let mut args = MachOArgs::default();
         args.common.incremental = false;
@@ -934,6 +977,13 @@ mod tests {
             incremental_link_options_after(|args| {
                 args.extra_dylib_paths
                     .push(b"/usr/lib/libz.1.dylib".to_vec());
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.weak_dylib_paths
+                    .insert(b"/System/Library/Frameworks/Foundation.framework/Foundation".to_vec());
             })
         );
         assert_ne!(

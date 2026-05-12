@@ -119,8 +119,36 @@ pub(crate) fn macho_unwind_info_allocation_size(entry_count: usize) -> u64 {
         + second_level_pages_size) as u64
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum DylibLoadKind {
+    Regular,
+    Weak,
+}
+
+pub(crate) struct DylibLoadCommand<'a> {
+    pub(crate) path: &'a [u8],
+    pub(crate) kind: DylibLoadKind,
+}
+
+pub(crate) fn load_dylib_commands<'a>(
+    args: &'a MachOArgs,
+) -> impl Iterator<Item = DylibLoadCommand<'a>> + 'a {
+    std::iter::once(DylibLoadCommand {
+        path: LIBSYSTEM_PATH,
+        kind: DylibLoadKind::Regular,
+    })
+    .chain(args.extra_dylib_paths.iter().map(|path| DylibLoadCommand {
+        path: path.as_slice(),
+        kind: if args.weak_dylib_paths.contains(path) {
+            DylibLoadKind::Weak
+        } else {
+            DylibLoadKind::Regular
+        },
+    }))
+}
+
 pub(crate) fn load_dylib_paths<'a>(args: &'a MachOArgs) -> impl Iterator<Item = &'a [u8]> + 'a {
-    std::iter::once(LIBSYSTEM_PATH).chain(args.extra_dylib_paths.iter().map(Vec::as_slice))
+    load_dylib_commands(args).map(|command| command.path)
 }
 
 pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
@@ -128,11 +156,13 @@ pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
 }
 
 pub(crate) fn load_dylib_commands_size(args: &MachOArgs) -> usize {
-    load_dylib_paths(args).map(load_dylib_command_size).sum()
+    load_dylib_commands(args)
+        .map(|command| load_dylib_command_size(command.path))
+        .sum()
 }
 
 pub(crate) fn load_dylib_command_count(args: &MachOArgs) -> usize {
-    load_dylib_paths(args).count()
+    load_dylib_commands(args).count()
 }
 
 pub(crate) fn id_dylib_path(args: &MachOArgs) -> &[u8] {
