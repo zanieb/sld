@@ -41,6 +41,7 @@ use crate::macho::DEFAULT_SEGMENT_COUNT;
 use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
 use crate::macho::DylibCommand;
+use crate::macho::DylibLoadKind;
 use crate::macho::DylinkerCommand;
 use crate::macho::EntryPointCommand;
 use crate::macho::FileHeader;
@@ -62,6 +63,7 @@ use crate::macho::id_dylib_command_size;
 use crate::macho::id_dylib_path;
 use crate::macho::load_dylib_command_count;
 use crate::macho::load_dylib_command_size;
+use crate::macho::load_dylib_commands;
 use crate::macho::load_dylib_paths;
 use crate::output_section_id;
 use crate::output_section_id::SectionName;
@@ -99,6 +101,7 @@ use object::macho::LC_DYLD_CHAINED_FIXUPS;
 use object::macho::LC_ID_DYLIB;
 use object::macho::LC_LOAD_DYLIB;
 use object::macho::LC_LOAD_DYLINKER;
+use object::macho::LC_LOAD_WEAK_DYLIB;
 use object::macho::LC_MAIN;
 use object::macho::LC_SEGMENT_64;
 use object::macho::LC_SYMTAB;
@@ -2482,8 +2485,8 @@ fn write_uuid_command(command: &mut UuidCommand) {
 
 fn write_load_dylib_commands(layout: &MachOLayout, buffer: &mut [u8]) -> Result {
     let mut offset = 0;
-    for path in load_dylib_paths(layout.args()) {
-        let command_size = load_dylib_command_size(path);
+    for dylib in load_dylib_commands(layout.args()) {
+        let command_size = load_dylib_command_size(dylib.path);
         ensure!(
             offset + command_size <= buffer.len(),
             "Invalid LC_LOAD_DYLIB allocation. Need at least {} bytes, got {}",
@@ -2493,7 +2496,7 @@ fn write_load_dylib_commands(layout: &MachOLayout, buffer: &mut [u8]) -> Result 
         let command_buffer = &mut buffer[offset..offset + command_size];
         let (command, path_buffer): (&mut DylibCommand, &mut [u8]) = from_bytes_mut(command_buffer)
             .map_err(|_| error!("Invalid LC_LOAD_DYLIB command allocation"))?;
-        write_load_dylib_command(command, path_buffer, path);
+        write_load_dylib_command(command, path_buffer, dylib.path, dylib.kind);
         offset += command_size;
     }
     ensure!(
@@ -2505,8 +2508,17 @@ fn write_load_dylib_commands(layout: &MachOLayout, buffer: &mut [u8]) -> Result 
     Ok(())
 }
 
-fn write_load_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], path: &[u8]) {
-    command.cmd.set(LE, LC_LOAD_DYLIB);
+fn write_load_dylib_command(
+    command: &mut DylibCommand,
+    path_buffer: &mut [u8],
+    path: &[u8],
+    kind: DylibLoadKind,
+) {
+    let command_id = match kind {
+        DylibLoadKind::Regular => LC_LOAD_DYLIB,
+        DylibLoadKind::Weak => LC_LOAD_WEAK_DYLIB,
+    };
+    command.cmd.set(LE, command_id);
     command
         .cmdsize
         .set(LE, load_dylib_command_size(path) as u32);
