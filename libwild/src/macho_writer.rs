@@ -2397,7 +2397,7 @@ fn get_resolution<'data>(
     };
     let merged_resolution = layout.merged_symbol_resolution(local_symbol_id);
     let resolution = if sym.is_local() {
-        local_section_resolution().or(merged_resolution)
+        merged_resolution.or_else(local_section_resolution)
     } else if sym.is_hidden() {
         match merged_resolution {
             // Hidden/private externs with duplicate archive definitions should use the selected
