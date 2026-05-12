@@ -120,17 +120,15 @@ patched 1 changed input file before loading inputs
 patched 1 changed input sections before loading inputs
 ```
 
-## Apple Container Lessons
+## Apple Container Details
 
-Recent verification exposed a few operational pitfalls worth preserving:
+The practical Apple Container workflow for this style of measurement is collected in
+`context/testing-in-apple-containers.md`. The short version is:
 
-- Apple Container may default to a memory limit that is far too small for seed-link experiments.
-  A 1 GiB container can make a healthy run look like a SIGKILL regression.
-- Use an explicit memory budget for large Codex runs.
-- Do not reuse state with a changed command shape unless you intend to test fallback behavior.
-- Validate the log before trusting the metric.
-- A byte mutation outside patchable sections can turn the intended patch benchmark into a fallback
-  relink or metadata-only rejection.
+- set explicit memory budgets for large seed-link experiments,
+- keep seed and patch command shapes stable,
+- validate the incremental log before trusting the metric,
+- treat mutations outside patchable sections as fallback tests, not patch benchmarks.
 
 ## How To Interpret Results
 
