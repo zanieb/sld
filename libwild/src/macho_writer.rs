@@ -3044,10 +3044,8 @@ fn write_internal_symbols<'data>(
             | crate::parsing::SymbolPlacement::ForceUndefined => {
                 (0, macho_internal_symbol_type(def_info, N_UNDF))
             }
-            crate::parsing::SymbolPlacement::DefsymAbsolute(_) => {
-                (0, macho_internal_symbol_type(def_info, N_ABS))
-            }
-            crate::parsing::SymbolPlacement::DefsymSymbol(_, _) => {
+            crate::parsing::SymbolPlacement::DefsymAbsolute(_)
+            | crate::parsing::SymbolPlacement::Redirect(_) => {
                 (0, macho_internal_symbol_type(def_info, N_ABS))
             }
             crate::parsing::SymbolPlacement::SectionStart(section_id)
