@@ -68,8 +68,8 @@ cargo run -q -p benchmark-runner -- report \
 
 ## May 12, 2026 Evidence Snapshot
 
-The current saved-link performance data is useful because it shows both a success case and a real
-gap.
+The latest saved-link performance data is useful because it shows both the baseline linker picture
+and the payoff from the metadata-only incremental path.
 
 ### Full Wild vs Mold and GNU ld
 
@@ -77,33 +77,35 @@ For ordinary full links, Wild looked strong:
 
 | Project | GNU ld | Mold | Wild | Wild vs GNU ld | Wild vs Mold |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `ruff` | 5686.18 ms | 877.66 ms | 480.80 ms | 11.83x | 1.83x |
-| `ty` | 5804.23 ms | 699.16 ms | 466.62 ms | 12.44x | 1.50x |
-| `uv` | 10607.51 ms | 1268.19 ms | 822.95 ms | 12.89x | 1.54x |
+| `ruff` | 5536.59 ms | 706.35 ms | 457.36 ms | 12.11x | 1.54x |
+| `ty` | 5957.20 ms | 703.12 ms | 481.59 ms | 12.37x | 1.46x |
+| `uv` | 10857.09 ms | 1323.03 ms | 855.20 ms | 12.70x | 1.55x |
 
 Source artifact:
 
-- `/private/tmp/wild-benchmark-results/incremental-linux-final.bench-results`
+- `/private/tmp/wild-benchmark-results/incremental-linux-metadata-only.bench-results`
 
 ### Changed-Input Incremental Runs
 
-The current `ruff` / `ty` / `uv` changed-input measurements do **not** yet prove the desired win over
-full Wild:
+The metadata-only snapshot flips the changed-input story. The incremental patch path is now
+meaningfully faster than both full Wild and Mold on the checked-in `ruff` / `ty` / `uv` workloads:
 
 | Project | Incremental changed | Full Wild | Incremental vs full Wild | Incremental vs Mold |
 | --- | ---: | ---: | ---: | ---: |
-| `ruff` | 2002.74 ms | 480.80 ms | 0.24x | 0.44x |
-| `ty` | 1431.73 ms | 466.62 ms | 0.33x | 0.49x |
-| `uv` | 2449.74 ms | 822.95 ms | 0.34x | 0.52x |
+| `ruff` | 125.38 ms | 457.36 ms | 3.65x | 5.63x |
+| `ty` | 75.24 ms | 481.59 ms | 6.40x | 9.34x |
+| `uv` | 200.19 ms | 855.20 ms | 4.27x | 6.61x |
 
-That is not documentation noise. It is the performance hole to attack next.
+The `ruff` and `uv` confidence intervals are still wide enough that they deserve another repeated
+run before being promoted as stable headline numbers. The direction is nevertheless clear: reducing
+metadata hydration cost changed the outcome materially.
 
-The result says:
+That result says:
 
 - The benchmark harness is catching real changed-input incremental work.
-- The current patch bookkeeping can dominate the win on these projects.
-- Any future speedup claim should be rerun against these cases, not only against a friendlier
-  workload.
+- The metadata-heavy proof step was previously erasing the benefit.
+- Future work should continue to compare incremental changed relinks against full Wild, not only
+  against slower external linkers.
 
 ### Codex As A Positive Changed-Input Case
 
