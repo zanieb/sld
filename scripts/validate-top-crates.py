@@ -420,8 +420,6 @@ def env_for_run(args: argparse.Namespace, target_dir_name: str, use_wild: bool) 
     env["CARGO_TARGET_DIR"] = str((args.work_dir / target_dir_name).resolve())
     if use_wild:
         append_rustflags(env, wild_rustflags(args))
-    else:
-        env.pop("RUSTFLAGS", None)
     return env
 
 
