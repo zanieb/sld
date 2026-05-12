@@ -457,10 +457,14 @@ fn mode_needs_previous_sections(mode: &IncrementalMode) -> bool {
 }
 
 pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> Result<bool> {
-    if !args.common().incremental
-        || args.should_write_trace_file()
-        || args.common().save_dir.is_active()
-    {
+    if !args.common().incremental {
+        return Ok(false);
+    }
+
+    let state_dir = state_dir_for_output(args.output());
+    let current_link_start = write_link_start_marker(&state_dir)?;
+
+    if args.should_write_trace_file() || args.common().save_dir.is_active() {
         return Ok(false);
     }
     if args
@@ -472,8 +476,6 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
 
     timing_phase!("Check incremental fast path");
 
-    let state_dir = state_dir_for_output(args.output());
-    let current_link_start = write_link_start_marker(&state_dir)?;
     if let Some(reason) = interrupted_update_relink_reason(&state_dir) {
         append_log(
             &state_dir,
@@ -13581,6 +13583,21 @@ mod tests {
 
         assert!(reason.contains("input file changed while incremental fast path was running"));
         assert!(reason.contains("input.o"));
+    }
+
+    #[test]
+    fn preloading_check_records_link_start_before_depfile_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        args.dependency_file = Some(dir.path().join("out.d"));
+
+        assert!(!maybe_reuse_output_before_loading(&args).unwrap());
+
+        let state_dir = state_dir_for_output(&args.output);
+        assert!(link_start_marker_identity(&state_dir).is_some());
     }
 
     #[test]
