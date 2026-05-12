@@ -16,6 +16,8 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::Metadata;
 use std::fs::OpenOptions;
+use std::hash::Hash as _;
+use std::hash::Hasher as _;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -23,6 +25,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -74,6 +77,81 @@ const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const ABSENT_FIELD: &str = "-";
+const RECORD_TEXT_INTERNER_SHARDS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SharedText(Arc<str>);
+
+impl SharedText {
+    fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for SharedText {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<String> for SharedText {
+    fn from(value: String) -> Self {
+        Self(Arc::<str>::from(value))
+    }
+}
+
+impl From<&str> for SharedText {
+    fn from(value: &str) -> Self {
+        Self(Arc::<str>::from(value))
+    }
+}
+
+impl std::fmt::Display for SharedText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq<String> for SharedText {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<&str> for SharedText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+struct RecordTextInterner {
+    values: [Mutex<HashMap<String, SharedText>>; RECORD_TEXT_INTERNER_SHARDS],
+}
+
+impl Default for RecordTextInterner {
+    fn default() -> Self {
+        Self {
+            values: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl RecordTextInterner {
+    fn intern(&self, value: String) -> SharedText {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        let shard = hasher.finish() as usize % RECORD_TEXT_INTERNER_SHARDS;
+        let mut values = self.values[shard].lock().unwrap();
+        if let Some(existing) = values.get(value.as_str()) {
+            return existing.clone();
+        }
+        let shared = SharedText::from(value.clone());
+        values.insert(value, shared.clone());
+        shared
+    }
+}
 
 pub(crate) struct PreparedState {
     mode: IncrementalMode,
@@ -87,6 +165,7 @@ pub(crate) struct PreparedState {
     current_relocations: Mutex<Vec<RelocationRecord>>,
     current_fdes: Mutex<Vec<FdeRecord>>,
     current_dynamic_relocations: Mutex<Vec<DynamicRelocationRecord>>,
+    record_texts: RecordTextInterner,
     reused_sections: AtomicUsize,
 }
 
@@ -200,8 +279,8 @@ impl Eq for FileIdentity {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct SectionRecord {
-    input_file: String,
-    input: String,
+    input_file: SharedText,
+    input: SharedText,
     section_index: u32,
     output_offset: u64,
     size: u64,
@@ -214,8 +293,8 @@ pub(crate) struct RelocationRecord {
     target_value: u64,
     target_name: Option<String>,
     target: Option<RelocationTargetRecord>,
-    input_file: String,
-    input: String,
+    input_file: SharedText,
+    input: SharedText,
     section_index: u32,
     relocation_offset: u64,
     output_offset: u64,
@@ -226,16 +305,16 @@ pub(crate) struct RelocationRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationTargetRecord {
-    input_file: String,
-    input: String,
+    input_file: SharedText,
+    input: SharedText,
     section_index: u32,
     section_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct FdeRecord {
-    input_file: String,
-    input: String,
+    input_file: SharedText,
+    input: SharedText,
     section_index: u32,
     eh_frame_section_index: u32,
     input_offset: u64,
@@ -245,8 +324,8 @@ pub(crate) struct FdeRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DynamicRelocationRecord {
-    input_file: String,
-    input: String,
+    input_file: SharedText,
+    input: SharedText,
     section_index: u32,
     relocation_offset: u64,
     output_offset: u64,
@@ -280,6 +359,7 @@ pub(crate) fn maybe_prepare(
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         });
     }
@@ -360,6 +440,7 @@ pub(crate) fn maybe_prepare(
         current_relocations: Mutex::new(Vec::new()),
         current_fdes: Mutex::new(Vec::new()),
         current_dynamic_relocations: Mutex::new(Vec::new()),
+        record_texts: RecordTextInterner::default(),
         reused_sections: AtomicUsize::new(0),
     })
 }
@@ -1885,7 +1966,7 @@ fn update_section_record(record: &mut SectionRecord, current: &PatchSection) -> 
         return false;
     }
 
-    record.input = current.input.clone();
+    record.input = current.input.clone().into();
     record.section_index = current.section_index;
     record.output_offset = current.output_offset;
     record.size = current.output_size;
@@ -1923,6 +2004,13 @@ impl PreparedState {
         )
     }
 
+    fn intern_input_texts(&self, input: InputRef<'_>) -> (SharedText, SharedText) {
+        (
+            self.record_texts.intern(encode_path(&input.file.filename)),
+            self.record_texts.intern(encode_input_ref(input)),
+        )
+    }
+
     pub(crate) fn try_reuse_section(
         &self,
         input: InputRef<'_>,
@@ -1939,7 +2027,14 @@ impl PreparedState {
             return false;
         }
 
-        let record = SectionRecord::new(input, section_index, output_offset, size);
+        let (input_file, input_text) = self.intern_input_texts(input);
+        let record = SectionRecord::new_with_texts(
+            input_file,
+            input_text,
+            section_index,
+            output_offset,
+            size,
+        );
         self.current_sections.lock().unwrap().push(record.clone());
 
         if !allow_reuse {
@@ -1948,7 +2043,7 @@ impl PreparedState {
         if !self.can_reuse_unchanged_sections() {
             return false;
         }
-        if !self.reusable_inputs.contains(&record.input_file) {
+        if !self.reusable_inputs.contains(record.input_file.as_str()) {
             return false;
         }
         if !self.previous_sections.contains(&record) {
@@ -1981,14 +2076,19 @@ impl PreparedState {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
         }
-        self.current_fdes.lock().unwrap().push(FdeRecord::new(
-            input,
-            section_index,
-            eh_frame_section_index,
-            input_offset,
-            output_offset,
-            size,
-        ));
+        let (input_file, input_text) = self.intern_input_texts(input);
+        self.current_fdes
+            .lock()
+            .unwrap()
+            .push(FdeRecord::new_with_texts(
+                input_file,
+                input_text,
+                section_index,
+                eh_frame_section_index,
+                input_offset,
+                output_offset,
+                size,
+            ));
     }
 
     pub(crate) fn record_relocation(
@@ -2009,11 +2109,22 @@ impl PreparedState {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
         }
+        let (input_file, input_text) = self.intern_input_texts(input);
+        let target = target.map(|(target_input, target_section_index, section_offset)| {
+            let (target_input_file, target_input_text) = self.intern_input_texts(target_input);
+            (
+                target_input_file,
+                target_input_text,
+                target_section_index,
+                section_offset,
+            )
+        });
         self.current_relocations
             .lock()
             .unwrap()
-            .push(RelocationRecord::new(
-                input,
+            .push(RelocationRecord::new_with_texts(
+                input_file,
+                input_text,
                 section_index,
                 target_symbol_id,
                 relocation_offset,
@@ -2040,17 +2151,18 @@ impl PreparedState {
         if self.mode == IncrementalMode::Disabled || size == 0 {
             return;
         }
-        self.current_dynamic_relocations
-            .lock()
-            .unwrap()
-            .push(DynamicRelocationRecord::new(
-                input,
+        let (input_file, input_text) = self.intern_input_texts(input);
+        self.current_dynamic_relocations.lock().unwrap().push(
+            DynamicRelocationRecord::new_with_texts(
+                input_file,
+                input_text,
                 section_index,
                 relocation_offset,
                 output_offset,
                 size,
                 output_info,
-            ));
+            ),
+        );
     }
 
     pub(crate) fn finish(
@@ -3230,15 +3342,32 @@ impl PartialEq for FileContentState {
 }
 
 impl SectionRecord {
+    #[cfg(test)]
     fn new(
         input: InputRef<'_>,
         section_index: object::SectionIndex,
         output_offset: u64,
         size: u64,
     ) -> Self {
+        Self::new_with_texts(
+            encode_path(&input.file.filename).into(),
+            encode_input_ref(input).into(),
+            section_index,
+            output_offset,
+            size,
+        )
+    }
+
+    fn new_with_texts(
+        input_file: SharedText,
+        input: SharedText,
+        section_index: object::SectionIndex,
+        output_offset: u64,
+        size: u64,
+    ) -> Self {
         Self {
-            input_file: encode_path(&input.file.filename),
-            input: encode_input_ref(input),
+            input_file,
+            input,
             section_index: section_index.0 as u32,
             output_offset,
             size,
@@ -3247,6 +3376,7 @@ impl SectionRecord {
 }
 
 impl RelocationRecord {
+    #[cfg(test)]
     fn new(
         input: InputRef<'_>,
         section_index: object::SectionIndex,
@@ -3261,16 +3391,55 @@ impl RelocationRecord {
         target_name: Option<String>,
         target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
     ) -> Self {
+        Self::new_with_texts(
+            encode_path(&input.file.filename).into(),
+            encode_input_ref(input).into(),
+            section_index,
+            target_symbol_id,
+            relocation_offset,
+            output_offset,
+            size,
+            kind,
+            addend,
+            written_value,
+            target_value,
+            target_name,
+            target.map(|(target_input, target_section_index, section_offset)| {
+                (
+                    encode_path(&target_input.file.filename).into(),
+                    encode_input_ref(target_input).into(),
+                    target_section_index,
+                    section_offset,
+                )
+            }),
+        )
+    }
+
+    fn new_with_texts(
+        input_file: SharedText,
+        input: SharedText,
+        section_index: object::SectionIndex,
+        target_symbol_id: u32,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        kind: u32,
+        addend: i64,
+        written_value: u64,
+        target_value: u64,
+        target_name: Option<String>,
+        target: Option<(SharedText, SharedText, object::SectionIndex, u64)>,
+    ) -> Self {
         Self {
             target_symbol_id,
             written_value: Some(written_value),
             target_value,
             target_name,
-            target: target.map(|(input, section_index, section_offset)| {
-                RelocationTargetRecord::new(input, section_index, section_offset)
+            target: target.map(|(input_file, input, section_index, section_offset)| {
+                RelocationTargetRecord::new(input_file, input, section_index, section_offset)
             }),
-            input_file: encode_path(&input.file.filename),
-            input: encode_input_ref(input),
+            input_file,
+            input,
             section_index: section_index.0 as u32,
             relocation_offset,
             output_offset,
@@ -3282,10 +3451,15 @@ impl RelocationRecord {
 }
 
 impl RelocationTargetRecord {
-    fn new(input: InputRef<'_>, section_index: object::SectionIndex, section_offset: u64) -> Self {
+    fn new(
+        input_file: SharedText,
+        input: SharedText,
+        section_index: object::SectionIndex,
+        section_offset: u64,
+    ) -> Self {
         Self {
-            input_file: encode_path(&input.file.filename),
-            input: encode_input_ref(input),
+            input_file,
+            input,
             section_index: section_index.0 as u32,
             section_offset,
         }
@@ -3293,6 +3467,7 @@ impl RelocationTargetRecord {
 }
 
 impl FdeRecord {
+    #[cfg(test)]
     fn new(
         input: InputRef<'_>,
         section_index: object::SectionIndex,
@@ -3301,9 +3476,29 @@ impl FdeRecord {
         output_offset: u64,
         size: u64,
     ) -> Self {
+        Self::new_with_texts(
+            encode_path(&input.file.filename).into(),
+            encode_input_ref(input).into(),
+            section_index,
+            eh_frame_section_index,
+            input_offset,
+            output_offset,
+            size,
+        )
+    }
+
+    fn new_with_texts(
+        input_file: SharedText,
+        input: SharedText,
+        section_index: object::SectionIndex,
+        eh_frame_section_index: object::SectionIndex,
+        input_offset: u64,
+        output_offset: u64,
+        size: u64,
+    ) -> Self {
         Self {
-            input_file: encode_path(&input.file.filename),
-            input: encode_input_ref(input),
+            input_file,
+            input,
             section_index: section_index.0 as u32,
             eh_frame_section_index: eh_frame_section_index.0 as u32,
             input_offset,
@@ -3314,8 +3509,29 @@ impl FdeRecord {
 }
 
 impl DynamicRelocationRecord {
+    #[cfg(test)]
     fn new(
         input: InputRef<'_>,
+        section_index: object::SectionIndex,
+        relocation_offset: u64,
+        output_offset: u64,
+        size: u64,
+        output_info: Option<(u64, u64)>,
+    ) -> Self {
+        Self::new_with_texts(
+            encode_path(&input.file.filename).into(),
+            encode_input_ref(input).into(),
+            section_index,
+            relocation_offset,
+            output_offset,
+            size,
+            output_info,
+        )
+    }
+
+    fn new_with_texts(
+        input_file: SharedText,
+        input: SharedText,
         section_index: object::SectionIndex,
         relocation_offset: u64,
         output_offset: u64,
@@ -3326,8 +3542,8 @@ impl DynamicRelocationRecord {
             .map(|(r_offset, r_info)| (Some(r_offset), Some(r_info)))
             .unwrap_or((None, None));
         Self {
-            input_file: encode_path(&input.file.filename),
-            input: encode_input_ref(input),
+            input_file,
+            input,
             section_index: section_index.0 as u32,
             relocation_offset,
             output_offset,
@@ -3346,8 +3562,8 @@ impl DynamicRelocationRecord {
 
 fn generated_section_record(name: &str, output_offset: u64, size: u64) -> SectionRecord {
     SectionRecord {
-        input_file: GENERATED_SECTION_INPUT_FILE.to_owned(),
-        input: name.to_owned(),
+        input_file: GENERATED_SECTION_INPUT_FILE.into(),
+        input: name.into(),
         section_index: GENERATED_SECTION_INDEX,
         output_offset,
         size,
@@ -3553,13 +3769,13 @@ fn timestamp_on_or_after(sec: i64, _nsec: i64, lower_sec: i64, _lower_nsec: i64)
 }
 
 struct LazyOutputBytes<F> {
-    bytes: Option<Vec<u8>>,
+    bytes: Option<memmap2::Mmap>,
     load: Option<F>,
 }
 
 impl<F> LazyOutputBytes<F>
 where
-    F: FnOnce() -> Result<Vec<u8>>,
+    F: FnOnce() -> Result<memmap2::Mmap>,
 {
     fn new(load: F) -> Self {
         Self {
@@ -3580,10 +3796,16 @@ where
     }
 }
 
-fn read_output_bytes(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| {
+fn read_output_bytes(path: &Path) -> Result<memmap2::Mmap> {
+    let file = OpenOptions::new().read(true).open(path).with_context(|| {
         format!(
             "Failed to read output `{}` for incremental state",
+            path.display()
+        )
+    })?;
+    unsafe { MmapOptions::new().map(&file) }.with_context(|| {
+        format!(
+            "Failed to mmap output `{}` for incremental state",
             path.display()
         )
     })
@@ -3599,7 +3821,7 @@ fn record_patch_fingerprints<F>(
     output: &mut LazyOutputBytes<F>,
 ) -> Result
 where
-    F: FnOnce() -> Result<Vec<u8>>,
+    F: FnOnce() -> Result<memmap2::Mmap>,
 {
     let mut sections_by_file = HashMap::<&str, Vec<&SectionRecord>>::new();
     for section in sections {
@@ -3843,7 +4065,7 @@ fn direct_copy_patch_sections<'a>(
                 && padding.iter().all(|byte| *byte == 0)
             {
                 patch_sections.push(PatchSection {
-                    input: record.input.clone(),
+                    input: record.input.to_string(),
                     section_index: record.section_index,
                     section_name: patch_section_name_for_matching(&section),
                     input_size: data.len() as u64,
@@ -4748,8 +4970,8 @@ fn added_dynamic_relocation_patches_for_input(
             data[16..24].copy_from_slice(&entry.addend.to_le_bytes());
             patches.push(DynamicRelocationPatch {
                 record: DynamicRelocationRecord {
-                    input_file: input_file_path.to_owned(),
-                    input: input_file_path.to_owned(),
+                    input_file: input_file_path.to_owned().into(),
+                    input: input_file_path.to_owned().into(),
                     section_index: matched.current.section_index,
                     relocation_offset: entry.offset,
                     output_offset,
@@ -4830,7 +5052,7 @@ fn relocation_addend_patches_for_input(
     for (relocation_index, relocation) in relocations.iter().enumerate() {
         if relocation.input_file == input.path {
             relocations_by_input
-                .entry(relocation.input.clone())
+                .entry(relocation.input.to_string())
                 .or_default()
                 .push(relocation_index);
         }
@@ -6018,8 +6240,8 @@ fn fde_add_patches_for_output(
         pc_begin_range.copy_from_slice(&pc_begin.to_le_bytes());
 
         let record = FdeRecord {
-            input_file: candidate.input_file.clone(),
-            input: candidate.input.clone(),
+            input_file: candidate.input_file.clone().into(),
+            input: candidate.input.clone().into(),
             section_index: candidate.target_section_index,
             eh_frame_section_index: candidate.eh_frame_section_index,
             input_offset: candidate.input_offset,
@@ -8154,8 +8376,8 @@ fn parse_section_line(line: &str) -> Result<SectionRecord> {
         return Err(crate::error!("Malformed incremental section record"));
     }
     Ok(SectionRecord {
-        input_file,
-        input,
+        input_file: input_file.into(),
+        input: input.into(),
         section_index,
         output_offset,
         size,
@@ -8212,8 +8434,8 @@ fn parse_compact_section_line(
         .get(section_input_id)
         .context("Incremental section input index out of bounds")?;
     Ok(SectionRecord {
-        input_file: input_file.clone(),
-        input: input.clone(),
+        input_file: input_file.clone().into(),
+        input: input.clone().into(),
         section_index,
         output_offset,
         size,
@@ -8306,8 +8528,8 @@ fn parse_compact_relocation_line(
                 .get(target_section_input_id)
                 .context("Incremental relocation target input index out of bounds")?;
             Some(RelocationTargetRecord {
-                input_file: target_input_file.clone(),
-                input: target_input.clone(),
+                input_file: target_input_file.clone().into(),
+                input: target_input.clone().into(),
                 section_index: parts[12]
                     .parse()
                     .context("Invalid incremental relocation target section index")?,
@@ -8340,8 +8562,8 @@ fn parse_compact_relocation_line(
                     None
                 } else {
                     Some(RelocationTargetRecord {
-                        input_file: parts[10].to_owned(),
-                        input: parts[11].to_owned(),
+                        input_file: parts[10].to_owned().into(),
+                        input: parts[11].to_owned().into(),
                         section_index: parts[12]
                             .parse()
                             .context("Invalid incremental relocation target section index")?,
@@ -8372,8 +8594,8 @@ fn parse_compact_relocation_line(
                     None
                 } else {
                     Some(RelocationTargetRecord {
-                        input_file: parts[11].to_owned(),
-                        input: parts[12].to_owned(),
+                        input_file: parts[11].to_owned().into(),
+                        input: parts[12].to_owned().into(),
                         section_index: parts[13]
                             .parse()
                             .context("Invalid incremental relocation target section index")?,
@@ -8396,8 +8618,8 @@ fn parse_compact_relocation_line(
         target_value,
         target_name,
         target,
-        input_file: input_file.clone(),
-        input: input.clone(),
+        input_file: input_file.clone().into(),
+        input: input.clone().into(),
         section_index,
         relocation_offset,
         output_offset,
@@ -8447,8 +8669,8 @@ fn parse_compact_fde_line(line: &str, section_inputs: &[(String, String)]) -> Re
         .get(section_input_id)
         .context("Incremental FDE input index out of bounds")?;
     Ok(FdeRecord {
-        input_file: input_file.clone(),
-        input: input.clone(),
+        input_file: input_file.clone().into(),
+        input: input.clone().into(),
         section_index,
         eh_frame_section_index,
         input_offset,
@@ -8523,8 +8745,8 @@ fn parse_compact_dynamic_relocation_line(
         .get(section_input_id)
         .context("Incremental dynamic relocation input index out of bounds")?;
     Ok(DynamicRelocationRecord {
-        input_file: input_file.clone(),
-        input: input.clone(),
+        input_file: input_file.clone().into(),
+        input: input.clone().into(),
         section_index,
         relocation_offset,
         output_offset,
@@ -9092,8 +9314,8 @@ mod tests {
         size: u64,
     ) -> SectionRecord {
         SectionRecord {
-            input_file: hex::encode(input),
-            input: hex::encode(input),
+            input_file: hex::encode(input).into(),
+            input: hex::encode(input).into(),
             section_index,
             output_offset,
             size,
@@ -9109,8 +9331,8 @@ mod tests {
         size: u64,
     ) -> FdeRecord {
         FdeRecord {
-            input_file: hex::encode(input),
-            input: hex::encode(input),
+            input_file: hex::encode(input).into(),
+            input: hex::encode(input).into(),
             section_index,
             eh_frame_section_index,
             input_offset,
@@ -9127,8 +9349,8 @@ mod tests {
         size: u64,
     ) -> DynamicRelocationRecord {
         DynamicRelocationRecord {
-            input_file: hex::encode(input),
-            input: hex::encode(input),
+            input_file: hex::encode(input).into(),
+            input: hex::encode(input).into(),
             section_index,
             relocation_offset,
             output_offset,
@@ -9175,14 +9397,14 @@ mod tests {
             target_name: target_name.map(hex::encode),
             target: target.map(
                 |(input, section_index, section_offset)| RelocationTargetRecord {
-                    input_file: hex::encode(input),
-                    input: hex::encode(input),
+                    input_file: hex::encode(input).into(),
+                    input: hex::encode(input).into(),
                     section_index,
                     section_offset,
                 },
             ),
-            input_file: hex::encode(input),
-            input: hex::encode(input),
+            input_file: hex::encode(input).into(),
+            input: hex::encode(input).into(),
             section_index,
             relocation_offset,
             output_offset,
@@ -9807,15 +10029,15 @@ mod tests {
         let unrelated_input = hex::encode("other.o");
         let mut records = vec![
             SectionRecord {
-                input_file: input_file.clone(),
-                input: input_ref.clone(),
+                input_file: input_file.clone().into(),
+                input: input_ref.clone().into(),
                 section_index: 3,
                 output_offset: 64,
                 size: 16,
             },
             SectionRecord {
-                input_file: unrelated_input,
-                input: input_ref.clone(),
+                input_file: unrelated_input.into(),
+                input: input_ref.clone().into(),
                 section_index: 3,
                 output_offset: 64,
                 size: 16,
@@ -11990,8 +12212,8 @@ mod tests {
         assert_eq!(
             parsed.relocations[0].target,
             Some(RelocationTargetRecord {
-                input_file: hex::encode("a.o"),
-                input: hex::encode("a.o"),
+                input_file: hex::encode("a.o").into(),
+                input: hex::encode("a.o").into(),
                 section_index: 2,
                 section_offset: 16,
             })
@@ -12736,6 +12958,15 @@ mod tests {
         assert!(rendered.contains("\nsection\t0\t1\t100\t12\n"));
         assert!(rendered.contains("\nsection\t0\t2\t112\t8\n"));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn record_text_interner_reuses_allocations() {
+        let interner = RecordTextInterner::default();
+        let first = interner.intern("same-input".to_owned());
+        let second = interner.intern("same-input".to_owned());
+
+        assert!(Arc::ptr_eq(&first.0, &second.0));
     }
 
     #[test]
@@ -13868,6 +14099,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -13908,6 +14140,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -13940,6 +14173,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -13987,6 +14221,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -14051,6 +14286,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
@@ -14133,6 +14369,7 @@ mod tests {
             current_relocations: Mutex::new(Vec::new()),
             current_fdes: Mutex::new(Vec::new()),
             current_dynamic_relocations: Mutex::new(Vec::new()),
+            record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
