@@ -2079,25 +2079,37 @@ impl PreparedState {
             (None, None)
         };
 
-        let mut sections = self.current_sections.lock().unwrap().clone();
+        let mut sections = {
+            let mut current_sections = self.current_sections.lock().unwrap();
+            std::mem::take(&mut *current_sections)
+        };
         if sections.is_empty() && self.mode == IncrementalMode::Reuse {
             sections.extend(self.previous_sections.iter().cloned());
         }
         sections.sort();
 
-        let mut relocations = self.current_relocations.lock().unwrap().clone();
+        let mut relocations = {
+            let mut current_relocations = self.current_relocations.lock().unwrap();
+            std::mem::take(&mut *current_relocations)
+        };
         if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
             relocations.extend(self.previous_relocations.iter().cloned());
         }
         relocations.sort();
 
-        let mut fdes = self.current_fdes.lock().unwrap().clone();
+        let mut fdes = {
+            let mut current_fdes = self.current_fdes.lock().unwrap();
+            std::mem::take(&mut *current_fdes)
+        };
         if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
             fdes.extend(self.previous_fdes.iter().cloned());
         }
         fdes.sort();
 
-        let mut dynamic_relocations = self.current_dynamic_relocations.lock().unwrap().clone();
+        let mut dynamic_relocations = {
+            let mut current_dynamic_relocations = self.current_dynamic_relocations.lock().unwrap();
+            std::mem::take(&mut *current_dynamic_relocations)
+        };
         if dynamic_relocations.is_empty() && self.mode == IncrementalMode::Reuse {
             dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
         }
@@ -2655,13 +2667,8 @@ impl PersistedState {
     }
 
     fn write(&self, state_dir: &Path) -> Result {
-        let sections = self.render_sections();
-        let sections_file = section_sidecar_file_name(&sections);
-        self.write_sections(state_dir, &sections_file, &sections)?;
-
-        let mut state = self.clone();
-        state.sections_file = Some(sections_file);
-        state.write_index(state_dir)
+        let sections_file = self.write_sections_streaming(state_dir)?;
+        self.write_index_with_sections_file(state_dir, &sections_file)
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -2708,6 +2715,11 @@ impl PersistedState {
     }
 
     fn write_index(&self, state_dir: &Path) -> Result {
+        let sections_file = self.sections_file.as_deref().unwrap_or(SECTIONS_FILE);
+        self.write_index_with_sections_file(state_dir, sections_file)
+    }
+
+    fn write_index_with_sections_file(&self, state_dir: &Path, sections_file: &str) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "Failed to create incremental state directory `{}`",
@@ -2717,7 +2729,7 @@ impl PersistedState {
 
         let path = state_dir.join(INDEX_FILE);
         let tmp_path = state_dir.join(format!("{INDEX_FILE}.tmp"));
-        std::fs::write(&tmp_path, self.render_index()).with_context(|| {
+        std::fs::write(&tmp_path, self.render_index(sections_file)).with_context(|| {
             format!("Failed to write incremental state `{}`", tmp_path.display())
         })?;
         let _ = std::fs::remove_file(&path);
@@ -2727,6 +2739,7 @@ impl PersistedState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_sections(&self, state_dir: &Path, file_name: &str, contents: &str) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
@@ -2753,14 +2766,62 @@ impl PersistedState {
         Ok(())
     }
 
-    fn render_index(&self) -> String {
+    fn write_sections_streaming(&self, state_dir: &Path) -> Result<String> {
+        std::fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "Failed to create incremental state directory `{}`",
+                state_dir.display()
+            )
+        })?;
+
+        let tmp_path = state_dir.join(format!("{SECTIONS_FILE}.tmp"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create incremental sections `{}`",
+                    tmp_path.display()
+                )
+            })?;
+        let mut writer = SectionSidecarWriter::new(file);
+        if self.write_rendered_sections(&mut writer).is_err() {
+            if let Some(error) = writer.take_error() {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to write incremental sections `{}`",
+                        tmp_path.display()
+                    )
+                });
+            }
+            return Err(crate::error!(
+                "Failed to render incremental sections `{}`",
+                tmp_path.display()
+            ));
+        }
+        let hash = writer.finish().with_context(|| {
+            format!(
+                "Failed to finish incremental sections `{}`",
+                tmp_path.display()
+            )
+        })?;
+        let file_name = format!("{SECTIONS_FILE_PREFIX}{hash}");
+        let path = state_dir.join(&file_name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to install incremental sections `{}`",
+                path.display()
+            )
+        })?;
+        Ok(file_name)
+    }
+
+    fn render_index(&self, sections_file: &str) -> String {
         let mut out = self.render_header_and_inputs();
-        writeln!(
-            &mut out,
-            "sections-file\t{}",
-            self.sections_file.as_deref().unwrap_or(SECTIONS_FILE)
-        )
-        .unwrap();
+        writeln!(&mut out, "sections-file\t{sections_file}").unwrap();
         out
     }
 
@@ -2909,9 +2970,15 @@ impl PersistedState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn render_sections(&self) -> String {
         let mut out = String::new();
+        self.write_rendered_sections(&mut out)
+            .expect("writing incremental sections to String should not fail");
+        out
+    }
 
+    fn write_rendered_sections(&self, mut out: &mut impl std::fmt::Write) -> std::fmt::Result {
         let mut section_inputs = Vec::new();
         let mut section_input_ids = HashMap::new();
         for section in &self.sections {
@@ -2947,12 +3014,12 @@ impl PersistedState {
             );
         }
 
-        writeln!(&mut out, "section-inputs\t{}", section_inputs.len()).unwrap();
+        writeln!(&mut out, "section-inputs\t{}", section_inputs.len())?;
         for (input_file, input) in section_inputs {
-            writeln!(&mut out, "section-input\t{input_file}\t{input}").unwrap();
+            writeln!(&mut out, "section-input\t{input_file}\t{input}")?;
         }
 
-        writeln!(&mut out, "sections\t{}", self.sections.len()).unwrap();
+        writeln!(&mut out, "sections\t{}", self.sections.len())?;
         for section in &self.sections {
             let section_input_id =
                 section_input_ids[&(section.input_file.as_str(), section.input.as_str())];
@@ -2960,10 +3027,9 @@ impl PersistedState {
                 &mut out,
                 "section\t{}\t{}\t{}\t{}",
                 section_input_id, section.section_index, section.output_offset, section.size
-            )
-            .unwrap();
+            )?;
         }
-        writeln!(&mut out, "relocs\t{}", self.relocations.len()).unwrap();
+        writeln!(&mut out, "relocs\t{}", self.relocations.len())?;
         for relocation in &self.relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
@@ -3006,10 +3072,9 @@ impl PersistedState {
                 target_input,
                 target_section_index,
                 target_section_offset
-            )
-            .unwrap();
+            )?;
         }
-        writeln!(&mut out, "fdes\t{}", self.fdes.len()).unwrap();
+        writeln!(&mut out, "fdes\t{}", self.fdes.len())?;
         for fde in &self.fdes {
             let section_input_id =
                 section_input_ids[&(fde.input_file.as_str(), fde.input.as_str())];
@@ -3022,10 +3087,9 @@ impl PersistedState {
                 fde.input_offset,
                 fde.output_offset,
                 fde.size
-            )
-            .unwrap();
+            )?;
         }
-        writeln!(&mut out, "dynrels\t{}", self.dynamic_relocations.len()).unwrap();
+        writeln!(&mut out, "dynrels\t{}", self.dynamic_relocations.len())?;
         for relocation in &self.dynamic_relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
@@ -3042,8 +3106,7 @@ impl PersistedState {
                     relocation.size,
                     output_r_offset,
                     output_r_info
-                )
-                .unwrap();
+                )?;
             } else {
                 writeln!(
                     &mut out,
@@ -3053,11 +3116,52 @@ impl PersistedState {
                     relocation.relocation_offset,
                     relocation.output_offset,
                     relocation.size
-                )
-                .unwrap();
+                )?;
             }
         }
-        out
+        Ok(())
+    }
+}
+
+struct SectionSidecarWriter {
+    file: std::fs::File,
+    hasher: blake3::Hasher,
+    error: Option<std::io::Error>,
+}
+
+impl SectionSidecarWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            hasher: blake3::Hasher::new(),
+            error: None,
+        }
+    }
+
+    fn take_error(&mut self) -> Option<std::io::Error> {
+        self.error.take()
+    }
+
+    fn finish(mut self) -> std::io::Result<String> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        self.file.flush()?;
+        Ok(self.hasher.finalize().to_hex().to_string())
+    }
+}
+
+impl std::fmt::Write for SectionSidecarWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if self.error.is_some() {
+            return Err(std::fmt::Error);
+        }
+        if let Err(error) = self.file.write_all(text.as_bytes()) {
+            self.error = Some(error);
+            return Err(std::fmt::Error);
+        }
+        self.hasher.update(text.as_bytes());
+        Ok(())
     }
 }
 
