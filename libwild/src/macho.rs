@@ -36,7 +36,6 @@ use gimli::LittleEndian;
 use object::Endian;
 use object::Endianness;
 use object::SymbolIndex;
-use object::U32;
 use object::macho;
 use object::macho::N_ABS;
 use object::macho::N_EXT;
@@ -54,6 +53,13 @@ use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
 use std::borrow::Cow;
+use zerocopy::BigEndian;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
+use zerocopy::U32;
+use zerocopy::U64;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
@@ -87,7 +93,7 @@ pub(crate) type EntryPointCommand = object::macho::EntryPointCommand<Endianness>
 pub(crate) type DylinkerCommand = object::macho::DylinkerCommand<Endianness>;
 pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
-pub(crate) type ChainedFixupsHeader = DyldChainedFixupsHeader<Endianness>;
+pub(crate) type ChainedFixupsHeader = DyldChainedFixupsHeader;
 pub(crate) type SymtabCommand = object::macho::SymtabCommand<Endianness>;
 
 // TODO: move the following data types to object crate
@@ -102,28 +108,24 @@ pub(crate) enum DyldChainedFixupsImporstFormat {
 }
 
 // header of the LC_DYLD_CHAINED_FIXUPS payload
-#[derive(Clone, Copy)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
-pub(crate) struct DyldChainedFixupsHeader<E: Endian> {
+pub(crate) struct DyldChainedFixupsHeader {
     // 0
-    pub(crate) fixups_version: U32<E>,
+    pub(crate) fixups_version: U32<zerocopy::LittleEndian>,
     // offset of dyld_chained_starts_in_image in chain_data
-    pub(crate) starts_offset: U32<E>,
+    pub(crate) starts_offset: U32<zerocopy::LittleEndian>,
     // offset of imports table in chain_data
-    pub(crate) imports_offset: U32<E>,
+    pub(crate) imports_offset: U32<zerocopy::LittleEndian>,
     // offset of symbol strings in chain_data
-    pub(crate) symbols_offset: U32<E>,
+    pub(crate) symbols_offset: U32<zerocopy::LittleEndian>,
     // number of imported symbol names
-    pub(crate) imports_count: U32<E>,
+    pub(crate) imports_count: U32<zerocopy::LittleEndian>,
     // DYLD_CHAINED_IMPORT*
-    pub(crate) imports_format: U32<E>,
+    pub(crate) imports_format: U32<zerocopy::LittleEndian>,
     // 0 => uncompressed, 1 => zlib compressed
-    pub(crate) symbols_format: U32<E>,
+    pub(crate) symbols_format: U32<zerocopy::LittleEndian>,
 }
-
-// Safety:
-// `DyldChainedFixupsHeader` is repr(C), contains only `U32<E>` fields, and has no padding.
-unsafe impl<E: Endian + 'static> object::Pod for DyldChainedFixupsHeader<E> {}
 
 // This struct is embedded in LC_DYLD_CHAINED_FIXUPS payload
 // struct dyld_chained_starts_in_image
@@ -132,6 +134,125 @@ unsafe impl<E: Endian + 'static> object::Pod for DyldChainedFixupsHeader<E> {}
 //     uint32_t    seg_info_offset[1];  // each entry is offset into this struct for that segment
 //     // followed by pool of dyld_chain_starts_in_segment data
 // };
+
+// Data structures mirroring the following URL:
+// https://github.com/apple-oss-distributions/xnu/blob/94d3b452840153a99b38a3a9659680b2a006908e/osfmk/kern/cs_blobs.h.
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct CodeSignatureSuperBlob {
+    // magic number
+    pub(crate) magic: U32<BigEndian>,
+    // total length of SuperBlob
+    pub(crate) length: U32<BigEndian>,
+    // number of index entries following
+    pub(crate) count: U32<BigEndian>,
+    // (count) entries
+    // CodeSignatureBlobIndex index[];
+    // followed by Blobs in no particular order as indicated by offsets in index
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct CodeSignatureBlobIndex {
+    // type of entry
+    pub(crate) type_: U32<BigEndian>,
+    // offset of entry
+    pub(crate) offset: U32<BigEndian>,
+    // an extra padding so that we have CodeSignatureSuperBlob + CodeSignatureBlobIndex aligned to
+    // 8 bytes!
+    pub(crate) padding: U32<BigEndian>,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct CodeSignatureCodeDirectory {
+    // magic number (CSMAGIC_CODEDIRECTORY)
+    pub(crate) magic: U32<BigEndian>,
+    // total length of CodeDirectory blob
+    pub(crate) length: U32<BigEndian>,
+    // compatibility version
+    pub(crate) version: U32<BigEndian>,
+    // setup and mode flags
+    pub(crate) flags: U32<BigEndian>,
+    // offset of hash slot element at index zero
+    pub(crate) hash_offset: U32<BigEndian>,
+    // offset of identifier string
+    pub(crate) ident_offset: U32<BigEndian>,
+    // number of special hash slots
+    pub(crate) n_special_slots: U32<BigEndian>,
+    // number of ordinary (code) hash slots
+    pub(crate) n_code_slots: U32<BigEndian>,
+    // limit to main image signature range
+    pub(crate) code_limit: U32<BigEndian>,
+    // size of each hash in bytes
+    pub(crate) hash_size: u8,
+    // type of hash (cdHashType* constants)
+    pub(crate) hash_type: u8,
+    // platform identifier; zero if not platform binary
+    pub(crate) platform: u8,
+    // log2(page size in bytes); 0 => infinite
+    pub(crate) page_size: u8,
+    // unused (must be zero)
+    pub(crate) spare2: U32<BigEndian>,
+
+    // Version 0x20100
+    //
+    // offset of optional scatter vector
+    pub(crate) scatter_offset: U32<BigEndian>,
+
+    // Version 0x20200
+    //
+    // offset of optional team identifier
+    pub(crate) team_offset: U32<BigEndian>,
+
+    // Version 0x20300
+    //
+    // unused (must be zero)
+    pub(crate) spare3: U32<BigEndian>,
+    // limit to main image signature range, 64 bits
+    pub(crate) code_limit64: U64<BigEndian>,
+
+    // Version 0x20400
+    //
+    // offset of executable segment
+    pub(crate) exec_seg_base: U64<BigEndian>,
+    // limit of executable segment
+    pub(crate) exec_seg_limit: U64<BigEndian>,
+    // executable segment flags
+    pub(crate) exec_seg_flags: U64<BigEndian>,
+    // Version 0x20500 and 0x20600 are unused!
+    // followed by dynamic content as located by offset fields above
+}
+
+pub(crate) const CS_SECTION_ALIGNMENT_EXP: u8 = 4;
+pub(crate) const CS_SECTION_ALIGNMENT: u64 = 2u64.pow(CS_SECTION_ALIGNMENT_EXP as u32);
+// TODO: properly implement
+pub(crate) const CS_IDENTIFIER_STRING: &[u8] = b"a.out";
+
+pub(crate) const CS_BLOB_HEADERS_SIZE: u64 =
+    (size_of::<CodeSignatureSuperBlob>() + size_of::<CodeSignatureBlobIndex>()) as u64;
+const _: () = assert!(CS_BLOB_HEADERS_SIZE.is_multiple_of(8));
+pub(crate) const CS_HEADERS_SIZE: u64 =
+    CS_BLOB_HEADERS_SIZE + size_of::<CodeSignatureCodeDirectory>() as u64;
+pub(crate) const CS_PADDED_FILENAME_SIZE: u64 =
+    (CS_IDENTIFIER_STRING.len() as u64 + 1).next_multiple_of(CS_SECTION_ALIGNMENT);
+pub(crate) const CS_HEADERS_WITH_FILENAME_SIZE: u64 = CS_HEADERS_SIZE + CS_PADDED_FILENAME_SIZE;
+pub(crate) const CS_BLOCK_SIZE_EXP: u8 = 12;
+pub(crate) const CS_BLOCK_SIZE: usize = 2usize.pow(CS_BLOCK_SIZE_EXP as u32);
+// SHA-256 is being used
+pub(crate) const CS_HASH_SIZE: u8 = 32;
+
+pub(crate) const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
+pub(crate) const CSSLOT_CODEDIRECTORY: u32 = 0;
+pub(crate) const CSMAGIC_CODEDIRECTORY: u32 = 0xfade0c02;
+pub(crate) const CS_SUPPORTSEXECSEG: u32 = 0x20400;
+// Ad hoc signed
+pub(crate) const CS_ADHOC: u32 = 0x00000002;
+// Automatically signed by the linker
+pub(crate) const CS_LINKER_SIGNED: u32 = 0x00020000;
+pub(crate) const CS_HASHTYPE_SHA256: u8 = 2;
+pub(crate) const CS_EXECSEG_MAIN_BINARY: u64 = 0x1;
 
 #[derive(derive_more::Debug)]
 pub(crate) struct File<'data> {
@@ -772,12 +893,14 @@ impl platform::ProgramSegmentDef for ProgramSegmentDef {
             | output_section_id::ENTRY_POINT
             | output_section_id::INTERP
             | output_section_id::DYLD_CHAINED_FIXUPS
-            | output_section_id::SYMTAB_COMMAND => SegmentType::LoadCommands,
+            | output_section_id::SYMTAB_COMMAND
+            | output_section_id::CODE_SIGNATURE_COMMAND => SegmentType::LoadCommands,
             output_section_id::TEXT | output_section_id::CSTRING => SegmentType::TextSections,
             output_section_id::DATA => SegmentType::DataSections,
             output_section_id::CHAINED_FIXUP_TABLE
             | output_section_id::SYMTAB_GLOBAL
-            | output_section_id::STRTAB => SegmentType::LinkeditSections,
+            | output_section_id::STRTAB
+            | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
             _ => SegmentType::Unused,
         };
 
@@ -1227,6 +1350,10 @@ impl platform::Platform for MachO {
             size_of::<DyldChainedFixupsCommand>() as u64,
         );
         sizes.increment(part_id::SYMTAB_COMMAND, size_of::<SymtabCommand>() as u64);
+        sizes.increment(
+            part_id::CODE_SIGNATURE_COMMAND,
+            size_of::<CodeSignatureCommand>() as u64,
+        );
     }
 
     fn finalise_sizes_for_symbol<'data>(
@@ -1296,6 +1423,7 @@ impl platform::Platform for MachO {
         // Allocate one extra character as n_strx == 0 is treated as unnamed.
         common.allocate(part_id::STRTAB, 1);
         common.allocate(part_id::CHAINED_FIXUP_TABLE, CHAINED_FIXUP_TABLE_SIZE);
+        common.allocate(part_id::CODE_SIGNATURE, CS_HEADERS_WITH_FILENAME_SIZE);
     }
 
     fn finalise_prelude_layout<'data>(
@@ -1355,6 +1483,7 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::INTERP); // DYLINKER
         builder.add_section(output_section_id::DYLD_CHAINED_FIXUPS);
         builder.add_section(output_section_id::SYMTAB_COMMAND);
+        builder.add_section(output_section_id::CODE_SIGNATURE_COMMAND);
         // Content of the sections (e.g. __text, __data).
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
@@ -1363,6 +1492,7 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
         builder.add_section(output_section_id::STRTAB);
+        builder.add_section(output_section_id::CODE_SIGNATURE);
 
         builder.build()
     }
@@ -1385,13 +1515,6 @@ impl platform::Platform for MachO {
                 *file_offset = segment_alignment.align_up(*file_offset as u64) as usize;
                 *mem_offset = segment_alignment.align_up(*mem_offset);
             }
-            SegmentType::TextSections => {
-                // TODO: A placeholder space for the LinkeditDataCommand command is allocated
-                // (added by codesign tool) in order to preserve the offsets into __text and
-                // other sections in the __TEXT segment.
-                *file_offset += size_of::<CodeSignatureCommand>();
-                *mem_offset += size_of::<CodeSignatureCommand>() as u64;
-            }
             _ => {}
         }
     }
@@ -1404,6 +1527,20 @@ impl platform::Platform for MachO {
             n_desc: Default::default(),
             n_value: Default::default(),
         }
+    }
+
+    fn last_part_size_to_extend(
+        record: &OutputRecordLayout,
+        last_part_id: part_id::PartId,
+    ) -> Result<usize> {
+        ensure!(
+            last_part_id == part_id::CODE_SIGNATURE,
+            "code signature must be last part_id"
+        );
+        // The CODE_SIGNATURE size depends on the final file size, excluding the
+        // signature itself. Compute it after layout because there is one SHA hash
+        // per file block (4 KiB) covered by the signature.
+        Ok(record.file_offset.div_ceil(CS_BLOCK_SIZE) * CS_HASH_SIZE as usize)
     }
 }
 
@@ -1460,6 +1597,11 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         target_segment_type: Some(SegmentType::LoadCommands),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::CODE_SIGNATURE_COMMAND.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"LC_CODE_SIGNATURE")),
+        target_segment_type: Some(SegmentType::LoadCommands),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::CHAINED_FIXUP_TABLE.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"DYLD_CHAINED_FIXUPS_TABLE")),
         target_segment_type: Some(SegmentType::LinkeditSections),
@@ -1473,6 +1615,14 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::STRTAB.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"STRTAB")),
         target_segment_type: Some(SegmentType::LinkeditSections),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::CODE_SIGNATURE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"CODE_SIGNATURE")),
+        target_segment_type: Some(SegmentType::LinkeditSections),
+        min_alignment: Alignment {
+            exponent: CS_SECTION_ALIGNMENT_EXP,
+        },
         ..DEFAULT_DEFS
     };
     // Multi-part generated sections

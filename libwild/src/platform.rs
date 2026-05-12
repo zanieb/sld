@@ -534,6 +534,15 @@ pub(crate) trait Platform:
         args: &Self::Args,
     ) -> Result;
 
+    /// Returns any extra size needed for the part that currently ends last in
+    /// the output file, once its file offset and provisional size are known.
+    fn last_part_size_to_extend(
+        _record: &OutputRecordLayout,
+        _last_part_id: PartId,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     fn finalise_layout_epilogue<'data>(
         epilogue_state: &mut Self::EpilogueLayoutExt,
         memory_offsets: &mut OutputSectionPartMap<u64>,

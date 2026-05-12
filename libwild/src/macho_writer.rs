@@ -17,7 +17,25 @@ use crate::layout::PreludeLayout;
 use crate::layout::Resolution;
 use crate::layout::Section;
 use crate::layout::SymbolCopyInfo;
+use crate::macho::CS_ADHOC;
+use crate::macho::CS_BLOB_HEADERS_SIZE;
+use crate::macho::CS_BLOCK_SIZE;
+use crate::macho::CS_BLOCK_SIZE_EXP;
+use crate::macho::CS_EXECSEG_MAIN_BINARY;
+use crate::macho::CS_HASH_SIZE;
+use crate::macho::CS_HASHTYPE_SHA256;
+use crate::macho::CS_IDENTIFIER_STRING;
+use crate::macho::CS_LINKER_SIGNED;
+use crate::macho::CS_PADDED_FILENAME_SIZE;
+use crate::macho::CS_SUPPORTSEXECSEG;
+use crate::macho::CSMAGIC_CODEDIRECTORY;
+use crate::macho::CSMAGIC_EMBEDDED_SIGNATURE;
+use crate::macho::CSSLOT_CODEDIRECTORY;
 use crate::macho::ChainedFixupsHeader;
+use crate::macho::CodeSignatureBlobIndex;
+use crate::macho::CodeSignatureCodeDirectory;
+use crate::macho::CodeSignatureCommand;
+use crate::macho::CodeSignatureSuperBlob;
 use crate::macho::DEFAULT_SEGMENT_COUNT;
 use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
@@ -49,6 +67,7 @@ use crate::symbol_db::SymbolId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
+use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
 use object::BigEndian;
 use object::Endianness;
@@ -57,6 +76,7 @@ use object::U32;
 use object::from_bytes_mut;
 use object::macho;
 use object::macho::CPU_TYPE_ARM64;
+use object::macho::LC_CODE_SIGNATURE;
 use object::macho::LC_DYLD_CHAINED_FIXUPS;
 use object::macho::LC_LOAD_DYLINKER;
 use object::macho::LC_MAIN;
@@ -74,11 +94,16 @@ use object::macho::SEG_TEXT;
 use object::slice_from_bytes_mut;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
+use rayon::slice::ParallelSlice;
+use sha2::Digest;
+use sha2::Sha256;
 use std::ops::BitAnd;
 use tracing::debug_span;
+use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
 const LE: Endianness = Endianness::Little;
+
 type MachOLayout<'data> = Layout<'data, MachO>;
 type SymtabEntry = object::macho::Nlist64<Endianness>;
 
@@ -113,6 +138,8 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
             }
             Ok(())
         })?;
+
+    write_code_signature(layout, sized_output)?;
 
     Ok(())
 }
@@ -171,6 +198,12 @@ fn write_prelude<'data, A: Arch<Platform = MachO>>(
         .map_err(|_| error!("Invalid SYMTAB_COMMAND allocation"))?;
     write_symtab_command::<A>(layout, symtab_command);
 
+    let code_signature_command: &mut CodeSignatureCommand =
+        from_bytes_mut(buffers.get_mut(part_id::CODE_SIGNATURE_COMMAND))
+            .map_err(|_| error!("Invalid CODE_SIGNATURE_COMMAND allocation"))?
+            .0;
+    write_code_signature_command::<A>(layout, code_signature_command);
+
     let chained_fixup_table = buffers.get_mut(part_id::CHAINED_FIXUP_TABLE);
     chained_fixup_table.fill(0);
     let starts_len = size_of::<u32>() * (DEFAULT_SEGMENT_COUNT + 1);
@@ -183,7 +216,7 @@ fn write_prelude<'data, A: Arch<Platform = MachO>>(
         );
     }
     let (chained_fixups_header, rest): (&mut ChainedFixupsHeader, &mut [u8]) =
-        from_bytes_mut(chained_fixup_table)
+        ChainedFixupsHeader::mut_from_prefix(chained_fixup_table)
             .map_err(|_| error!("Invalid chained fixups header allocation"))?;
     let (starts_in_image, _) =
         slice_from_bytes_mut::<U32<Endianness>>(rest, DEFAULT_SEGMENT_COUNT + 1)
@@ -623,6 +656,22 @@ fn write_symtab_command<A: Arch<Platform = MachO>>(
     command.strsize.set(LE, strtab.file_size as u32);
 }
 
+fn write_code_signature_command<A: Arch<Platform = MachO>>(
+    layout: &MachOLayout,
+    command: &mut CodeSignatureCommand,
+) {
+    let code_signature = layout
+        .section_layouts
+        .get(output_section_id::CODE_SIGNATURE);
+
+    command.cmd.set(LE, LC_CODE_SIGNATURE);
+    command
+        .cmdsize
+        .set(LE, size_of::<CodeSignatureCommand>() as u32);
+    command.dataoff.set(LE, code_signature.file_offset as u32);
+    command.datasize.set(LE, code_signature.file_size as u32);
+}
+
 fn write_chained_fixup_table<A: Arch<Platform = MachO>>(
     header: &mut ChainedFixupsHeader,
     starts_in_image: &mut [U32<Endianness>],
@@ -636,25 +685,122 @@ fn write_chained_fixup_table<A: Arch<Platform = MachO>>(
         );
     }
 
-    header.fixups_version.set(LE, 0);
+    header.fixups_version.set(0);
     header
         .starts_offset
-        .set(LE, size_of::<ChainedFixupsHeader>() as u32);
+        .set(size_of::<ChainedFixupsHeader>() as u32);
     header
         .imports_offset
-        .set(LE, (size_of::<ChainedFixupsHeader>() + starts_len) as u32);
+        .set((size_of::<ChainedFixupsHeader>() + starts_len) as u32);
     header
         .symbols_offset
-        .set(LE, (size_of::<ChainedFixupsHeader>() + starts_len) as u32);
-    header.imports_count.set(LE, 0);
-    header.imports_format.set(
-        LE,
-        DyldChainedFixupsImporstFormat::DYLD_CHAINED_IMPORT as u32,
-    );
-    header.symbols_format.set(LE, 0);
+        .set((size_of::<ChainedFixupsHeader>() + starts_len) as u32);
+    header.imports_count.set(0);
+    header
+        .imports_format
+        .set(DyldChainedFixupsImporstFormat::DYLD_CHAINED_IMPORT as u32);
+    header.symbols_format.set(0);
 
     starts_in_image[0].set(LE, DEFAULT_SEGMENT_COUNT as u32);
     starts_in_image[1..].fill(U32::new(LE, 0));
+
+    Ok(())
+}
+
+fn write_code_signature(layout: &MachOLayout, sized_output: &mut SizedOutput) -> Result {
+    let code_signature_section = layout
+        .section_layouts
+        .get(output_section_id::CODE_SIGNATURE);
+    let calculated_hashes: Vec<_> = sized_output.out[..code_signature_section.file_offset]
+        .par_chunks(CS_BLOCK_SIZE)
+        .map(Sha256::digest)
+        .collect();
+    let calculated_hashes = calculated_hashes.into_iter().flatten().collect_vec();
+
+    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+    let code_signature = section_buffers.get_mut(output_section_id::CODE_SIGNATURE);
+
+    let (super_blob, rest): (&mut CodeSignatureSuperBlob, &mut [u8]) =
+        CodeSignatureSuperBlob::mut_from_prefix(code_signature)
+            .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    let (blob_indices, rest) = <[CodeSignatureBlobIndex]>::mut_from_prefix_with_elems(rest, 1)
+        .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    let blob_index = &mut blob_indices[0];
+    let (code_directories, rest) =
+        <[CodeSignatureCodeDirectory]>::mut_from_prefix_with_elems(rest, 1)
+            .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    let code_dir = &mut code_directories[0];
+    let (identifier, hashes) = rest.split_at_mut(CS_PADDED_FILENAME_SIZE as usize);
+
+    super_blob.magic.set(CSMAGIC_EMBEDDED_SIGNATURE);
+    super_blob
+        .length
+        .set(code_signature_section.file_size as u32);
+    super_blob.count.set(1);
+
+    blob_index.type_.set(CSSLOT_CODEDIRECTORY);
+    blob_index.offset.set(CS_BLOB_HEADERS_SIZE as u32);
+    blob_index.padding.set(0);
+
+    code_dir.magic.set(CSMAGIC_CODEDIRECTORY);
+    code_dir
+        .length
+        .set((code_signature_section.file_size as u64 - CS_BLOB_HEADERS_SIZE) as u32);
+    code_dir.version.set(CS_SUPPORTSEXECSEG);
+    code_dir.flags.set(CS_ADHOC | CS_LINKER_SIGNED);
+    code_dir
+        .hash_offset
+        .set(size_of::<CodeSignatureCodeDirectory>() as u32 + CS_PADDED_FILENAME_SIZE as u32);
+    code_dir
+        .ident_offset
+        .set(size_of::<CodeSignatureCodeDirectory>() as u32);
+    code_dir.n_special_slots.set(0);
+    code_dir
+        .n_code_slots
+        .set(code_signature_section.file_offset.div_ceil(CS_BLOCK_SIZE) as u32);
+    code_dir
+        .code_limit
+        .set(code_signature_section.file_offset as u32);
+    code_dir.hash_size = CS_HASH_SIZE;
+    code_dir.hash_type = CS_HASHTYPE_SHA256;
+    code_dir.platform = 0;
+    code_dir.page_size = CS_BLOCK_SIZE_EXP;
+    code_dir.spare2.set(0);
+    code_dir.scatter_offset.set(0);
+    code_dir.team_offset.set(0);
+    code_dir.spare3.set(0);
+    code_dir.code_limit64.set(0);
+
+    let text_segment_size = get_segment_sections(layout, SegmentType::Text)
+        .ok_or_else(|| error!("Text segment is mandatory"))?
+        .segment_size;
+    code_dir
+        .exec_seg_base
+        .set(text_segment_size.file_offset as u64);
+    code_dir
+        .exec_seg_limit
+        .set(text_segment_size.file_size as u64);
+    // TODO: change once shared libraries are supported
+    code_dir.exec_seg_flags.set(CS_EXECSEG_MAIN_BINARY);
+
+    identifier[..CS_IDENTIFIER_STRING.len()].copy_from_slice(CS_IDENTIFIER_STRING);
+    identifier[CS_IDENTIFIER_STRING.len()..].fill(0);
+    hashes.copy_from_slice(&calculated_hashes);
+
+    #[cfg(target_os = "macos")]
+    if let crate::file_writer::OutputBuffer::Mmap(output) = &mut sized_output.out {
+        // Match lld's workaround for the macOS kernel caching signature-verification
+        // data before the final code signature has been written:
+        //
+        // https://openradar.appspot.com/FB8914231
+        unsafe {
+            libc::msync(
+                output.as_mut_ptr().cast(),
+                code_signature_section.file_offset + code_signature_section.file_size,
+                libc::MS_INVALIDATE,
+            );
+        }
+    }
 
     Ok(())
 }
