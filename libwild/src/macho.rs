@@ -189,7 +189,11 @@ fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::MachO;
     use super::macho_eh_frame_fde_count;
+    use crate::platform;
+    use crate::platform::Symbol as _;
+    use object::macho::N_SECT;
 
     #[test]
     fn macho_eh_frame_fde_count_ignores_cies() {
@@ -202,6 +206,19 @@ mod tests {
         ];
 
         assert_eq!(macho_eh_frame_fde_count(&data).unwrap(), 1);
+    }
+
+    #[test]
+    fn macho_default_strips_local_assembler_labels() {
+        let mut sym = <MachO as platform::Platform>::default_symtab_entry();
+        sym.n_type = N_SECT;
+
+        assert!(sym.is_default_strippable(b"ltmp1"));
+        assert!(sym.is_default_strippable(b".Ldata1"));
+        assert!(sym.is_default_strippable(b"_.Ldata1"));
+        assert!(sym.is_default_strippable(b"l_.str"));
+        assert!(sym.is_default_strippable(b"l_.str.1"));
+        assert!(!sym.is_default_strippable(b"_main"));
     }
 }
 
@@ -913,7 +930,12 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_default_strippable(&self, name: &[u8]) -> bool {
-        self.is_local() && name.starts_with(b"ltmp")
+        self.is_local()
+            && (name.starts_with(b"ltmp")
+                || name.starts_with(b".L")
+                || name.starts_with(b"_.L")
+                || name == b"l_.str"
+                || name.starts_with(b"l_.str."))
     }
 
     fn debug_string(&self) -> String {
@@ -2064,6 +2086,19 @@ fn section_flags_are_no_bits(flags: SectionFlags) -> bool {
     )
 }
 
+fn should_relax_got_load_to_direct(
+    output_kind: crate::output_kind::OutputKind,
+    relocation_type: u8,
+    is_undefined: bool,
+) -> bool {
+    output_kind.is_executable()
+        && !is_undefined
+        && matches!(
+            relocation_type,
+            macho::ARM64_RELOC_GOT_LOAD_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        )
+}
+
 fn chained_fixup_table_allocation_size(
     common: &crate::layout::CommonGroupState<MachO>,
     symbol_db: &crate::symbol_db::SymbolDb<MachO>,
@@ -2080,8 +2115,13 @@ fn chained_fixup_table_allocation_size(
         + size_of::<u16>() as u64 * page_count;
 
     let mut symbol_strings_size = 1;
+    let mut import_count = 0u64;
     for group in &symbol_db.groups {
         for symbol_id in group.symbol_id_range() {
+            if !symbol_db.is_undefined(symbol_db.definition(symbol_id)) {
+                continue;
+            }
+            import_count += 1;
             if let Ok(name) = symbol_db.symbol_name(symbol_id) {
                 symbol_strings_size += name.bytes().len() as u64 + 1;
             }
@@ -2091,7 +2131,7 @@ fn chained_fixup_table_allocation_size(
     (CHAINED_FIXUP_TABLE_HEADER_SIZE
         + starts_in_image_size.next_multiple_of(8)
         + starts_in_segment_size.next_multiple_of(8)
-        + symbol_db.num_symbols() as u64 * size_of::<u32>() as u64
+        + import_count * size_of::<u32>() as u64
         + symbol_strings_size)
         .next_multiple_of(8)
 }
@@ -2498,10 +2538,19 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
         let rel_offset = rel_info.r_address;
 
+        let raw_relocation_type = rel.info(LE).r_type;
         let rel_info = A::relocation_from_raw(rel_info)?;
         let mut flags_to_add = layout::resolution_flags(rel_info.kind) | extra_flags;
+        if should_relax_got_load_to_direct(
+            symbol_db.output_kind,
+            raw_relocation_type,
+            symbol_db.is_undefined(symbol_id),
+        ) {
+            flags_to_add.remove(ValueFlags::GOT);
+            flags_to_add |= ValueFlags::DIRECT;
+        }
         if symbol_db.is_undefined(symbol_id) {
-            match rel.info(LE).r_type {
+            match raw_relocation_type {
                 macho::ARM64_RELOC_BRANCH26 => {
                     flags_to_add |= ValueFlags::PLT | ValueFlags::GOT;
                 }
