@@ -280,8 +280,13 @@ impl Linker {
 
         let incremental_state = incremental::maybe_prepare(args, file_loader)?;
         if incremental_state.can_reuse_output() {
-            incremental_state.begin_update()?;
-            incremental_state.finish(args, file_loader)?;
+            finish_incremental_update_after_input_check(
+                || file_loader.verify_inputs_unchanged(),
+                || {
+                    incremental_state.begin_update()?;
+                    incremental_state.finish(args, file_loader)
+                },
+            )?;
             return Ok(LinkerOutput { layout: None });
         }
 
@@ -363,7 +368,10 @@ impl Linker {
         incremental_state.begin_update()?;
         P::write_output_file::<A>(&output, &layout, &incremental_state)?;
         diff::maybe_diff()?;
-        incremental_state.finish(args, file_loader)?;
+        finish_incremental_update_after_input_check(
+            || file_loader.verify_inputs_unchanged(),
+            || incremental_state.finish(args, file_loader),
+        )?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
         let (g1, g2) = timing_guard!("Shutdown");
@@ -375,9 +383,41 @@ impl Linker {
     }
 }
 
+#[inline]
+fn finish_incremental_update_after_input_check(
+    verify_inputs_unchanged: impl FnOnce() -> error::Result<()>,
+    finish_incremental_update: impl FnOnce() -> error::Result<()>,
+) -> error::Result<()> {
+    verify_inputs_unchanged()?;
+    finish_incremental_update()
+}
+
 impl Default for Linker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn incremental_update_is_not_finalised_when_input_check_fails() {
+        let finished = Cell::new(false);
+
+        let result = finish_incremental_update_after_input_check(
+            || Err(crate::error!("input changed")),
+            || {
+                finished.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!finished.get());
     }
 }
 
