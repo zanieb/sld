@@ -46,6 +46,7 @@ pub struct MachOArgs {
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) extra_dylib_paths: Vec<Vec<u8>>,
     pub(crate) dylib_symbol_ordinals: HashMap<Vec<u8>, u8>,
+    pub(crate) install_name: Option<Vec<u8>>,
     pub(crate) sysroot: Option<PathBuf>,
     pub(crate) relocation_model: RelocationModel,
     pub(crate) should_output_executable: bool,
@@ -84,6 +85,7 @@ impl Default for MachOArgs {
             lib_search_path: Vec::new(),
             extra_dylib_paths: Vec::new(),
             dylib_symbol_ordinals: HashMap::new(),
+            install_name: None,
             sysroot: None,
             should_adhoc_codesign: cfg!(target_os = "macos"),
             dead_strip: false,
@@ -110,6 +112,7 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
             .field("lib_search_path", &args.lib_search_path)
             .field("extra_dylib_paths", &args.extra_dylib_paths)
             .field("dylib_symbol_ordinals", &dylib_symbol_ordinals)
+            .field("install_name", &args.install_name)
             .field("sysroot", &args.sysroot)
             .field("relocation_model", &args.relocation_model)
             .field("should_output_executable", &args.should_output_executable)
@@ -625,7 +628,7 @@ fn handle_ld64_multi_arg<S: AsRef<str>, I: Iterator<Item = S>>(
         }
         "-install_name" | "--install_name" => {
             let value = input.next().context("-install_name requires an argument")?;
-            args.warn_unsupported(&format!("-install_name {}", value.as_ref()))?;
+            args.install_name = Some(value.as_ref().as_bytes().to_vec());
             Ok(true)
         }
         "-Wl,-exported_symbols_list" => {
@@ -662,6 +665,12 @@ fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
                     .next()
                     .context("-Wl,-weak_framework requires an argument")?;
                 args.add_framework(framework)?;
+            }
+            "-install_name" => {
+                let value = values
+                    .next()
+                    .context("-Wl,-install_name requires an argument")?;
+                args.install_name = Some(value.as_bytes().to_vec());
             }
             _ if value.starts_with("-l") && value.len() > 2 => {
                 args.add_linked_library(&value[2..])?
@@ -838,6 +847,42 @@ mod tests {
     }
 
     #[test]
+    fn install_name_records_dynamiclib_id_path() {
+        let mut args = MachOArgs::default();
+
+        parse(
+            &mut args,
+            ["-install_name", "@rpath/libwild-custom.dylib"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.install_name.as_deref(),
+            Some(b"@rpath/libwild-custom.dylib".as_slice())
+        );
+        assert_eq!(
+            crate::macho::id_dylib_path(&args),
+            b"@rpath/libwild-custom.dylib"
+        );
+    }
+
+    #[test]
+    fn wl_install_name_records_dynamiclib_id_path() {
+        let mut args = MachOArgs::default();
+
+        parse(
+            &mut args,
+            ["-Wl,-install_name,@rpath/libwild-wl.dylib"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.install_name.as_deref(),
+            Some(b"@rpath/libwild-wl.dylib".as_slice())
+        );
+    }
+
+    #[test]
     fn non_incremental_links_unlink_existing_outputs_by_default() {
         let mut args = MachOArgs::default();
         args.common.incremental = false;
@@ -896,6 +941,12 @@ mod tests {
             incremental_link_options_after(|args| {
                 args.dylib_symbol_ordinals
                     .insert(b"_zlibVersion".to_vec(), 2);
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.install_name = Some(b"@rpath/libwild-custom.dylib".to_vec());
             })
         );
         assert_ne!(

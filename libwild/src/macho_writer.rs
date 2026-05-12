@@ -37,7 +37,6 @@ use crate::macho::CodeSignatureBlobIndex;
 use crate::macho::CodeSignatureCodeDirectory;
 use crate::macho::CodeSignatureCommand;
 use crate::macho::CodeSignatureSuperBlob;
-use crate::macho::DEFAULT_ID_DYLIB_PATH;
 use crate::macho::DEFAULT_SEGMENT_COUNT;
 use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
@@ -59,6 +58,8 @@ use crate::macho::SegmentType;
 use crate::macho::SymtabCommand;
 use crate::macho::UuidCommand;
 use crate::macho::get_segment_sections;
+use crate::macho::id_dylib_command_size;
+use crate::macho::id_dylib_path;
 use crate::macho::load_dylib_command_count;
 use crate::macho::load_dylib_command_size;
 use crate::macho::load_dylib_paths;
@@ -831,7 +832,7 @@ fn write_prelude<'data, A: Arch<Platform = MachO>>(
         let (id_dylib_command, id_dylib_path_buffer): (&mut DylibCommand, &mut [u8]) =
             from_bytes_mut(buffers.get_mut(part_id::ID_DYLIB))
                 .map_err(|_| error!("Invalid ID_DYLIB command allocation"))?;
-        write_id_dylib_command(id_dylib_command, id_dylib_path_buffer);
+        write_id_dylib_command(layout, id_dylib_command, id_dylib_path_buffer);
     }
 
     if !layout.args().is_dynamiclib {
@@ -2522,13 +2523,16 @@ fn write_load_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], 
     path_buffer[path.len()..].zero();
 }
 
-fn write_id_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8]) {
+fn write_id_dylib_command(
+    layout: &MachOLayout,
+    command: &mut DylibCommand,
+    path_buffer: &mut [u8],
+) {
+    let path = id_dylib_path(layout.args());
     command.cmd.set(LE, LC_ID_DYLIB);
-    command.cmdsize.set(
-        LE,
-        ((size_of::<DylibCommand>() + DEFAULT_ID_DYLIB_PATH.len() + 1)
-            .next_multiple_of(MACHO_COMMAND_ALIGNMENT)) as u32,
-    );
+    command
+        .cmdsize
+        .set(LE, id_dylib_command_size(layout.args()) as u32);
     command
         .dylib
         .name
@@ -2538,8 +2542,8 @@ fn write_id_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8]) {
     command.dylib.current_version.set(LE, 0);
     command.dylib.compatibility_version.set(LE, 0);
 
-    path_buffer[0..DEFAULT_ID_DYLIB_PATH.len()].copy_from_slice(DEFAULT_ID_DYLIB_PATH);
-    path_buffer[DEFAULT_ID_DYLIB_PATH.len()..].zero();
+    path_buffer[0..path.len()].copy_from_slice(path);
+    path_buffer[path.len()..].zero();
 }
 
 fn write_dyld_chained_fixups_command<A: Arch<Platform = MachO>>(
