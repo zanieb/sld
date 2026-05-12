@@ -147,6 +147,64 @@ pub(crate) fn load_dylib_commands<'a>(
     }))
 }
 
+fn macho_eh_frame_fde_count(data: &[u8]) -> Result<usize> {
+    let mut count = 0;
+    let mut offset = 0usize;
+    while offset + size_of::<u32>() <= data.len() {
+        let length = read_macho_u32(data, offset)? as usize;
+        if length == 0 {
+            break;
+        }
+        ensure!(
+            length != 0xffff_ffff,
+            "Mach-O 64-bit __eh_frame lengths are not supported"
+        );
+
+        let entry_end = offset
+            .checked_add(size_of::<u32>())
+            .and_then(|entry_start| entry_start.checked_add(length))
+            .context("Mach-O __eh_frame entry length overflow")?;
+        ensure!(
+            entry_end <= data.len(),
+            "Mach-O __eh_frame entry at offset {offset:#x} extends past the section"
+        );
+
+        let cie_pointer = read_macho_u32(data, offset + size_of::<u32>())?;
+        if cie_pointer != 0 {
+            count += 1;
+        }
+
+        offset = entry_end;
+    }
+
+    Ok(count)
+}
+
+fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let bytes = bytes
+        .get(offset..offset + size_of::<u32>())
+        .ok_or_else(|| error!("Read past end of Mach-O buffer"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::macho_eh_frame_fde_count;
+
+    #[test]
+    fn macho_eh_frame_fde_count_ignores_cies() {
+        let data = [
+            4, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE pointer
+            4, 0, 0, 0, // FDE length
+            8, 0, 0, 0, // CIE pointer
+            0, 0, 0, 0, // terminator
+        ];
+
+        assert_eq!(macho_eh_frame_fde_count(&data).unwrap(), 1);
+    }
+}
+
 pub(crate) fn load_dylib_paths<'a>(args: &'a MachOArgs) -> impl Iterator<Item = &'a [u8]> + 'a {
     load_dylib_commands(args).map(|command| command.path)
 }
@@ -1082,6 +1140,7 @@ impl platform::ProgramSegmentDef for ProgramSegmentDef {
             | output_section_id::TDATA
             | output_section_id::TBSS
             | output_section_id::BSS
+            | output_section_id::MACHO_MOD_INIT_FUNC
             | output_section_id::MACHO_THREAD_VARS
             | output_section_id::MACHO_THREAD_PTRS => SegmentType::DataSections,
             output_section_id::CHAINED_FIXUP_TABLE
@@ -1369,6 +1428,15 @@ impl platform::Platform for MachO {
         // TODO
         let section_part_id =
             state.section_part_id(section_index, &resources.symbol_db.section_part_ids);
+        let section_header = state.object.section(section_index)?;
+        if state.object.section_name(section_header)? == b"__eh_frame" {
+            let data = state.object.raw_section_data(section_header)?;
+            common.allocate(
+                part_id::MACHO_UNWIND_INFO,
+                macho_unwind_info_allocation_size(macho_eh_frame_fde_count(data)?),
+            );
+        }
+
         for rel in state.relocations(section_index)?.relocations {
             process_relocation::<A>(
                 state,
@@ -1899,6 +1967,7 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::GOT);
         builder.add_section(output_section_id::RUSTC_METADATA);
         builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::MACHO_MOD_INIT_FUNC);
         builder.add_section(output_section_id::MACHO_THREAD_VARS);
         builder.add_section(output_section_id::MACHO_THREAD_PTRS);
         builder.add_section(output_section_id::TDATA);
@@ -2198,6 +2267,12 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: SectionFlags::from_u32(macho::S_REGULAR),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::MACHO_MOD_INIT_FUNC.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__mod_init_func")),
+        section_flags: SectionFlags::from_u32(macho::S_MOD_INIT_FUNC_POINTERS),
+        min_alignment: alignment::GOT_ENTRY,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::MACHO_THREAD_VARS.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__thread_vars")),
         section_flags: SectionFlags::from_u32(macho::S_THREAD_LOCAL_VARIABLES),
@@ -2248,6 +2323,10 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
     SectionRule::exact_section_keep(b".rustc", crate::output_section_id::RUSTC_METADATA),
     SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
+    SectionRule::exact_section_keep(
+        b"__mod_init_func",
+        crate::output_section_id::MACHO_MOD_INIT_FUNC,
+    ),
     SectionRule::exact_section_keep(
         b"__thread_vars",
         crate::output_section_id::MACHO_THREAD_VARS,

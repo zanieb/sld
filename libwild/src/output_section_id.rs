@@ -142,8 +142,9 @@ pub(crate) const CSTRING: OutputSectionId = OutputSectionId::regular(15);
 pub(crate) const MACHO_THREAD_VARS: OutputSectionId = OutputSectionId::regular(16);
 pub(crate) const MACHO_THREAD_PTRS: OutputSectionId = OutputSectionId::regular(17);
 pub(crate) const RUSTC_METADATA: OutputSectionId = OutputSectionId::regular(18);
+pub(crate) const MACHO_MOD_INIT_FUNC: OutputSectionId = OutputSectionId::regular(19);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 19;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 20;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {
