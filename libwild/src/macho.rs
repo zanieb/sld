@@ -135,6 +135,16 @@ pub(crate) fn load_dylib_command_count(args: &MachOArgs) -> usize {
     load_dylib_paths(args).count()
 }
 
+pub(crate) fn id_dylib_path(args: &MachOArgs) -> &[u8] {
+    args.install_name
+        .as_deref()
+        .unwrap_or(DEFAULT_ID_DYLIB_PATH)
+}
+
+pub(crate) fn id_dylib_command_size(args: &MachOArgs) -> usize {
+    load_dylib_command_size(id_dylib_path(args))
+}
+
 type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
@@ -1663,11 +1673,7 @@ impl platform::Platform for MachO {
             );
         }
         if args.is_dynamiclib {
-            sizes.increment(
-                part_id::ID_DYLIB,
-                ((size_of::<DylibCommand>() + DEFAULT_ID_DYLIB_PATH.len() + 1)
-                    .next_multiple_of(MACHO_COMMAND_ALIGNMENT)) as u64,
-            );
+            sizes.increment(part_id::ID_DYLIB, id_dylib_command_size(args) as u64);
         }
         sizes.increment(
             part_id::DYLD_CHAINED_FIXUPS,
