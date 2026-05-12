@@ -780,7 +780,8 @@ fn relocation_target_patches_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        let Some(target_value) = add_signed_delta_u64(relocation.target_value, delta) else {
+        let previous_target_value = relocation.target_value;
+        let Some(target_value) = add_signed_delta_u64(previous_target_value, delta) else {
             return Ok(Err(format!(
                 "relocation target value overflowed in {}",
                 display_hex_path(&input.path)
@@ -798,6 +799,7 @@ fn relocation_target_patches_for_input(
         target.section_offset = current.section_offset;
         output_symbols.push(RelocationTargetSymbolPatch {
             target_name: target_name.to_owned(),
+            previous_target_value,
             target_value,
         });
     }
@@ -850,6 +852,38 @@ fn symbol_position_by_name(
     Ok(None)
 }
 
+fn symbol_position_by_name_and_value(
+    bytes: &[u8],
+    file_offset: usize,
+    file: &object::File<'_>,
+    encoded_name: &str,
+    value: u64,
+) -> Result<std::result::Result<Option<SymbolPosition>, String>> {
+    let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
+    let mut matched_symbol = None;
+    for symbol in file.symbols() {
+        if symbol.name_bytes()? != name || symbol.address() != value {
+            continue;
+        }
+        if matched_symbol.is_some() {
+            return Ok(Err(
+                "ambiguous output symbol for incremental value patch".to_owned()
+            ));
+        }
+        let Some(section_index) = symbol.section_index() else {
+            return Ok(Ok(None));
+        };
+        let value_range = elf_symbol_value_field_range(bytes, symbol.index())
+            .map(|range| file_offset + range.start..file_offset + range.end);
+        matched_symbol = Some(SymbolPosition {
+            section_index,
+            section_offset: symbol.address(),
+            value_range,
+        });
+    }
+    Ok(Ok(matched_symbol))
+}
+
 fn output_symbol_value_patches(
     output: &[u8],
     symbols: &[RelocationTargetSymbolPatch],
@@ -860,10 +894,10 @@ fn output_symbol_value_patches(
 
     let file = object::File::parse(output)
         .context("Failed to parse output for incremental symbol value patching")?;
-    let mut values_by_name = HashMap::<&str, u64>::new();
+    let mut values_by_previous_name_and_value = HashMap::<(&str, u64), u64>::new();
     for symbol in symbols {
-        if let Some(previous) =
-            values_by_name.insert(symbol.target_name.as_str(), symbol.target_value)
+        let key = (symbol.target_name.as_str(), symbol.previous_target_value);
+        if let Some(previous) = values_by_previous_name_and_value.insert(key, symbol.target_value)
             && previous != symbol.target_value
         {
             return Ok(Err(
@@ -872,12 +906,23 @@ fn output_symbol_value_patches(
         }
     }
 
-    let mut patches = Vec::with_capacity(values_by_name.len());
-    for (target_name, target_value) in values_by_name {
-        let Some(symbol) = symbol_position_by_name(output, 0, &file, target_name)? else {
-            return Ok(Err(
-                "missing output symbol for incremental value patch".to_owned()
-            ));
+    let mut patches = Vec::with_capacity(values_by_previous_name_and_value.len());
+    for ((target_name, previous_target_value), target_value) in values_by_previous_name_and_value {
+        let symbol = symbol_position_by_name_and_value(
+            output,
+            0,
+            &file,
+            target_name,
+            previous_target_value,
+        )?;
+        let symbol = match symbol {
+            Ok(Some(symbol)) => symbol,
+            Ok(None) => {
+                return Ok(Err(
+                    "missing output symbol for incremental value patch".to_owned()
+                ));
+            }
+            Err(error) => return Ok(Err(error)),
         };
         let Some(value_range) = symbol.value_range else {
             return Ok(Err(
@@ -1681,6 +1726,7 @@ struct RelocationTargetPatches {
 #[derive(Clone)]
 struct RelocationTargetSymbolPatch {
     target_name: String,
+    previous_target_value: u64,
     target_value: u64,
 }
 
@@ -9307,6 +9353,149 @@ mod tests {
             hasher.update(&[0]);
         }
         hasher.finalize().to_hex().to_string()
+    }
+
+    #[test]
+    fn output_symbol_value_patches_match_duplicate_names_by_previous_value() {
+        let (output, first_value_range, second_value_range) = duplicate_symbol_name_elf();
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[RelocationTargetSymbolPatch {
+                target_name: hex::encode(b"duplicate"),
+                previous_target_value: 0x200,
+                target_value: 0x208,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].output_offset, second_value_range.start as u64);
+        assert_eq!(patches[0].data, 0x208_u64.to_le_bytes());
+        assert_eq!(&output[first_value_range], &0x100_u64.to_le_bytes());
+        assert_eq!(&output[second_value_range], &0x200_u64.to_le_bytes());
+    }
+
+    fn duplicate_symbol_name_elf() -> (Vec<u8>, std::ops::Range<usize>, std::ops::Range<usize>) {
+        let mut bytes = vec![0; 0x220];
+        let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        let strtab = b"\0duplicate\0";
+        let text_offset = 0x40;
+        let symtab_offset = 0x60;
+        let strtab_offset = 0xa8;
+        let shstrtab_offset = 0xb8;
+        let section_headers_offset = 0xe0;
+        bytes[strtab_offset..strtab_offset + strtab.len()].copy_from_slice(strtab);
+        bytes[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&object::elf::ET_REL.to_le_bytes());
+        bytes[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&(section_headers_offset as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&5_u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&4_u16.to_le_bytes());
+
+        let write_symbol = |bytes: &mut [u8], index: usize, value: u64| {
+            let symbol_offset = symtab_offset + index * 24;
+            bytes[symbol_offset..symbol_offset + 4].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[symbol_offset + 4] = object::elf::STT_OBJECT;
+            bytes[symbol_offset + 6..symbol_offset + 8].copy_from_slice(&1_u16.to_le_bytes());
+            bytes[symbol_offset + 8..symbol_offset + 16].copy_from_slice(&value.to_le_bytes());
+        };
+        write_symbol(&mut bytes, 1, 0x100);
+        write_symbol(&mut bytes, 2, 0x200);
+
+        let name_offset = |name: &[u8]| -> u32 {
+            shstrtab
+                .windows(name.len())
+                .position(|window| window == name)
+                .unwrap() as u32
+        };
+        let write_section = |bytes: &mut [u8],
+                             index: usize,
+                             name: &[u8],
+                             ty: u32,
+                             flags: u64,
+                             offset: u64,
+                             size: u64,
+                             link: u32,
+                             info: u32,
+                             align: u64,
+                             entsize: u64| {
+            let header = section_headers_offset + index * 64;
+            bytes[header..header + 4].copy_from_slice(&name_offset(name).to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&ty.to_le_bytes());
+            bytes[header + 8..header + 16].copy_from_slice(&flags.to_le_bytes());
+            bytes[header + 24..header + 32].copy_from_slice(&offset.to_le_bytes());
+            bytes[header + 32..header + 40].copy_from_slice(&size.to_le_bytes());
+            bytes[header + 40..header + 44].copy_from_slice(&link.to_le_bytes());
+            bytes[header + 44..header + 48].copy_from_slice(&info.to_le_bytes());
+            bytes[header + 48..header + 56].copy_from_slice(&align.to_le_bytes());
+            bytes[header + 56..header + 64].copy_from_slice(&entsize.to_le_bytes());
+        };
+        write_section(
+            &mut bytes,
+            1,
+            b".text",
+            object::elf::SHT_PROGBITS,
+            u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR),
+            text_offset as u64,
+            0x20,
+            0,
+            0,
+            16,
+            0,
+        );
+        write_section(
+            &mut bytes,
+            2,
+            b".symtab",
+            object::elf::SHT_SYMTAB,
+            0,
+            symtab_offset as u64,
+            72,
+            3,
+            3,
+            8,
+            24,
+        );
+        write_section(
+            &mut bytes,
+            3,
+            b".strtab",
+            object::elf::SHT_STRTAB,
+            0,
+            strtab_offset as u64,
+            strtab.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+        write_section(
+            &mut bytes,
+            4,
+            b".shstrtab",
+            object::elf::SHT_STRTAB,
+            0,
+            shstrtab_offset as u64,
+            shstrtab.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        let first_value_range = symtab_offset + 24 + 8..symtab_offset + 24 + 16;
+        let second_value_range = symtab_offset + 48 + 8..symtab_offset + 48 + 16;
+        (bytes, first_value_range, second_value_range)
     }
 
     fn section_record(
