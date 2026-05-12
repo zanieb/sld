@@ -372,6 +372,24 @@ fn push_import(
     let raw_name = layout.symbol_db.symbol_name(symbol_id)?;
     let name = import_symbol_name(raw_name.bytes()).to_vec();
     let lib_ordinal = import_library_ordinal(layout, &name)?;
+    if let Some((import_index, import)) = imports
+        .iter_mut()
+        .enumerate()
+        .find(|(_, import)| import.name == name && import.lib_ordinal == lib_ordinal)
+    {
+        if let Some(got_address) = got_address {
+            match import.got_address {
+                Some(existing) if existing != got_address => {}
+                _ => {
+                    import.got_address = Some(got_address);
+                    import.stub_address = stub_address;
+                    return Ok(import_index);
+                }
+            }
+        } else {
+            return Ok(import_index);
+        }
+    }
     let import_index = imports.len();
     imports.push(ChainedImport {
         name,
@@ -1433,6 +1451,10 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     resolution.raw_value = resolution.raw_value.wrapping_add(paired_addend as u64);
 
     let raw_value = resolution.raw_value;
+    let got_load_relaxed_to_direct = matches!(
+        rel.r_type,
+        macho::ARM64_RELOC_GOT_LOAD_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+    ) && resolution.format_specific.got_address.is_none();
     let uses_tlv_got = matches!(
         rel.r_type,
         macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
@@ -1512,8 +1534,10 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         )?;
     }
 
-    if rel.r_type == macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 && !uses_tlv_got {
-        rewrite_tlv_pageoff_to_add(&mut out[offset_in_section as usize..])?;
+    if (rel.r_type == macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 && !uses_tlv_got)
+        || (rel.r_type == macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 && got_load_relaxed_to_direct)
+    {
+        rewrite_pageoff_load_to_add(&mut out[offset_in_section as usize..])?;
     }
 
     tracing::trace!(
@@ -1595,17 +1619,17 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
     Ok(Some(new_value))
 }
 
-fn rewrite_tlv_pageoff_to_add(out: &mut [u8]) -> Result {
+fn rewrite_pageoff_load_to_add(out: &mut [u8]) -> Result {
     ensure!(
         out.len() >= 4,
-        "Mach-O TLV pageoff relocation must have a 4-byte instruction"
+        "Mach-O pageoff relocation must have a 4-byte instruction"
     );
     let insn = read_u32(out, 0)?;
-    // ld64 relaxes the TLVP pageoff instruction from:
+    // ld64 relaxes pageoff loads from:
     //     ldr Xt, [Xn, #imm]
     // to:
     //     add Xt, Xn, #imm
-    // so the following call through the TLV descriptor receives the descriptor address.
+    // so the register receives the target address instead of loading through an indirection slot.
     let rewritten = 0x9100_0000 | (insn & 0x003f_ffff);
     write_u32(out, 0, rewritten)
 }

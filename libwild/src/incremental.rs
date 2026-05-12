@@ -9029,6 +9029,10 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
 }
 
 fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
+    if clone_snapshot_bytes(source, target) {
+        return Ok(());
+    }
+
     let mut input = std::fs::File::open(source)
         .with_context(|| format!("Failed to read incremental input `{}`", source.display()))?;
     let mut output = std::fs::File::create(target).with_context(|| {
@@ -9045,6 +9049,28 @@ fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
         )
     })?;
     Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(source) = CString::new(source.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(target) = CString::new(target.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    // `clonefile` creates an APFS copy-on-write clone, so the snapshot keeps
+    // copy semantics without paying to duplicate every input byte up front.
+    unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) == 0 }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn clone_snapshot_bytes(_source: &Path, _target: &Path) -> bool {
+    false
 }
 
 fn input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
