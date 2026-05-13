@@ -337,6 +337,32 @@ impl ObjectLayoutStateExt {
                 .resize_with(required_len, BTreeSet::new);
         }
     }
+
+    pub(crate) fn live_subsection_ranges(
+        &self,
+        section_index: object::SectionIndex,
+        section_size: u64,
+    ) -> Vec<std::ops::Range<u64>> {
+        let Some(Some(boundaries)) = self.subsection_boundaries.get(section_index.0) else {
+            return Vec::new();
+        };
+        let live_subsections = self.live_subsections.get(section_index.0);
+        boundaries
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, start)| {
+                let end = boundaries
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(section_size);
+                (end > start
+                    && live_subsections
+                        .is_some_and(|live_subsections| live_subsections.contains(&start)))
+                .then_some(start..end)
+            })
+            .collect()
+    }
 }
 
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
@@ -2259,7 +2285,8 @@ fn macho_subsection_gc_enabled<'data>(
     Ok(
         !section.should_retain()
             && (section.is_executable()
-                || section_name == b"__gcc_except_tab"),
+                || section_name == b"__gcc_except_tab"
+                || section_name == b"__const"),
     )
 }
 
@@ -2761,14 +2788,6 @@ fn mark_macho_subsection_live<'data>(
             object
                 .enumerate_symbols()
                 .filter_map(|(candidate_index, candidate)| {
-                    if candidate.is_local()
-                        && object
-                            .symbol_name(candidate)
-                            .ok()
-                            .is_some_and(|name| candidate.is_default_strippable(name))
-                    {
-                        return None;
-                    }
                     if candidate.n_desc.get(LE) & N_ALT_ENTRY != 0 {
                         return None;
                     }
@@ -2825,15 +2844,6 @@ fn compact_dead_macho_subsections<'data>(
         .enumerate_symbols()
         .zip(per_symbol_flags.range(object.symbol_id_range))
     {
-        if symbol.is_local()
-            && object
-                .object
-                .symbol_name(symbol)
-                .ok()
-                .is_some_and(|name| symbol.is_default_strippable(name))
-        {
-            continue;
-        }
         let Ok(Some(section_index)) = object.object.symbol_section(symbol, symbol_index) else {
             continue;
         };
