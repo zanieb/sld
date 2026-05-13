@@ -38,14 +38,17 @@ use crate::symbol_db::SymbolDb;
 use crate::symbol_db::SymbolId;
 use crate::symbol_db::Visibility;
 use crate::timing_phase;
+use crate::value_flags::AtomicPerSymbolFlags;
 use crate::value_flags::ValueFlags;
 use gimli::LittleEndian;
+use linker_utils::relaxation::SectionRelaxDeltas;
 use object::Endian;
 use object::Endianness;
 use object::SymbolIndex;
 use object::macho;
 use object::macho::N_ABS;
 use object::macho::N_EXT;
+use object::macho::N_NO_DEAD_STRIP;
 use object::macho::N_PEXT;
 use object::macho::N_SECT;
 use object::macho::N_TYPE;
@@ -60,6 +63,8 @@ use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::Path;
 use zerocopy::BigEndian;
@@ -261,6 +266,76 @@ pub(crate) struct ResolutionExt {
     pub(crate) got_address: Option<NonZeroU64>,
     pub(crate) stub_address: Option<NonZeroU64>,
     pub(crate) is_import: bool,
+}
+
+#[derive(Clone)]
+struct CompactUnwindEntryLookup {
+    entry_start: u64,
+    relocation_indices: Vec<usize>,
+}
+
+struct CompactUnwindLookup {
+    section_index: object::SectionIndex,
+    entries_by_symbol: HashMap<usize, Vec<CompactUnwindEntryLookup>>,
+}
+
+#[derive(Clone)]
+struct EhFrameEntryLookup {
+    fde_start: u64,
+    fde_end: usize,
+    cie_start: u64,
+    cie_end: usize,
+    fde_relocation_indices: Vec<usize>,
+    cie_relocation_indices: Vec<usize>,
+}
+
+struct EhFrameLookup {
+    section_index: object::SectionIndex,
+    entries_by_symbol: HashMap<usize, Vec<EhFrameEntryLookup>>,
+}
+
+#[derive(Clone, Copy)]
+struct EhFrameEntryBounds {
+    start: usize,
+    end: usize,
+    cie_pointer: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct ObjectLayoutStateExt {
+    subsection_boundaries: Vec<Option<Vec<u64>>>,
+    live_subsections: Vec<BTreeSet<u64>>,
+    pub(crate) live_compact_unwind_entries: Vec<BTreeSet<u64>>,
+    pub(crate) live_eh_frame_fdes: Vec<BTreeSet<u64>>,
+    pub(crate) live_eh_frame_cies: Vec<BTreeSet<u64>>,
+    compact_unwind_lookup: Option<Option<CompactUnwindLookup>>,
+    eh_frame_lookup: Option<Option<EhFrameLookup>>,
+}
+
+impl ObjectLayoutStateExt {
+    fn ensure_section(&mut self, section_index: object::SectionIndex) {
+        let required_len = section_index.0 + 1;
+        if self.subsection_boundaries.len() < required_len {
+            self.subsection_boundaries
+                .resize_with(required_len, || None);
+        }
+        if self.live_subsections.len() < required_len {
+            self.live_subsections
+                .resize_with(required_len, BTreeSet::new);
+        }
+        if self.live_compact_unwind_entries.len() < required_len {
+            self.live_compact_unwind_entries
+                .resize_with(required_len, BTreeSet::new);
+        }
+        if self.live_eh_frame_fdes.len() < required_len {
+            self.live_eh_frame_fdes
+                .resize_with(required_len, BTreeSet::new);
+        }
+        if self.live_eh_frame_cies.len() < required_len {
+            self.live_eh_frame_cies
+                .resize_with(required_len, BTreeSet::new);
+        }
+    }
 }
 
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
@@ -1300,7 +1375,7 @@ impl platform::Platform for MachO {
     type LayoutResourcesExt<'data> = ();
     type PreludeLayoutStateExt = ();
     type PreludeLayoutExt = ();
-    type ObjectLayoutStateExt<'data> = ();
+    type ObjectLayoutStateExt<'data> = ObjectLayoutStateExt;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
@@ -1390,7 +1465,18 @@ impl platform::Platform for MachO {
     fn finalise_object_sizes<'data>(
         object: &mut crate::layout::ObjectLayoutState<'data, Self>,
         common: &mut crate::layout::CommonGroupState<'data, Self>,
+        output_sections: &crate::output_section_id::OutputSections<Self>,
+        per_symbol_flags: &AtomicPerSymbolFlags,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) {
+        compact_dead_macho_subsections(
+            object,
+            common,
+            output_sections,
+            per_symbol_flags,
+            symbol_db,
+        );
+        compact_dead_macho_eh_frame(object, common, output_sections, symbol_db);
     }
 
     fn finalise_object_layout<'data>(
@@ -1451,12 +1537,21 @@ impl platform::Platform for MachO {
         let section_part_id =
             state.section_part_id(section_index, &resources.symbol_db.section_part_ids);
         let section_header = state.object.section(section_index)?;
+        if macho_subsection_gc_enabled(state, section_index, resources.symbol_db.args)? {
+            // Relocations in these sections are traversed atom-by-atom from
+            // `load_object_symbol`, so section materialisation alone must not
+            // make every atom reachable.
+            return Ok(());
+        }
         if state.object.section_name(section_header)? == b"__eh_frame" {
             let data = state.object.raw_section_data(section_header)?;
             common.allocate(
                 part_id::MACHO_UNWIND_INFO,
                 macho_unwind_info_allocation_size(macho_eh_frame_fde_count(data)?),
             );
+            if macho_unwind_atom_gc_enabled(state, resources.symbol_db.args) {
+                return Ok(());
+            }
         }
 
         for rel in state.relocations(section_index)?.relocations {
@@ -1473,6 +1568,34 @@ impl platform::Platform for MachO {
             )?;
         }
         Ok(())
+    }
+
+    fn load_object_symbol<'data, 'scope, A: platform::Arch<Platform = Self>>(
+        state: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        symbol_id: crate::symbol_db::SymbolId,
+        resources: &'scope crate::layout::GraphResources<'data, 'scope, Self>,
+        queue: &mut crate::layout::LocalWorkQueue,
+        scope: &rayon::Scope<'scope>,
+    ) -> crate::error::Result<bool> {
+        let symbol_index = state.symbol_id_range.id_to_input(symbol_id);
+        let symbol = state.object.symbol(symbol_index)?;
+        let Some(section_index) = state.object.symbol_section(symbol, symbol_index)? else {
+            return Ok(false);
+        };
+        if !macho_subsection_gc_enabled(state, section_index, resources.symbol_db.args)? {
+            return Ok(false);
+        }
+
+        load_macho_subsection_symbol::<A>(
+            state,
+            common,
+            symbol_index,
+            section_index,
+            resources,
+            queue,
+            scope,
+        )
     }
 
     fn create_dynamic_symbol_definition<'data>(
@@ -1573,6 +1696,9 @@ impl platform::Platform for MachO {
             part_id::MACHO_UNWIND_INFO,
             macho_unwind_info_allocation_size(data.len() / MACHO_COMPACT_UNWIND_ENTRY_SIZE),
         );
+        if macho_unwind_atom_gc_enabled(object, resources.symbol_db.args) {
+            return Ok(());
+        }
 
         for rel in object
             .relocations(compact_unwind_section_index)?
@@ -1593,7 +1719,6 @@ impl platform::Platform for MachO {
                 matches!(field_offset, 0 | 16 | 24),
                 "Unsupported Mach-O __compact_unwind relocation field offset {field_offset:#x}"
             );
-
             let extra_flags = if rel_info.r_extern && field_offset == 16 {
                 ValueFlags::GOT
             } else {
@@ -1854,6 +1979,7 @@ impl platform::Platform for MachO {
                 symbol_db,
                 flags.get(),
                 &state.sections,
+                state.section_relax_deltas(),
             ) {
                 num_globals += 1;
                 strings_size += info.name.len() + 1;
@@ -1945,7 +2071,23 @@ impl platform::Platform for MachO {
     }
 
     fn default_layout_rules(args: &Self::Args) -> Vec<crate::layout_rules::SectionRule<'static>> {
-        DEFAULT_SECTION_RULES.to_vec()
+        let gc_rule = |name, section_id| {
+            if args.dead_strip {
+                SectionRule::exact_section(name, section_id)
+            } else {
+                SectionRule::exact_section_keep(name, section_id)
+            }
+        };
+
+        let mut rules = Vec::with_capacity(DEFAULT_SECTION_RULES.len() + 6);
+        rules.push(gc_rule(b"__text", crate::output_section_id::TEXT));
+        rules.extend(DEFAULT_SECTION_RULES.iter().cloned());
+        rules.push(gc_rule(b"__const", crate::output_section_id::RODATA));
+        rules.push(gc_rule(b"__cstring", crate::output_section_id::CSTRING));
+        rules.push(gc_rule(b"__data", crate::output_section_id::DATA));
+        rules.push(gc_rule(b"__bss", crate::output_section_id::BSS));
+        rules.push(gc_rule(b"__common", crate::output_section_id::BSS));
+        rules
     }
 
     fn build_output_order_and_program_segments<'data>(
@@ -2097,6 +2239,796 @@ fn should_relax_got_load_to_direct(
             relocation_type,
             macho::ARM64_RELOC_GOT_LOAD_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
         )
+}
+
+fn macho_subsection_gc_enabled<'data>(
+    state: &crate::layout::ObjectLayoutState<'data, MachO>,
+    section_index: object::SectionIndex,
+    args: &MachOArgs,
+) -> Result<bool> {
+    if !args.dead_strip || state.object.flags & macho::MH_SUBSECTIONS_VIA_SYMBOLS == 0 {
+        return Ok(false);
+    }
+
+    let section = state.object.section(section_index)?;
+    Ok(section.is_executable() && !section.should_retain())
+}
+
+fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    symbol_index: object::SymbolIndex,
+    section_index: object::SectionIndex,
+    resources: &'scope crate::layout::GraphResources<'data, 'scope, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result<bool> {
+    let Some((start, end, newly_live)) =
+        mark_macho_subsection_live(state, symbol_index, section_index)?
+    else {
+        return Ok(false);
+    };
+
+    queue.send_section_request::<A>(state.file_id, section_index, resources, scope);
+
+    if newly_live {
+        let section_part_id =
+            state.section_part_id(section_index, &resources.symbol_db.section_part_ids);
+        for rel in state.relocations(section_index)?.relocations {
+            let rel_offset = u64::from(rel.info(LE).r_address);
+            if rel_offset < start || rel_offset >= end {
+                continue;
+            }
+            process_relocation::<A>(
+                state,
+                common,
+                rel,
+                section_part_id,
+                resources,
+                queue,
+                false,
+                ValueFlags::empty(),
+                scope,
+            )?;
+        }
+        if state.object.section(section_index)?.is_executable() {
+            load_macho_unwind_metadata_for_symbol::<A>(
+                state,
+                common,
+                symbol_index,
+                resources,
+                queue,
+                scope,
+            )?;
+        }
+    }
+
+    Ok(true)
+}
+
+fn macho_unwind_atom_gc_enabled<'data>(
+    state: &crate::layout::ObjectLayoutState<'data, MachO>,
+    args: &MachOArgs,
+) -> bool {
+    args.dead_strip && state.object.flags & macho::MH_SUBSECTIONS_VIA_SYMBOLS != 0
+}
+
+fn load_macho_unwind_metadata_for_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    symbol_index: object::SymbolIndex,
+    resources: &'scope crate::layout::GraphResources<'data, 'scope, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    if !macho_unwind_atom_gc_enabled(state, resources.symbol_db.args) {
+        return Ok(());
+    }
+
+    load_macho_compact_unwind_for_symbol::<A>(
+        state,
+        common,
+        symbol_index,
+        resources,
+        queue,
+        scope,
+    )?;
+    load_macho_eh_frame_for_symbol::<A>(state, common, symbol_index, resources, queue, scope)
+}
+
+fn load_macho_compact_unwind_for_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    symbol_index: object::SymbolIndex,
+    resources: &'scope crate::layout::GraphResources<'data, 'scope, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    ensure_compact_unwind_lookup(state)?;
+    let Some(lookup) = state
+        .format_specific
+        .compact_unwind_lookup
+        .as_ref()
+        .and_then(Option::as_ref)
+    else {
+        return Ok(());
+    };
+    let compact_section_index = lookup.section_index;
+    let entries = state
+        .format_specific
+        .compact_unwind_lookup
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|lookup| lookup.entries_by_symbol.get(&symbol_index.0))
+        .cloned()
+        .unwrap_or_default();
+    let relocations = state.relocations(compact_section_index)?.relocations;
+
+    for entry in entries {
+        state.format_specific.ensure_section(compact_section_index);
+        if !state.format_specific.live_compact_unwind_entries[compact_section_index.0]
+            .insert(entry.entry_start)
+        {
+            continue;
+        }
+
+        for relocation_index in entry.relocation_indices {
+            let entry_rel = relocations[relocation_index];
+            let entry_rel_info = entry_rel.info(LE);
+            let entry_offset = usize::try_from(entry_rel_info.r_address)
+                .context("Mach-O compact-unwind relocation offset overflow")?;
+            let entry_field_offset = entry_offset % MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+            let extra_flags = if entry_rel_info.r_extern && entry_field_offset == 16 {
+                ValueFlags::GOT
+            } else {
+                ValueFlags::empty()
+            };
+            process_relocation::<A>(
+                state,
+                common,
+                &entry_rel,
+                part_id::MACHO_UNWIND_INFO,
+                resources,
+                queue,
+                true,
+                extra_flags,
+                scope,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_macho_eh_frame_for_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    symbol_index: object::SymbolIndex,
+    resources: &'scope crate::layout::GraphResources<'data, 'scope, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    ensure_eh_frame_lookup(state)?;
+    let Some(lookup) = state
+        .format_specific
+        .eh_frame_lookup
+        .as_ref()
+        .and_then(Option::as_ref)
+    else {
+        return Ok(());
+    };
+    let eh_frame_section_index = lookup.section_index;
+    let section_part_id = state.section_part_id(
+        eh_frame_section_index,
+        &resources.symbol_db.section_part_ids,
+    );
+    let entries = state
+        .format_specific
+        .eh_frame_lookup
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|lookup| lookup.entries_by_symbol.get(&symbol_index.0))
+        .cloned()
+        .unwrap_or_default();
+
+    for entry in entries {
+        state.format_specific.ensure_section(eh_frame_section_index);
+        let fde_is_new = state.format_specific.live_eh_frame_fdes[eh_frame_section_index.0]
+            .insert(entry.fde_start);
+        let cie_is_new = state.format_specific.live_eh_frame_cies[eh_frame_section_index.0]
+            .insert(entry.cie_start);
+
+        if fde_is_new {
+            process_macho_relocation_indices::<A>(
+                state,
+                common,
+                eh_frame_section_index,
+                section_part_id,
+                &entry.fde_relocation_indices,
+                resources,
+                queue,
+                scope,
+            )?;
+        }
+        if cie_is_new {
+            process_macho_relocation_indices::<A>(
+                state,
+                common,
+                eh_frame_section_index,
+                section_part_id,
+                &entry.cie_relocation_indices,
+                resources,
+                queue,
+                scope,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_macho_relocation_indices<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    section_index: object::SectionIndex,
+    section_part_id: part_id::PartId,
+    relocation_indices: &[usize],
+    resources: &'scope crate::layout::GraphResources<'data, 'scope, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    let relocations = state.relocations(section_index)?.relocations;
+    for relocation_index in relocation_indices {
+        let rel = relocations[*relocation_index];
+        process_relocation::<A>(
+            state,
+            common,
+            &rel,
+            section_part_id,
+            resources,
+            queue,
+            false,
+            ValueFlags::empty(),
+            scope,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_compact_unwind_lookup<'data>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+) -> Result {
+    if state.format_specific.compact_unwind_lookup.is_some() {
+        return Ok(());
+    }
+    let Some((compact_section_index, compact_section)) =
+        state.object.section_by_name("__compact_unwind")
+    else {
+        state.format_specific.compact_unwind_lookup = Some(None);
+        return Ok(());
+    };
+    let data = state.object.raw_section_data(compact_section)?;
+    ensure!(
+        data.len() % MACHO_COMPACT_UNWIND_ENTRY_SIZE == 0,
+        "__compact_unwind size must be a multiple of {MACHO_COMPACT_UNWIND_ENTRY_SIZE}"
+    );
+
+    let relocations = state.relocations(compact_section_index)?.relocations;
+    let mut relocation_indices_by_entry: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut entry_starts_by_symbol: HashMap<usize, Vec<u64>> = HashMap::new();
+
+    for (relocation_index, rel) in relocations.iter().copied().enumerate() {
+        let rel_info = rel.info(LE);
+        if rel_info.r_type == macho::ARM64_RELOC_ADDEND {
+            continue;
+        }
+
+        let offset = usize::try_from(rel_info.r_address)
+            .context("Mach-O compact-unwind relocation offset overflow")?;
+        ensure!(
+            offset < data.len(),
+            "Mach-O __compact_unwind relocation at invalid offset {offset:#x}"
+        );
+        let field_offset = offset % MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+        ensure!(
+            matches!(field_offset, 0 | 16 | 24),
+            "Unsupported Mach-O __compact_unwind relocation field offset {field_offset:#x}"
+        );
+        let entry_start = (offset - field_offset) as u64;
+        relocation_indices_by_entry
+            .entry(entry_start)
+            .or_default()
+            .push(relocation_index);
+
+        if field_offset == 0 && rel_info.r_extern {
+            entry_starts_by_symbol
+                .entry(rel_info.r_symbolnum as usize)
+                .or_default()
+                .push(entry_start);
+        }
+    }
+
+    let entries_by_symbol = entry_starts_by_symbol
+        .into_iter()
+        .map(|(symbol_index, entry_starts)| {
+            let entries = entry_starts
+                .into_iter()
+                .map(|entry_start| CompactUnwindEntryLookup {
+                    entry_start,
+                    relocation_indices: relocation_indices_by_entry
+                        .get(&entry_start)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect();
+            (symbol_index, entries)
+        })
+        .collect();
+
+    state.format_specific.compact_unwind_lookup = Some(Some(CompactUnwindLookup {
+        section_index: compact_section_index,
+        entries_by_symbol,
+    }));
+    Ok(())
+}
+
+fn ensure_eh_frame_lookup<'data>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+) -> Result {
+    if state.format_specific.eh_frame_lookup.is_some() {
+        return Ok(());
+    }
+    let Some((eh_frame_section_index, eh_frame_section)) =
+        state.object.section_by_name("__eh_frame")
+    else {
+        state.format_specific.eh_frame_lookup = Some(None);
+        return Ok(());
+    };
+    let data = state.object.raw_section_data(eh_frame_section)?;
+
+    let mut entry_bounds = Vec::new();
+    let mut entry_by_start = HashMap::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let length = macho_read_u32(data, offset)? as usize;
+        if length == 0 {
+            break;
+        }
+        ensure!(
+            length != 0xffff_ffff,
+            "Mach-O 64-bit __eh_frame lengths are not supported"
+        );
+        let entry_end = offset
+            .checked_add(4)
+            .and_then(|entry| entry.checked_add(length))
+            .context("Mach-O __eh_frame entry length overflow")?;
+        ensure!(
+            entry_end <= data.len(),
+            "Mach-O __eh_frame entry at offset {offset:#x} extends past the section"
+        );
+
+        let bounds = EhFrameEntryBounds {
+            start: offset,
+            end: entry_end,
+            cie_pointer: macho_read_u32(data, offset + 4)?,
+        };
+        entry_bounds.push(bounds);
+        entry_by_start.insert(offset, bounds);
+        offset = entry_end;
+    }
+
+    let relocations = state.relocations(eh_frame_section_index)?.relocations;
+    let mut relocation_order = relocations
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(relocation_index, rel)| {
+            let rel_info = rel.info(LE);
+            (rel_info.r_type != macho::ARM64_RELOC_ADDEND)
+                .then_some((rel_info.r_address as usize, relocation_index))
+        })
+        .collect::<Vec<_>>();
+    relocation_order.sort_unstable_by_key(|(offset, _)| *offset);
+
+    let mut relocation_indices_by_entry: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut relocation_cursor = 0usize;
+    for bounds in &entry_bounds {
+        while relocation_cursor < relocation_order.len()
+            && relocation_order[relocation_cursor].0 < bounds.start
+        {
+            relocation_cursor += 1;
+        }
+        let entry_relocation_start = relocation_cursor;
+        while relocation_cursor < relocation_order.len()
+            && relocation_order[relocation_cursor].0 < bounds.end
+        {
+            relocation_cursor += 1;
+        }
+        relocation_indices_by_entry.insert(
+            bounds.start as u64,
+            relocation_order[entry_relocation_start..relocation_cursor]
+                .iter()
+                .map(|(_, relocation_index)| *relocation_index)
+                .collect(),
+        );
+    }
+
+    let mut entries_by_symbol: HashMap<usize, Vec<EhFrameEntryLookup>> = HashMap::new();
+    for bounds in entry_bounds
+        .iter()
+        .copied()
+        .filter(|bounds| bounds.cie_pointer != 0)
+    {
+        let pc_begin_offset = bounds.start + 8;
+        let fde_relocation_indices = relocation_indices_by_entry
+            .get(&(bounds.start as u64))
+            .cloned()
+            .unwrap_or_default();
+        let symbol_indices = fde_relocation_indices
+            .iter()
+            .filter_map(|relocation_index| {
+                let rel_info = relocations[*relocation_index].info(LE);
+                (rel_info.r_address as usize == pc_begin_offset && rel_info.r_extern)
+                    .then_some(rel_info.r_symbolnum as usize)
+            });
+
+        let cie_pointer_offset = bounds.start + 4;
+        let cie_start = cie_pointer_offset
+            .checked_sub(bounds.cie_pointer as usize)
+            .with_context(|| {
+                format!(
+                    "Mach-O __eh_frame FDE at offset {:#x} references invalid CIE pointer {:#x}",
+                    bounds.start, bounds.cie_pointer
+                )
+            })?;
+        let cie_bounds = entry_by_start.get(&cie_start).copied().with_context(|| {
+            format!(
+                "Mach-O __eh_frame FDE at offset {:#x} references missing CIE at offset {cie_start:#x}",
+                bounds.start
+            )
+        })?;
+        ensure!(
+            cie_bounds.cie_pointer == 0,
+            "Mach-O __eh_frame FDE at offset {:#x} references non-CIE entry {cie_start:#x}",
+            bounds.start
+        );
+        let cie_relocation_indices = relocation_indices_by_entry
+            .get(&(cie_start as u64))
+            .cloned()
+            .unwrap_or_default();
+
+        for symbol_index in symbol_indices {
+            entries_by_symbol
+                .entry(symbol_index)
+                .or_default()
+                .push(EhFrameEntryLookup {
+                    fde_start: bounds.start as u64,
+                    fde_end: bounds.end,
+                    cie_start: cie_start as u64,
+                    cie_end: cie_bounds.end,
+                    fde_relocation_indices: fde_relocation_indices.clone(),
+                    cie_relocation_indices: cie_relocation_indices.clone(),
+                });
+        }
+    }
+
+    state.format_specific.eh_frame_lookup = Some(Some(EhFrameLookup {
+        section_index: eh_frame_section_index,
+        entries_by_symbol,
+    }));
+    Ok(())
+}
+
+fn macho_read_u32(data: &[u8], offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .context("Mach-O 32-bit read offset overflow")?;
+    let bytes = data
+        .get(offset..end)
+        .with_context(|| format!("Mach-O 32-bit read at offset {offset:#x} is out of bounds"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn mark_macho_subsection_live<'data>(
+    state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    symbol_index: object::SymbolIndex,
+    section_index: object::SectionIndex,
+) -> Result<Option<(u64, u64, bool)>> {
+    let symbol = state.object.symbol(symbol_index)?;
+    let symbol_offset = state
+        .object
+        .symbol_offset_in_section(symbol, section_index)?;
+    let section_size = state
+        .object
+        .section_size(state.object.section(section_index)?)?;
+    let object = state.object;
+    let ext = &mut state.format_specific;
+    ext.ensure_section(section_index);
+
+    let boundaries = ext.subsection_boundaries[section_index.0].get_or_insert_with(|| {
+        let mut offsets = vec![0];
+        offsets.extend(
+            object
+                .enumerate_symbols()
+                .filter_map(|(candidate_index, candidate)| {
+                    if candidate.is_local()
+                        && object
+                            .symbol_name(candidate)
+                            .ok()
+                            .is_some_and(|name| candidate.is_default_strippable(name))
+                    {
+                        return None;
+                    }
+                    let candidate_section = object
+                        .symbol_section(candidate, candidate_index)
+                        .ok()
+                        .flatten()?;
+                    if candidate_section != section_index {
+                        return None;
+                    }
+                    object
+                        .symbol_offset_in_section(candidate, candidate_section)
+                        .ok()
+                })
+                .filter(|offset| *offset < section_size),
+        );
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
+    });
+
+    let boundary_index = boundaries.partition_point(|boundary| *boundary <= symbol_offset);
+    if boundary_index == 0 {
+        return Ok(None);
+    }
+    let boundary_index = boundary_index - 1;
+    let start = boundaries[boundary_index];
+    let end = boundaries
+        .get(boundary_index + 1)
+        .copied()
+        .unwrap_or(section_size);
+    if end <= start {
+        return Ok(None);
+    }
+
+    let newly_live = ext.live_subsections[section_index.0].insert(start);
+    Ok(Some((start, end, newly_live)))
+}
+
+fn compact_dead_macho_subsections<'data>(
+    object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    output_sections: &crate::output_section_id::OutputSections<MachO>,
+    per_symbol_flags: &AtomicPerSymbolFlags,
+    symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
+) {
+    if !symbol_db.args.dead_strip || object.object.flags & macho::MH_SUBSECTIONS_VIA_SYMBOLS == 0 {
+        return;
+    }
+
+    let mut symbols_by_section = vec![Vec::<(u64, bool)>::new(); object.sections.len()];
+    for ((symbol_index, symbol), flags) in object
+        .object
+        .enumerate_symbols()
+        .zip(per_symbol_flags.range(object.symbol_id_range))
+    {
+        if symbol.is_local()
+            && object
+                .object
+                .symbol_name(symbol)
+                .ok()
+                .is_some_and(|name| symbol.is_default_strippable(name))
+        {
+            continue;
+        }
+        let Ok(Some(section_index)) = object.object.symbol_section(symbol, symbol_index) else {
+            continue;
+        };
+        let Ok(offset) = object
+            .object
+            .symbol_offset_in_section(symbol, section_index)
+        else {
+            continue;
+        };
+        let explicitly_live = object
+            .format_specific
+            .live_subsections
+            .get(section_index.0)
+            .is_some_and(|live_subsections| live_subsections.contains(&offset));
+        let keep = explicitly_live
+            || flags.get().has_resolution()
+            || symbol.n_desc.get(LE) & N_NO_DEAD_STRIP != 0;
+        symbols_by_section[section_index.0].push((offset, keep));
+    }
+
+    for section_number in 0..object.sections.len() {
+        if !matches!(
+            object.sections.get(section_number),
+            Some(crate::resolution::SectionSlot::Loaded(_))
+        ) {
+            continue;
+        }
+        let section_index = object::SectionIndex(section_number);
+        let Ok(section_header) = object.object.section(section_index) else {
+            continue;
+        };
+        if !section_header.is_executable() || section_header.should_retain() {
+            continue;
+        }
+        let Ok(section_size) = object.object.section_size(section_header) else {
+            continue;
+        };
+
+        let atoms = &mut symbols_by_section[section_number];
+        if atoms.is_empty() {
+            continue;
+        }
+        atoms.sort_unstable_by_key(|(offset, _)| *offset);
+        if atoms.first().is_some_and(|(offset, _)| *offset > 0) {
+            atoms.insert(0, (0, false));
+        }
+
+        let mut merged_atoms = Vec::with_capacity(atoms.len());
+        for &(offset, keep) in atoms.iter() {
+            if let Some((last_offset, last_keep)) = merged_atoms.last_mut()
+                && *last_offset == offset
+            {
+                *last_keep |= keep;
+            } else {
+                merged_atoms.push((offset, keep));
+            }
+        }
+
+        let mut raw_deltas = Vec::new();
+        for (index, &(start, keep)) in merged_atoms.iter().enumerate() {
+            let end = merged_atoms
+                .get(index + 1)
+                .map_or(section_size, |(next_start, _)| *next_start);
+            if keep || end <= start {
+                continue;
+            }
+            let Ok(bytes_deleted) = u32::try_from(end - start) else {
+                raw_deltas.clear();
+                break;
+            };
+            raw_deltas.push((start, bytes_deleted));
+        }
+        if raw_deltas.is_empty() {
+            continue;
+        }
+
+        let deleted = raw_deltas
+            .iter()
+            .map(|(_, bytes_deleted)| u64::from(*bytes_deleted))
+            .sum::<u64>();
+        let part_id = object.section_part_id(section_index, &symbol_db.section_part_ids);
+        let Some(crate::resolution::SectionSlot::Loaded(section)) =
+            object.sections.get_mut(section_number)
+        else {
+            continue;
+        };
+        let old_capacity = section.capacity(part_id, output_sections);
+        section.size = section.size.saturating_sub(deleted);
+        let new_capacity = section.capacity(part_id, output_sections);
+        if old_capacity > new_capacity {
+            common.deallocate(part_id, old_capacity - new_capacity);
+        }
+
+        if let Some(existing) = object.section_relax_deltas_mut().get_mut(section_number) {
+            existing.merge_additional(raw_deltas);
+        } else {
+            object
+                .section_relax_deltas_mut()
+                .insert_sorted(section_number, SectionRelaxDeltas::new(raw_deltas));
+        }
+    }
+}
+
+fn compact_dead_macho_eh_frame<'data>(
+    object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    common: &mut crate::layout::CommonGroupState<'data, MachO>,
+    output_sections: &crate::output_section_id::OutputSections<MachO>,
+    symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
+) {
+    if !macho_unwind_atom_gc_enabled(object, symbol_db.args) {
+        return;
+    }
+
+    let Some((section_index, section_header)) = object.object.section_by_name("__eh_frame") else {
+        return;
+    };
+    if !matches!(
+        object.sections.get(section_index.0),
+        Some(crate::resolution::SectionSlot::Loaded(_))
+    ) {
+        return;
+    }
+
+    let Ok(data) = object.object.raw_section_data(section_header) else {
+        return;
+    };
+    let live_fdes = object
+        .format_specific
+        .live_eh_frame_fdes
+        .get(section_index.0);
+    let live_cies = object
+        .format_specific
+        .live_eh_frame_cies
+        .get(section_index.0);
+
+    let mut raw_deltas = Vec::new();
+    let mut offset = 0usize;
+    while offset + size_of::<u32>() <= data.len() {
+        let Ok(length) = macho_read_u32(data, offset) else {
+            raw_deltas.clear();
+            break;
+        };
+        let length = length as usize;
+        if length == 0 {
+            break;
+        }
+        if length == 0xffff_ffff {
+            raw_deltas.clear();
+            break;
+        }
+        let Some(entry_end) = offset
+            .checked_add(size_of::<u32>())
+            .and_then(|entry| entry.checked_add(length))
+        else {
+            raw_deltas.clear();
+            break;
+        };
+        if entry_end > data.len() {
+            raw_deltas.clear();
+            break;
+        }
+        let Ok(cie_pointer) = macho_read_u32(data, offset + size_of::<u32>()) else {
+            raw_deltas.clear();
+            break;
+        };
+        let keep = if cie_pointer == 0 {
+            live_cies.is_some_and(|entries| entries.contains(&(offset as u64)))
+        } else {
+            live_fdes.is_some_and(|entries| entries.contains(&(offset as u64)))
+        };
+        if !keep {
+            let Ok(bytes_deleted) = u32::try_from(entry_end - offset) else {
+                raw_deltas.clear();
+                break;
+            };
+            raw_deltas.push((offset as u64, bytes_deleted));
+        }
+        offset = entry_end;
+    }
+    if raw_deltas.is_empty() {
+        return;
+    }
+
+    let deleted = raw_deltas
+        .iter()
+        .map(|(_, bytes_deleted)| u64::from(*bytes_deleted))
+        .sum::<u64>();
+    let part_id = object.section_part_id(section_index, &symbol_db.section_part_ids);
+    let Some(crate::resolution::SectionSlot::Loaded(section)) =
+        object.sections.get_mut(section_index.0)
+    else {
+        return;
+    };
+    let old_capacity = section.capacity(part_id, output_sections);
+    section.size = section.size.saturating_sub(deleted);
+    let new_capacity = section.capacity(part_id, output_sections);
+    if old_capacity > new_capacity {
+        common.deallocate(part_id, old_capacity - new_capacity);
+    }
+
+    if let Some(existing) = object.section_relax_deltas_mut().get_mut(section_index.0) {
+        existing.merge_additional(raw_deltas);
+    } else {
+        object
+            .section_relax_deltas_mut()
+            .insert_sorted(section_index.0, SectionRelaxDeltas::new(raw_deltas));
+    }
 }
 
 fn chained_fixup_table_allocation_size(
@@ -2352,17 +3284,13 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
-    SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
     SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::EH_FRAME),
     SectionRule::exact_section_keep(
         b"__gcc_except_tab",
         crate::output_section_id::GCC_EXCEPT_TABLE,
     ),
     SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
-    SectionRule::exact_section_keep(b"__const", crate::output_section_id::RODATA),
-    SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
     SectionRule::exact_section_keep(b".rustc", crate::output_section_id::RUSTC_METADATA),
-    SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
     SectionRule::exact_section_keep(
         b"__mod_init_func",
         crate::output_section_id::MACHO_MOD_INIT_FUNC,
@@ -2377,8 +3305,6 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     ),
     SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
     SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
-    SectionRule::exact_section_keep(b"__bss", crate::output_section_id::BSS),
-    SectionRule::exact_section_keep(b"__common", crate::output_section_id::BSS),
     // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
 ];
 
@@ -2490,8 +3416,8 @@ pub(crate) fn get_segment_sections<'data>(
 
 #[inline(always)]
 fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
-    object: &layout::ObjectLayoutState<'data, MachO>,
-    common: &layout::CommonGroupState<'data, MachO>,
+    object: &mut layout::ObjectLayoutState<'data, MachO>,
+    common: &mut layout::CommonGroupState<'data, MachO>,
     rel: &Relocation,
     section_part_id: part_id::PartId,
     resources: &'scope layout::GraphResources<'data, '_, MachO>,
@@ -2534,6 +3460,33 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let symbol_db = resources.symbol_db;
         let local_symbol_id = object.symbol_id_range.input_to_id(local_sym_index);
         let symbol_id = symbol_db.definition(local_symbol_id);
+        let local_symbol = object.object.symbol(local_sym_index)?;
+        if let Some(section_index) = object
+            .object
+            .symbol_section(local_symbol, local_sym_index)?
+        {
+            let keeps_same_object_subsection =
+                local_symbol.is_local() || local_symbol.is_hidden() || symbol_id == local_symbol_id;
+            if keeps_same_object_subsection
+                && macho_subsection_gc_enabled(object, section_index, resources.symbol_db.args)?
+            {
+                load_macho_subsection_symbol::<A>(
+                    object,
+                    common,
+                    local_sym_index,
+                    section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+            } else if local_symbol.is_local() || local_symbol.is_hidden() {
+                // Local/private-extern Mach-O references may need this object's
+                // section address even when the canonical symbol request resolves
+                // elsewhere. Keep the local section materialised so writer-time
+                // relocation fallback has an address to use.
+                queue.send_section_request::<A>(object.file_id, section_index, resources, scope);
+            }
+        }
         let mut flags = resources.local_flags_for_symbol(symbol_id);
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
         let rel_offset = rel_info.r_address;

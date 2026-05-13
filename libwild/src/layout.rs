@@ -772,6 +772,9 @@ pub(crate) struct ObjectLayout<'data, P: Platform> {
 
     /// Whether this object is responsible for writing the thunks in its ThunkBlock.
     pub(crate) owns_thunk_block: bool,
+
+    /// Format-specific per-object state that must survive into writer time.
+    pub(crate) format_specific: P::ObjectLayoutStateExt<'data>,
 }
 
 #[derive(Debug)]
@@ -900,9 +903,9 @@ impl<'data, P: Platform> SymbolRequestHandler<'data, P> for ObjectLayoutState<'d
         &mut self,
         common: &mut CommonGroupState<'data, P>,
         symbol_id: SymbolId,
-        resources: &GraphResources<'data, 'scope, P>,
+        resources: &'scope GraphResources<'data, 'scope, P>,
         queue: &mut LocalWorkQueue,
-        _scope: &Scope<'scope>,
+        scope: &Scope<'scope>,
     ) -> Result {
         debug_assert_bail!(
             resources.symbol_db.is_canonical(symbol_id),
@@ -912,6 +915,10 @@ impl<'data, P: Platform> SymbolRequestHandler<'data, P> for ObjectLayoutState<'d
 
         let object_symbol_index = self.symbol_id_range.id_to_input(symbol_id);
         let local_symbol = self.object.symbol(object_symbol_index)?;
+
+        if P::load_object_symbol::<A>(self, common, symbol_id, resources, queue, scope)? {
+            return Ok(());
+        }
 
         if let Some(section_id) = self
             .object
@@ -1122,6 +1129,10 @@ impl<'data, P: Platform> CommonGroupState<'data, P> {
 
     pub(crate) fn allocate(&mut self, part_id: PartId, size: u64) {
         self.mem_sizes.increment(part_id, size);
+    }
+
+    pub(crate) fn deallocate(&mut self, part_id: PartId, size: u64) {
+        self.mem_sizes.decrement(part_id, size);
     }
 
     /// Allocate resources and update attributes based on a section having been loaded.
@@ -3741,6 +3752,14 @@ fn new_dynamic_object_layout_state<'data, P: Platform>(
 }
 
 impl<'data, P: Platform> ObjectLayoutState<'data, P> {
+    pub(crate) fn section_relax_deltas(&self) -> &RelaxDeltaMap {
+        &self.section_relax_deltas
+    }
+
+    pub(crate) fn section_relax_deltas_mut(&mut self) -> &mut RelaxDeltaMap {
+        &mut self.section_relax_deltas
+    }
+
     #[inline(always)]
     fn activate<'scope, A: Arch<Platform = P>>(
         &mut self,
@@ -3994,7 +4013,13 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             }
         }
 
-        P::finalise_object_sizes(self, common);
+        P::finalise_object_sizes(
+            self,
+            common,
+            output_sections,
+            per_symbol_flags,
+            resources.symbol_db,
+        );
 
         Ok(())
     }
@@ -4112,6 +4137,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             section_relax_deltas: self.section_relax_deltas,
             thunk_block_id: self.thunk_block_id,
             owns_thunk_block: self.owns_thunk_block,
+            format_specific: self.format_specific,
         })
     }
 
@@ -4320,6 +4346,7 @@ impl<'data> SymbolCopyInfo<'data> {
         symbol_db: &SymbolDb<'data, P>,
         symbol_state: ValueFlags,
         sections: &[SectionSlot],
+        section_relax_deltas: &RelaxDeltaMap,
     ) -> Option<SymbolCopyInfo<'data>> {
         if !symbol_db.is_canonical(symbol_id) || sym.is_undefined() {
             return None;
@@ -4329,6 +4356,15 @@ impl<'data> SymbolCopyInfo<'data> {
             && !sections[section.0].is_loaded()
         {
             // Symbol is in a discarded section.
+            return None;
+        }
+
+        if let Ok(Some(section)) = object.symbol_section(sym, sym_index)
+            && let Some(deltas) = section_relax_deltas.get(section.0)
+            && let Ok(offset) = object.symbol_offset_in_section(sym, section)
+            && deltas.deletes_input_offset(offset)
+        {
+            // Symbol is in bytes that were compacted out of the output section.
             return None;
         }
 

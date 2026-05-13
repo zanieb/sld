@@ -374,6 +374,9 @@ pub(crate) trait Platform:
     fn finalise_object_sizes<'data>(
         object: &mut layout::ObjectLayoutState<'data, Self>,
         common: &mut layout::CommonGroupState<'data, Self>,
+        output_sections: &OutputSections<Self>,
+        per_symbol_flags: &AtomicPerSymbolFlags,
+        symbol_db: &SymbolDb<'data, Self>,
     );
 
     fn finalise_object_layout<'data>(
@@ -420,6 +423,19 @@ pub(crate) trait Platform:
         section_index: object::SectionIndex,
         scope: &Scope<'scope>,
     ) -> Result;
+
+    /// Gives a platform the chance to handle symbol-driven liveness more precisely than loading
+    /// the whole containing input section. Returns `true` when the platform handled the request.
+    fn load_object_symbol<'data, 'scope, A: Arch<Platform = Self>>(
+        _state: &mut layout::ObjectLayoutState<'data, Self>,
+        _common: &mut layout::CommonGroupState<'data, Self>,
+        _symbol_id: SymbolId,
+        _resources: &'scope layout::GraphResources<'data, 'scope, Self>,
+        _queue: &mut layout::LocalWorkQueue,
+        _scope: &Scope<'scope>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 
     fn create_dynamic_symbol_definition<'data>(
         symbol_db: &SymbolDb<'data, Self>,

@@ -1838,6 +1838,7 @@ fn build_sym_index_map(layout: &ElfLayout<'_>) -> Vec<Option<u32>> {
                     &layout.symbol_db,
                     flags.get(),
                     &object.sections,
+                    &object.section_relax_deltas,
                 )
                 .is_some()
                 {
@@ -2396,6 +2397,7 @@ fn write_symbols<'data>(
             &layout.symbol_db,
             flags.get(),
             &object.sections,
+            &object.section_relax_deltas,
         ) {
             let e = LittleEndian;
 
