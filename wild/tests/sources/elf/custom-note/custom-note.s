@@ -1,9 +1,14 @@
 /*
 //#LinkArgs:-shared -z now --gc-sections
 //#RunEnabled:false
+//#EnableLinker:mold
 //#Contains:FOOBAR
 //#Contains:HELLO_WORLD
 //#DiffIgnore:section.got
+//#DiffIgnore:section.eh_frame
+//#DiffIgnore:section.eh_frame_hdr
+//#DiffIgnore:eh_frame.*
+//#DiffIgnore:segment.GNU_EH_FRAME.*
 //#DiffIgnore:segment.RISCV_ATTRIBUTES.*
 // Wild emits `.riscv.attributes`, but GNU ld does not
 //#DiffIgnore:riscv_attributes.*

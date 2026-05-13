@@ -1324,6 +1324,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    fn has_section_start_address_overrides(&self) -> bool {
+        false
+    }
+
     /// Returns the address override for a `SEGMENT_START` segment name, as set via
     /// `-Ttext`, `-Tdata` or `-Tbss` on the command line. Returns `None` if no override
     /// was provided, in which case `SEGMENT_START` should return its default value.

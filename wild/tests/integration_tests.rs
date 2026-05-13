@@ -563,6 +563,10 @@ impl Linker {
     fn is_lld(&self) -> bool {
         self.name() == "lld"
     }
+
+    fn is_apple_ld(&self) -> bool {
+        self.name() == "apple-ld"
+    }
 }
 
 fn wild_path() -> &'static Path {
@@ -4688,13 +4692,29 @@ impl LinkCommand {
                             }
                         }
                         PlatformKind::MachO => {
-                            if linker.is_lld() {
+                            if linker.is_lld() || linker.is_apple_ld() {
                                 let arch = cross_arch.unwrap_or(arch);
                                 command.arg("-arch").arg(arch.darwin_arch_name());
                                 command.arg("-platform_version");
                                 command.arg("macos");
                                 command.arg("11.0");
                                 command.arg("11.0");
+                            }
+
+                            if linker.is_apple_ld() {
+                                command
+                                    .arg("-syslibroot")
+                                    .arg(macos_sdk_path().context(
+                                        "Apple ld requires a macOS SDK path from xcrun",
+                                    )?);
+
+                                if !linker_args
+                                    .args
+                                    .iter()
+                                    .any(|arg| arg == "-r" || arg == "-dylib" || arg == "-bundle")
+                                {
+                                    command.arg("-lSystem");
+                                }
                             }
                         }
                     }
@@ -6250,6 +6270,18 @@ fn available_linkers_for_linux() -> Result<Vec<Linker>> {
 fn available_linkers_for_mac() -> Result<Vec<Linker>> {
     let mut linkers = Vec::new();
 
+    if cfg!(target_os = "macos") && macos_sdk_path().is_some() {
+        if let Ok(path) = find_bin(&["ld"]) {
+            linkers.push(Linker::ThirdParty(ThirdPartyLinker {
+                name: "apple-ld",
+                gcc_name: "ld",
+                path,
+                cross_paths: HashMap::new(),
+                enabled_by_default: false,
+            }));
+        }
+    }
+
     if let Ok(path) = find_bin(&["ld.lld"]) {
         linkers.push(Linker::ThirdParty(ThirdPartyLinker {
             name: "lld",
@@ -6263,6 +6295,25 @@ fn available_linkers_for_mac() -> Result<Vec<Linker>> {
     linkers.push(Linker::Wild);
 
     Ok(linkers)
+}
+
+fn macos_sdk_path() -> Option<&'static Path> {
+    static SDK_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SDK_PATH
+        .get_or_init(|| {
+            let output = Command::new("xcrun").arg("--show-sdk-path").output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8(output.stdout).ok()?;
+            let path = stdout.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
+        })
+        .as_deref()
 }
 
 fn run_with_config(
@@ -6719,11 +6770,17 @@ impl Filter {
             return false;
         };
 
-        if self.exact {
+        if self.exact || Self::is_rooted_filter(filter) {
             !filter.starts_with(prefix) && !prefix.starts_with(filter)
         } else {
             false
         }
+    }
+
+    fn is_rooted_filter(filter: &str) -> bool {
+        ["elf/", "macho/", "external_test_suites/"]
+            .iter()
+            .any(|prefix| filter.starts_with(prefix))
     }
 }
 

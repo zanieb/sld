@@ -2064,6 +2064,13 @@ impl platform::Args for ElfArgs {
         }
     }
 
+    fn has_section_start_address_overrides(&self) -> bool {
+        !self.section_start.is_empty()
+            || self.ttext.is_some()
+            || self.tdata.is_some()
+            || self.tbss.is_some()
+    }
+
     fn segment_start_override(&self, name: crate::parsing::SegmentName) -> Option<u64> {
         match name {
             crate::parsing::SegmentName::Text => self.ttext,

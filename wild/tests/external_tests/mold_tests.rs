@@ -119,6 +119,10 @@ fn check_mold_tests_regression(mold_test: PathBuf) -> Result {
 fn verify_skipped_mold_tests_still_fail(mold_test: PathBuf) -> Result {
     let output = run_mold_test(&mold_test)?;
     if output.status.success() {
+        if mold_test_was_skipped(&output) {
+            return Ok(());
+        }
+
         let linker = external_linker_name();
         let message = if using_third_party_linker() {
             format!(
@@ -135,6 +139,12 @@ fn verify_skipped_mold_tests_still_fail(mold_test: PathBuf) -> Result {
     }
 
     Ok(())
+}
+
+fn mold_test_was_skipped(output: &Output) -> bool {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim_end().ends_with(" skipped"))
 }
 
 fn load_skip_tests_config() -> &'static Option<Vec<String>> {

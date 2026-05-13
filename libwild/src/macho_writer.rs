@@ -81,7 +81,6 @@ use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
 use crate::sharding::ShardKey;
 use crate::symbol_db::SymbolId;
-use crate::thunks::ThunkBlockId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
@@ -1214,7 +1213,14 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
             .thunk_block_addresses
             .get(object.thunk_block_id.as_usize())
     {
-        write_thunks::<A>(addresses, buffers, layout)?;
+        let part_id = layout.thunk_block_part_ids[object.thunk_block_id.as_usize()];
+        write_thunks::<A>(addresses, part_id, buffers, layout)?;
+    }
+    for &block_id in &object.extra_thunk_block_ids {
+        if let Some(addresses) = layout.thunk_block_addresses.get(block_id.as_usize()) {
+            let part_id = layout.thunk_block_part_ids[block_id.as_usize()];
+            write_thunks::<A>(addresses, part_id, buffers, layout)?;
+        }
     }
 
     Ok(())
@@ -1222,6 +1228,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
 
 fn write_thunks<A: Arch<Platform = MachO>>(
     thunk_addresses: &std::collections::BTreeMap<SymbolId, u64>,
+    part_id: crate::part_id::PartId,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'_>,
 ) -> Result {
@@ -1233,7 +1240,11 @@ fn write_thunks<A: Arch<Platform = MachO>>(
         return Ok(());
     }
 
-    let buffer = buffers.get_mut(config.primary_function_part_id);
+    let buffer = buffers.get_mut(part_id);
+    let raw_size = thunk_addresses.len() * thunk_size;
+    let allocation_size = part_id
+        .alignment(&layout.output_sections)
+        .align_up_usize(raw_size);
     for (&symbol_id, &thunk_address) in thunk_addresses {
         ensure!(
             thunk_address != 0,
@@ -1257,6 +1268,12 @@ fn write_thunks<A: Arch<Platform = MachO>>(
             .split_off_mut(..thunk_size)
             .ok_or_else(|| crate::file_writer::insufficient_allocation("Mach-O thunk space"))?;
         A::write_thunk(thunk_address, target_address, thunk_buf);
+    }
+    let padding_size = allocation_size - raw_size;
+    if padding_size > 0 {
+        buffer
+            .split_off_mut(..padding_size)
+            .ok_or_else(|| crate::file_writer::insufficient_allocation("Mach-O thunk space"))?;
     }
     Ok(())
 }
@@ -1642,11 +1659,12 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
     }
 
     let canonical_id = layout.symbol_db.definition(local_symbol_id);
-    let thunk_id = if section_part_id == config.primary_function_part_id {
-        object_layout.thunk_block_id
-    } else {
-        ThunkBlockId::FIRST
-    };
+    let thunk_id = crate::thunks::block_id_for_source_part(
+        object_layout,
+        &layout.thunk_block_part_ids,
+        section_part_id,
+        config.primary_function_part_id,
+    );
 
     let thunk_address = layout
         .thunk_block_addresses

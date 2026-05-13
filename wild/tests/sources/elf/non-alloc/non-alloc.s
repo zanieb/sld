@@ -2,6 +2,12 @@
 
 //#LinkArgs:-z noexecstack
 //#Object:runtime.c
+//#EnableLinker:mold
+//#DiffIgnore:section.got
+//#DiffIgnore:section.eh_frame
+//#DiffIgnore:section.eh_frame_hdr
+//#DiffIgnore:eh_frame.*
+//#DiffIgnore:segment.GNU_EH_FRAME.*
 //#Arch: x86_64
 
 .section .nonloadable, "R", @progbits

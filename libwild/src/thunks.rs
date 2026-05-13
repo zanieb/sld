@@ -6,31 +6,31 @@
 //! Our support for range-extension thunks makes some assumptions in order to be as efficient as
 //! possible. The main assumption is that the bulk of the executable code will be placed into a
 //! single output part. We call this part the primary-part. Its ID can be obtained from
-//! `ThunkConfig::primary_function_part_id`. We assume that all the other executable code will be
-//! before this primary part and that it'll fit within the range of a range-limited branch
-//! instruction. This, we refer to as the non-primary parts. It includes functions with higher
-//! alignment, the PLT, .init, .fini etc.
+//! `ThunkConfig::primary_function_part_id`. Other executable code is tracked as non-primary parts.
+//! It includes functions with higher alignment, the PLT, .init, .fini etc.
 //!
 //! When processing relocations, we check if a relocation is range-limited. If it is, then we handle
 //! it in one of the following ways depending on whether the section containing the relocation is
 //! mapped to the primary part and whether the definition symbol is contained in a section that's
 //! mapped to the primary part.
 //!
-//! * Non-primary part references non-primary part: Assumed to be in range.
-//! * Non-primary part references primary part: Stored in
-//!   ThunkLayoutBuilder::non_primary_referenced_symbols.
-//! * Prmary part references anything: ValueFlags::HAS_RANGE_LIMITED_REL set for local symbol in the
+//! * Non-primary part references anything: The source part and target range are checked after
+//!   layout. If they're too far apart, a thunk block is allocated in the source part.
+//! * Primary part references anything: ValueFlags::HAS_RANGE_LIMITED_REL set for local symbol in the
 //!   object that made the reference.
 
 use crate::input_data::FileId;
 use crate::layout;
 use crate::layout::FileLayoutState;
+use crate::output_section_id::OutputOrder;
 use crate::output_section_id::OutputSections;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::part_id::PartId;
 use crate::platform::Arch;
+use crate::platform::ObjectFile as _;
 use crate::platform::Platform;
-use crate::platform::SectionAttributes as _;
+use crate::platform::SectionHeader as _;
+use crate::program_segments::ProgramSegments;
 use crate::resolution;
 use crate::symbol_db::SymbolId;
 use crate::timing_phase;
@@ -42,6 +42,7 @@ use itertools::Itertools as _;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator as _;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Identifies a ThunkBlock within a Vec.
@@ -55,21 +56,30 @@ impl ThunkBlockId {
     pub(crate) fn as_usize(self) -> usize {
         self.0 as usize
     }
+
+    pub(crate) fn from_usize(value: usize) -> Self {
+        Self(value as u32)
+    }
 }
 
 pub(crate) struct ThunkBlock {
+    /// Part in which thunks for this block are placed.
+    pub(crate) part_id: PartId,
+
     /// Sorted and deduplicated SymbolIds for which we need thunks.
     pub(crate) symbols: Vec<SymbolId>,
 }
 
-struct ThunkBlockBuilder<'data, 'state, P: Platform> {
-    objects: Vec<&'state layout::ObjectLayoutState<'data, P>>,
+struct ThunkBlockBuilder {
+    part_id: PartId,
+    objects: Vec<FileId>,
     symbols: Vec<SymbolId>,
 }
 
-impl<'data, 'state, P: Platform> Default for ThunkBlockBuilder<'data, 'state, P> {
-    fn default() -> Self {
+impl ThunkBlockBuilder {
+    fn new(part_id: PartId) -> Self {
         Self {
+            part_id,
             objects: Vec::new(),
             symbols: Vec::new(),
         }
@@ -84,9 +94,9 @@ pub(crate) struct ThunkLayoutBuilder {
 
     primary_function_part_id: PartId,
 
-    /// Symbols that are defined in primary parts and referenced by range-limited relocations from
-    /// non-primary parts.
-    non_primary_referenced_symbols: SegQueue<SymbolId>,
+    /// Symbols referenced by range-limited relocations from non-primary parts, paired with the
+    /// source part that needs to branch to them.
+    non_primary_referenced_symbols: SegQueue<(PartId, SymbolId)>,
 }
 
 /// How much space we allow for the thunks themselves in the thunk block. Note, we don't actually
@@ -103,10 +113,17 @@ impl ThunkLayoutBuilder {
     /// needed.
     pub(crate) fn new<A: Arch>(
         groups: &[resolution::ResolvedGroup<A::Platform>],
+        output_sections: &OutputSections<A::Platform>,
+        section_part_ids: &[PartId],
+        args: &<A::Platform as Platform>::Args,
     ) -> Option<ThunkLayoutBuilder> {
         let config = A::thunk_config()?;
 
         timing_phase!("Create thunk layout builder");
+
+        let force_conservative_thunks =
+            <<A::Platform as Platform>::Args as crate::platform::Args>::has_section_start_address_overrides(args)
+                || has_fixed_executable_section_addresses(groups, output_sections, section_part_ids);
 
         let total_executable_bytes: u64 = groups
             .iter()
@@ -120,8 +137,9 @@ impl ThunkLayoutBuilder {
             })
             .sum();
 
-        if total_executable_bytes < config.min_branch_range {
-            // Total text size is small enough that we know we won't need any thunks.
+        if total_executable_bytes < config.min_branch_range && !force_conservative_thunks {
+            // Total text size is small enough and no executable output section has an explicit
+            // address that could introduce a large gap, so we know we won't need any thunks.
             return None;
         }
 
@@ -140,73 +158,65 @@ impl ThunkLayoutBuilder {
         per_symbol_flags: &crate::value_flags::PerSymbolFlags,
         output_sections: &OutputSections<P>,
         section_part_sizes: &OutputSectionPartMap<u64>,
+        output_order: &OutputOrder,
+        program_segments: &ProgramSegments<P::ProgramSegmentDef>,
     ) -> Vec<ThunkBlock> {
         timing_phase!("Build thunk layout");
 
-        let non_primary_text_size =
-            self.compute_non_primary_text_size(output_sections, section_part_sizes);
+        let section_part_layouts = layout::layout_section_parts::<P>(
+            section_part_sizes,
+            output_sections,
+            program_segments,
+            output_order,
+            symbol_db.args,
+        );
 
-        let primary_ranges = collect_primary_ranges(group_states, non_primary_text_size);
+        let primary_ranges = collect_primary_ranges(
+            group_states,
+            section_part_layouts
+                .get(self.primary_function_part_id)
+                .mem_offset,
+        );
 
-        let mut block_builders =
-            assign_thunk_blocks_to_groups(group_states, &primary_ranges, self.branch_range);
+        let mut block_builders = assign_thunk_blocks_to_groups(
+            group_states,
+            &primary_ranges,
+            self.branch_range,
+            self.primary_function_part_id,
+        );
 
         self.process_primary_part_refs(
+            group_states,
             &primary_ranges,
+            &section_part_layouts,
             symbol_db,
             per_symbol_flags,
             &mut block_builders,
         );
 
-        self.process_non_primary_part_refs(&mut block_builders);
+        self.process_non_primary_part_refs(
+            group_states,
+            &primary_ranges,
+            &section_part_layouts,
+            symbol_db,
+            per_symbol_flags,
+            &mut block_builders,
+        );
 
-        let blocks = block_builders
+        block_builders
             .into_par_iter()
             .map(|block| block.build())
-            .collect();
-
-        tracing::trace!("Thunk blocks: {blocks:#?}");
-
-        blocks
-    }
-
-    fn compute_non_primary_text_size<P: Platform>(
-        &self,
-        output_sections: &OutputSections<P>,
-        section_part_sizes: &OutputSectionPartMap<u64>,
-    ) -> u64 {
-        verbose_timing_phase!("Compute non-primary text size");
-
-        let non_primary_text_bytes: u64 = output_sections
-            .ids_with_info()
-            .filter(|(_, info)| info.section_attributes.is_executable())
-            .flat_map(|(section_id, _)| {
-                let base = section_id.base_part_id();
-                (0..section_id.num_parts()).map(move |i| base.offset(i))
-            })
-            .filter(|&part_id| part_id != self.primary_function_part_id)
-            .map(|part_id| *section_part_sizes.get(part_id))
-            .sum();
-        non_primary_text_bytes
-    }
-
-    fn process_non_primary_part_refs<P: Platform>(
-        &mut self,
-        block_builders: &mut [ThunkBlockBuilder<'_, '_, P>],
-    ) {
-        verbose_timing_phase!("Process non-primary part refs");
-
-        block_builders[ThunkBlockId::FIRST.as_usize()]
-            .symbols
-            .extend(core::mem::take(&mut self.non_primary_referenced_symbols));
+            .collect()
     }
 
     fn process_primary_part_refs<'data, P: Platform>(
         &self,
+        group_states: &[layout::GroupState<'data, P>],
         primary_ranges: &[Vec<Option<(u64, u64)>>],
+        section_part_layouts: &OutputSectionPartMap<layout::OutputRecordLayout>,
         symbol_db: &crate::symbol_db::SymbolDb<'data, P>,
         per_symbol_flags: &crate::value_flags::PerSymbolFlags,
-        block_builders: &mut [ThunkBlockBuilder<'data, '_, P>],
+        block_builders: &mut [ThunkBlockBuilder],
     ) {
         verbose_timing_phase!("Process primary part refs");
 
@@ -224,22 +234,36 @@ impl ThunkLayoutBuilder {
             primary_ranges[fid.group()][fid.file()]
         };
 
+        let part_range = |part_id: PartId| -> Option<(u64, u64)> {
+            let layout = section_part_layouts.get(part_id);
+            (layout.mem_size > 0)
+                .then_some((layout.mem_offset, layout.mem_offset + layout.mem_size))
+        };
+
         // Returns true if a thunk can be skipped based on known source and definition positions.
         let provably_in_range = |src_start: u64, src_end: u64, definition_id: SymbolId| -> bool {
             let definition_flags = per_symbol_flags.flags_for_symbol(definition_id);
-            if definition_flags.contains(ValueFlags::DYNAMIC) {
-                // For dynamic targets (e.g. PLT), source distance depends on pre-.text executable
-                // bytes that aren't captured by primary ranges alone.
-                return false;
-            }
 
-            if let Some((def_start, def_end)) = primary_range_for_symbol(definition_id) {
+            let target_range = if definition_flags.needs_plt() || definition_flags.is_ifunc() {
+                part_range(crate::part_id::PLT_GOT)
+            } else if definition_flags.contains(ValueFlags::DYNAMIC) {
+                None
+            } else {
+                let part_id = symbol_db.part_id_for_symbol(definition_id);
+                if part_id == self.primary_function_part_id {
+                    primary_range_for_symbol(definition_id)
+                } else {
+                    part_range(part_id)
+                }
+            };
+
+            if let Some((def_start, def_end)) = target_range {
                 let span_start = src_start.min(def_start);
                 let span_end = src_end.max(def_end);
                 return span_end.saturating_sub(span_start) < self.branch_range;
             }
 
-            src_end < self.branch_range
+            false
         };
 
         // Collect primary-section range-limited symbols by scanning each block's objects in
@@ -248,7 +272,13 @@ impl ThunkLayoutBuilder {
             let symbols = block
                 .objects
                 .par_iter()
-                .map(|obj| {
+                .filter_map(|file_id| {
+                    let FileLayoutState::Object(obj) =
+                        &group_states[file_id.group()].files[file_id.file()]
+                    else {
+                        return None;
+                    };
+
                     verbose_timing_phase!("Collect object primary part thunks");
 
                     let mut object_symbols = HashSet::new();
@@ -273,7 +303,7 @@ impl ThunkLayoutBuilder {
                             object_symbols.insert(definition_id);
                         }
                     }
-                    object_symbols
+                    Some(object_symbols)
                 })
                 .reduce(HashSet::new, |mut a, mut b| {
                     verbose_timing_phase!("Merge thunk block symbols");
@@ -288,6 +318,126 @@ impl ThunkLayoutBuilder {
             block.symbols.extend(symbols);
         });
     }
+
+    fn process_non_primary_part_refs<'data, P: Platform>(
+        &mut self,
+        group_states: &mut [layout::GroupState<'data, P>],
+        primary_ranges: &[Vec<Option<(u64, u64)>>],
+        section_part_layouts: &OutputSectionPartMap<layout::OutputRecordLayout>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, P>,
+        per_symbol_flags: &crate::value_flags::PerSymbolFlags,
+        block_builders: &mut Vec<ThunkBlockBuilder>,
+    ) {
+        verbose_timing_phase!("Process non-primary part refs");
+
+        let part_range = |part_id: PartId| -> Option<(u64, u64)> {
+            let layout = section_part_layouts.get(part_id);
+            (layout.mem_size > 0)
+                .then_some((layout.mem_offset, layout.mem_offset + layout.mem_size))
+        };
+
+        let primary_range_for_symbol = |definition_id: SymbolId| -> Option<(u64, u64)> {
+            let definition_flags = per_symbol_flags.flags_for_symbol(definition_id);
+
+            if definition_flags.contains(ValueFlags::IFUNC)
+                || definition_flags.contains(ValueFlags::DYNAMIC)
+                || symbol_db.part_id_for_symbol(definition_id) != self.primary_function_part_id
+            {
+                return None;
+            }
+
+            let fid = symbol_db.file_id_for_symbol(definition_id);
+            primary_ranges[fid.group()][fid.file()]
+        };
+
+        let target_range_for_symbol = |definition_id: SymbolId| -> Option<(u64, u64)> {
+            let definition_flags = per_symbol_flags.flags_for_symbol(definition_id);
+            if definition_flags.needs_plt() || definition_flags.is_ifunc() {
+                part_range(crate::part_id::PLT_GOT)
+            } else if definition_flags.contains(ValueFlags::DYNAMIC) {
+                None
+            } else {
+                let part_id = symbol_db.part_id_for_symbol(definition_id);
+                if part_id == self.primary_function_part_id {
+                    primary_range_for_symbol(definition_id)
+                } else {
+                    part_range(part_id)
+                }
+            }
+        };
+
+        let needs_thunk = |source_part_id: PartId, definition_id: SymbolId| -> bool {
+            let Some((src_start, src_end)) = part_range(source_part_id) else {
+                return false;
+            };
+            let Some((def_start, def_end)) = target_range_for_symbol(definition_id) else {
+                return true;
+            };
+            let span_start = src_start.min(def_start);
+            let span_end = src_end.max(def_end);
+            span_end.saturating_sub(span_start) >= self.branch_range
+        };
+
+        let mut symbols_by_part: HashMap<PartId, HashSet<SymbolId>> = HashMap::new();
+        for (source_part_id, symbol_id) in core::mem::take(&mut self.non_primary_referenced_symbols)
+        {
+            let definition_id = symbol_db.definition(symbol_id);
+            if needs_thunk(source_part_id, definition_id) {
+                symbols_by_part
+                    .entry(source_part_id)
+                    .or_default()
+                    .insert(definition_id);
+            }
+        }
+
+        for (source_part_id, symbols) in symbols_by_part
+            .into_iter()
+            .sorted_by_key(|(source_part_id, _)| *source_part_id)
+        {
+            let block_id = ThunkBlockId::from_usize(block_builders.len());
+            let Some(owner) =
+                assign_extra_thunk_block_owner(group_states, symbol_db, source_part_id, block_id)
+            else {
+                continue;
+            };
+
+            block_builders.push(ThunkBlockBuilder {
+                part_id: source_part_id,
+                objects: vec![owner],
+                symbols: symbols.into_iter().collect(),
+            });
+        }
+    }
+}
+
+fn has_fixed_executable_section_addresses<P: Platform>(
+    groups: &[resolution::ResolvedGroup<P>],
+    output_sections: &OutputSections<P>,
+    section_part_ids: &[PartId],
+) -> bool {
+    groups.iter().any(|group| {
+        group.files.iter().any(|file| {
+            let resolution::ResolvedFile::Object(obj) = file else {
+                return false;
+            };
+
+            obj.common
+                .object
+                .enumerate_sections()
+                .any(|(section_index, section)| {
+                    if !section.is_executable() {
+                        return false;
+                    }
+
+                    let input_section_id = obj.section_id_range.input_to_id(section_index);
+                    let part_id = section_part_ids[input_section_id.as_usize()];
+                    output_sections
+                        .output_info(part_id.output_section_id())
+                        .location
+                        .is_some()
+                })
+        })
+    })
 }
 
 fn collect_primary_ranges<P: Platform>(
@@ -316,6 +466,63 @@ fn collect_primary_ranges<P: Platform>(
         .collect()
 }
 
+fn assign_extra_thunk_block_owner<P: Platform>(
+    group_states: &mut [layout::GroupState<P>],
+    symbol_db: &crate::symbol_db::SymbolDb<P>,
+    part_id: PartId,
+    block_id: ThunkBlockId,
+) -> Option<FileId> {
+    for group in group_states {
+        for file in &mut group.files {
+            let FileLayoutState::Object(obj) = file else {
+                continue;
+            };
+
+            let owns_part = obj.sections.iter().enumerate().any(|(index, section)| {
+                matches!(section, resolution::SectionSlot::Loaded(_))
+                    && obj.section_part_id(object::SectionIndex(index), &symbol_db.section_part_ids)
+                        == part_id
+            });
+
+            if owns_part {
+                obj.extra_thunk_block_ids.push(block_id);
+                return Some(obj.file_id);
+            }
+        }
+    }
+
+    None
+}
+
+pub(crate) fn block_id_for_source_part<P: Platform>(
+    object_layout: &layout::ObjectLayout<'_, P>,
+    thunk_block_part_ids: &[PartId],
+    source_part_id: PartId,
+    primary_function_part_id: PartId,
+) -> ThunkBlockId {
+    if source_part_id == primary_function_part_id {
+        return object_layout.thunk_block_id;
+    }
+
+    object_layout
+        .extra_thunk_block_ids
+        .iter()
+        .copied()
+        .find(|block_id| {
+            thunk_block_part_ids
+                .get(block_id.as_usize())
+                .copied()
+                .is_some_and(|part_id| part_id == source_part_id)
+        })
+        .or_else(|| {
+            thunk_block_part_ids
+                .iter()
+                .position(|&part_id| part_id == source_part_id)
+                .map(ThunkBlockId::from_usize)
+        })
+        .unwrap_or(ThunkBlockId::FIRST)
+}
+
 /// Records that a thunkable relocation was encountered during the GC phase. The actual decision
 /// about whether a thunk is needed is deferred to `ThunkLayoutBuilder::build()`.
 pub(crate) fn handle_thunk_extensions_for_relocation<A: Arch>(
@@ -337,25 +544,22 @@ pub(crate) fn handle_thunk_extensions_for_relocation<A: Arch>(
                 .or_assign(ValueFlags::HAS_RANGE_LIMITED_REL);
         } else {
             let canonical_symbol_id = resources.symbol_db.definition(symbol_id);
-            if resources.symbol_db.part_id_for_symbol(canonical_symbol_id)
-                == config.primary_function_part_id
-            {
-                resources
-                    .thunk_layout_builder
-                    .as_ref()
-                    .unwrap()
-                    .non_primary_referenced_symbols
-                    .push(canonical_symbol_id);
-            }
+            resources
+                .thunk_layout_builder
+                .as_ref()
+                .unwrap()
+                .non_primary_referenced_symbols
+                .push((section_part_id, canonical_symbol_id));
         }
     }
 }
 
-fn assign_thunk_blocks_to_groups<'data, 'state, P: Platform>(
-    group_states: &'state mut [layout::GroupState<'data, P>],
+fn assign_thunk_blocks_to_groups<'data, P: Platform>(
+    group_states: &mut [layout::GroupState<'data, P>],
     primary_ranges: &[Vec<Option<(u64, u64)>>],
     max_branch_range: u64,
-) -> Vec<ThunkBlockBuilder<'data, 'state, P>> {
+    primary_function_part_id: PartId,
+) -> Vec<ThunkBlockBuilder> {
     verbose_timing_phase!("Assign thunk blocks");
 
     let post_gc_bounds = group_states
@@ -388,7 +592,7 @@ fn assign_thunk_blocks_to_groups<'data, 'state, P: Platform>(
     );
 
     let mut block_builders = (0..num_blocks.max(1))
-        .map(|_| ThunkBlockBuilder::default())
+        .map(|_| ThunkBlockBuilder::new(primary_function_part_id))
         .collect_vec();
 
     for group in group_states.iter() {
@@ -398,7 +602,7 @@ fn assign_thunk_blocks_to_groups<'data, 'state, P: Platform>(
             {
                 block_builders[obj.thunk_block_id.as_usize()]
                     .objects
-                    .push(obj);
+                    .push(obj.file_id);
             }
         }
     }
@@ -468,7 +672,7 @@ fn assign_thunk_blocks(
     num_blocks
 }
 
-impl<'data, 'state, P: Platform> ThunkBlockBuilder<'data, 'state, P> {
+impl ThunkBlockBuilder {
     fn build(mut self) -> ThunkBlock {
         verbose_timing_phase!("Build thunk block");
         // Sorting is needed for deterministic output, since the symbols came here in hashset
@@ -477,6 +681,7 @@ impl<'data, 'state, P: Platform> ThunkBlockBuilder<'data, 'state, P> {
         self.symbols.sort();
         self.symbols.dedup();
         ThunkBlock {
+            part_id: self.part_id,
             symbols: self.symbols,
         }
     }
