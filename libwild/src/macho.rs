@@ -2254,11 +2254,7 @@ fn macho_subsection_gc_enabled<'data>(
     }
 
     let section = state.object.section(section_index)?;
-    let section_name = state.object.section_name(section)?;
-    Ok(
-        !section.should_retain()
-            && (section.is_executable() || section_name == b"__gcc_except_tab"),
-    )
+    Ok(section.is_executable() && !section.should_retain())
 }
 
 fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
@@ -2860,11 +2856,7 @@ fn compact_dead_macho_subsections<'data>(
         let Ok(section_header) = object.object.section(section_index) else {
             continue;
         };
-        let section_name = object.object.section_name(section_header).ok();
-        if section_header.should_retain()
-            || !(section_header.is_executable()
-                || section_name == Some(b"__gcc_except_tab".as_slice()))
-        {
+        if !section_header.is_executable() || section_header.should_retain() {
             continue;
         }
         let Ok(section_size) = object.object.section_size(section_header) else {
