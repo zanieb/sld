@@ -1902,10 +1902,8 @@ impl platform::Platform for Elf {
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::INIT);
         builder.add_section(output_section_id::FINI);
-        builder.add_sections(&custom.exec);
-        // We want ThunkConfig::primary_function_part_id to be more or less last, since we only
-        // support generating thunks before the primary_function_part, not after.
         builder.add_section(output_section_id::TEXT);
+        builder.add_sections(&custom.exec);
 
         builder.add_section(output_section_id::TDATA);
         builder.add_sections(&custom.tdata);

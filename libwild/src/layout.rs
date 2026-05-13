@@ -221,6 +221,8 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>>(
                 &per_symbol_flags,
                 &output_sections,
                 &section_part_sizes,
+                &output_order,
+                &program_segments,
             )
         })
         .unwrap_or_default();
@@ -229,6 +231,7 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>>(
         &mut group_states,
         &thunk_blocks,
         &mut section_part_sizes,
+        &output_sections,
         &symbol_db,
     );
 
@@ -362,6 +365,7 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>>(
         .into_iter()
         .map(|m| m.into_inner().unwrap())
         .collect();
+    let thunk_block_part_ids = thunk_blocks.iter().map(|block| block.part_id).collect();
 
     let relocation_statistics = OutputSectionMap::with_size(section_layouts.len());
 
@@ -388,6 +392,7 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>>(
         dynamic_symbol_definitions,
         properties_and_attributes,
         thunk_block_addresses,
+        thunk_block_part_ids,
         compressed_debug_sections: OutputSectionMap::with_size(num_sections),
     };
 
@@ -618,6 +623,7 @@ pub struct Layout<'data, P: Platform> {
     /// Thunk address maps indexed by ThunkBlockId. Each entry maps SymbolId to the memory address
     /// of the thunk for that symbol within the block.
     pub(crate) thunk_block_addresses: Vec<BTreeMap<SymbolId, u64>>,
+    pub(crate) thunk_block_part_ids: Vec<PartId>,
 
     pub(crate) compressed_debug_sections: OutputSectionMap<Option<CompressedSection>>,
 }
@@ -775,6 +781,9 @@ pub(crate) struct ObjectLayout<'data, P: Platform> {
 
     /// Format-specific per-object state that must survive into writer time.
     pub(crate) format_specific: P::ObjectLayoutStateExt<'data>,
+
+    /// Additional non-primary thunk blocks owned by this object.
+    pub(crate) extra_thunk_block_ids: Vec<crate::thunks::ThunkBlockId>,
 }
 
 #[derive(Debug)]
@@ -1184,6 +1193,9 @@ pub(crate) struct ObjectLayoutState<'data, P: Platform> {
 
     /// Whether this object is responsible for writing the thunk block.
     pub(crate) owns_thunk_block: bool,
+
+    /// Additional non-primary thunk blocks owned by this object.
+    pub(crate) extra_thunk_block_ids: Vec<ThunkBlockId>,
 
     /// Total bytes of primary-function-part sections that survived GC. Used to help determine
     /// distances for range-extension thunks.
@@ -1663,6 +1675,36 @@ fn compute_symbols_and_layouts<'data, P: Platform>(
         .collect()
 }
 
+fn assign_thunk_block_addresses<P: Platform>(
+    block_id: ThunkBlockId,
+    thunk_size: u64,
+    memory_offsets: &mut OutputSectionPartMap<u64>,
+    resources: &FinaliseLayoutResources<'_, '_, P>,
+) {
+    let Some(block) = resources.thunk_blocks.get(block_id.as_usize()) else {
+        return;
+    };
+    if block.symbols.is_empty() {
+        return;
+    }
+
+    let mut addresses = resources.thunk_block_addresses[block_id.as_usize()]
+        .lock()
+        .unwrap();
+
+    let addr = memory_offsets.get_mut(block.part_id);
+    let start_address = *addr;
+    for &symbol_id in &block.symbols {
+        addresses.insert(symbol_id, *addr);
+        *addr += thunk_size;
+    }
+    *addr = start_address
+        + block
+            .part_id
+            .alignment(resources.output_sections)
+            .align_up(*addr - start_address);
+}
+
 fn compute_segment_layout<P: Platform>(
     section_layouts: &OutputSectionMap<OutputRecordLayout>,
     output_sections: &OutputSections<P>,
@@ -1874,6 +1916,7 @@ fn allocate_thunk_block_space<P: Platform>(
     group_states: &mut [GroupState<P>],
     thunk_blocks: &[crate::thunks::ThunkBlock],
     total_sizes: &mut OutputSectionPartMap<u64>,
+    output_sections: &OutputSections<P>,
     symbol_db: &SymbolDb<P>,
 ) {
     if thunk_blocks.is_empty() {
@@ -1890,23 +1933,53 @@ fn allocate_thunk_block_space<P: Platform>(
         for file in &group_state.files {
             if let FileLayoutState::Object(obj) = file
                 && let Some(config) = P::file_thunk_config(obj.object)
-                && obj.owns_thunk_block
             {
-                let block = thunk_blocks.get(obj.thunk_block_id.as_usize());
-                let count = block.map_or(0, |b| b.symbols.len());
-                let size = count as u64 * config.thunk_size;
-                extra_thunk_sizes.increment(config.primary_function_part_id, size);
-                if emit_symbols && let Some(block) = block {
-                    P::allocate_thunk_symbol_sizes(
+                if obj.owns_thunk_block {
+                    allocate_thunk_block_size::<P>(
+                        obj.thunk_block_id,
+                        config.thunk_size,
+                        thunk_blocks,
                         &mut extra_thunk_sizes,
-                        &block.symbols,
+                        output_sections,
                         symbol_db,
+                        emit_symbols,
+                    );
+                }
+                for &block_id in &obj.extra_thunk_block_ids {
+                    allocate_thunk_block_size::<P>(
+                        block_id,
+                        config.thunk_size,
+                        thunk_blocks,
+                        &mut extra_thunk_sizes,
+                        output_sections,
+                        symbol_db,
+                        emit_symbols,
                     );
                 }
             }
         }
         group_state.common.mem_sizes.merge(&extra_thunk_sizes);
         total_sizes.merge(&extra_thunk_sizes);
+    }
+}
+
+fn allocate_thunk_block_size<P: Platform>(
+    block_id: ThunkBlockId,
+    thunk_size: u64,
+    thunk_blocks: &[crate::thunks::ThunkBlock],
+    extra_thunk_sizes: &mut OutputSectionPartMap<u64>,
+    output_sections: &OutputSections<P>,
+    symbol_db: &SymbolDb<P>,
+    emit_symbols: bool,
+) {
+    let Some(block) = thunk_blocks.get(block_id.as_usize()) else {
+        return;
+    };
+    let raw_size = block.symbols.len() as u64 * thunk_size;
+    let size = block.part_id.alignment(output_sections).align_up(raw_size);
+    extra_thunk_sizes.increment(block.part_id, size);
+    if emit_symbols {
+        P::allocate_thunk_symbol_sizes(extra_thunk_sizes, &block.symbols, symbol_db);
     }
 }
 
@@ -2070,7 +2143,12 @@ fn find_required_sections<'data, A: Arch>(
 
     let num_groups = groups_in.len();
 
-    let thunk_layout_builder = thunks::ThunkLayoutBuilder::new::<A>(&groups_in);
+    let thunk_layout_builder = thunks::ThunkLayoutBuilder::new::<A>(
+        &groups_in,
+        output_sections,
+        &symbol_db.section_part_ids,
+        symbol_db.args,
+    );
 
     let mut worker_slots = Vec::with_capacity(num_groups);
     worker_slots.resize_with(num_groups, || {
@@ -3734,6 +3812,7 @@ fn new_object_layout_state<P: Platform>(
         section_relax_deltas: RelaxDeltaMap::new(),
         thunk_block_id: ThunkBlockId::default(),
         owns_thunk_block: false,
+        extra_thunk_block_ids: Vec::new(),
         post_gc_primary_bytes: 0,
     })
 }
@@ -4106,21 +4185,24 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
 
         P::finalise_object_layout(&self, memory_offsets);
 
-        // If this object owns a ThunkBlock, assign addresses for the block's thunks and write
-        // them directly into the shared output map.
-        if self.owns_thunk_block
-            && let Some(config) = P::file_thunk_config(self.object)
-            && let Some(block) = resources.thunk_blocks.get(self.thunk_block_id.as_usize())
-            && !block.symbols.is_empty()
-        {
-            let mut addresses = resources.thunk_block_addresses[self.thunk_block_id.as_usize()]
-                .lock()
-                .unwrap();
-
-            let addr = memory_offsets.get_mut(config.primary_function_part_id);
-            for &symbol_id in &block.symbols {
-                addresses.insert(symbol_id, *addr);
-                *addr += config.thunk_size;
+        // If this object owns any ThunkBlocks, assign addresses for their thunks and write them
+        // directly into the shared output map.
+        if let Some(config) = P::file_thunk_config(self.object) {
+            if self.owns_thunk_block {
+                assign_thunk_block_addresses(
+                    self.thunk_block_id,
+                    config.thunk_size,
+                    memory_offsets,
+                    resources,
+                );
+            }
+            for &block_id in &self.extra_thunk_block_ids {
+                assign_thunk_block_addresses(
+                    block_id,
+                    config.thunk_size,
+                    memory_offsets,
+                    resources,
+                );
             }
         }
 
@@ -4138,6 +4220,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             thunk_block_id: self.thunk_block_id,
             owns_thunk_block: self.owns_thunk_block,
             format_specific: self.format_specific,
+            extra_thunk_block_ids: self.extra_thunk_block_ids,
         })
     }
 
@@ -4867,7 +4950,7 @@ fn perform_iterative_relaxation<'data, A: Arch>(
     }
 }
 
-fn layout_section_parts<P: Platform>(
+pub(crate) fn layout_section_parts<P: Platform>(
     sizes: &OutputSectionPartMap<u64>,
     output_sections: &OutputSections<P>,
     program_segments: &ProgramSegments<P::ProgramSegmentDef>,

@@ -14,7 +14,6 @@ tests = [
   "execute-only.sh",
   "fatal-warnings.sh",                 # `-warn-common` and `-fatal-warnings`
   "filter.sh",
-  "global-offset-table.sh",            # `-defsym=foo=_GLOBAL_OFFSET_TABLE_`
   "icf-gcc-except-table.sh",           # `--icf`
   "icf.sh",                            # `--icf`
   "image-base.sh",

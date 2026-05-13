@@ -87,7 +87,6 @@ use crate::sharding::ShardKey;
 use crate::string_merging::get_merged_string_output_address;
 use crate::symbol_db::SymbolDb;
 use crate::symbol_db::SymbolId;
-use crate::thunks::ThunkBlockId;
 use crate::timing_phase;
 use crate::value_flags::PerSymbolFlags;
 use crate::value_flags::ValueFlags;
@@ -1689,22 +1688,37 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
             .thunk_block_addresses
             .get(object.thunk_block_id.as_usize())
     {
+        let part_id = layout.thunk_block_part_ids[object.thunk_block_id.as_usize()];
         write_thunks::<A>(
             addresses,
+            part_id,
             buffers,
             layout,
             &mut table_writer.debug_symbol_writer,
         )?;
+    }
+    for &block_id in &object.extra_thunk_block_ids {
+        if let Some(addresses) = layout.thunk_block_addresses.get(block_id.as_usize()) {
+            let part_id = layout.thunk_block_part_ids[block_id.as_usize()];
+            write_thunks::<A>(
+                addresses,
+                part_id,
+                buffers,
+                layout,
+                &mut table_writer.debug_symbol_writer,
+            )?;
+        }
     }
     Ok(())
 }
 
 /// Write thunk instructions for a set of (SymbolId -> thunk_address) mappings.
 ///
-/// Thunks are sorted by SymbolId for determinism and written consecutively into the primary
-/// function part buffer. Space must already have been reserved during `finalise_sizes`.
+/// Thunks are sorted by SymbolId for determinism and written consecutively into the block's source
+/// part buffer. Space must already have been reserved during `finalise_sizes`.
 fn write_thunks<'data, A: Arch<Platform = Elf>>(
     thunk_addresses: &BTreeMap<crate::symbol_db::SymbolId, u64>,
+    part_id: crate::part_id::PartId,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &ElfLayout<'data>,
     symbol_writer: &mut SymbolTableWriter<'_, '_>,
@@ -1715,14 +1729,22 @@ fn write_thunks<'data, A: Arch<Platform = Elf>>(
 
     let config = A::thunk_config().expect("write_thunks called without thunk config");
     let thunk_size = config.thunk_size as usize;
-    let primary_part_id = config.primary_function_part_id;
     let emit_symbols = !layout.args().should_strip_all();
 
-    let text_section_id = primary_part_id.output_section_id();
-    let text_shndx = layout
+    let thunk_section_id = part_id.output_section_id();
+    let thunk_shndx = layout
         .output_sections
-        .output_index_of_section(text_section_id)
+        .output_index_of_section(thunk_section_id)
         .unwrap_or(0);
+    let raw_size = thunk_addresses.len() * thunk_size;
+    let allocation_size = part_id
+        .alignment(&layout.output_sections)
+        .align_up_usize(raw_size);
+    let allocation_name = format!(
+        "thunk space in {}",
+        layout.output_sections.part_debug(part_id)
+    );
+    let buf = buffers.get_mut(part_id);
 
     for (symbol_id, &thunk_address) in thunk_addresses {
         debug_assert_ne!(thunk_address, 0, "Thunk address should have been assigned");
@@ -1749,10 +1771,9 @@ fn write_thunks<'data, A: Arch<Platform = Elf>>(
             res.raw_value
         };
 
-        let buf = buffers.get_mut(primary_part_id);
         let thunk_buf = buf
             .split_off_mut(..thunk_size)
-            .ok_or_else(|| crate::file_writer::insufficient_allocation("thunk space in .text"))?;
+            .ok_or_else(|| crate::file_writer::insufficient_allocation(&allocation_name))?;
 
         A::write_thunk(thunk_address, target_address, thunk_buf);
 
@@ -1766,13 +1787,19 @@ fn write_thunks<'data, A: Arch<Platform = Elf>>(
             thunk_name.extend_from_slice(&orig_name);
             let entry = symbol_writer.define_symbol(
                 true,
-                SymbolSection::Index(text_shndx),
+                SymbolSection::Index(thunk_shndx),
                 thunk_address,
                 thunk_size as u64,
                 &thunk_name,
             )?;
             entry.set_st_info(object::elf::STB_LOCAL, object::elf::STT_FUNC);
         }
+    }
+
+    let padding_size = allocation_size - raw_size;
+    if padding_size > 0 {
+        buf.split_off_mut(..padding_size)
+            .ok_or_else(|| crate::file_writer::insufficient_allocation(&allocation_name))?;
     }
 
     Ok(())
@@ -3676,11 +3703,12 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = Elf>>(
 
     let canonical_id = layout.symbol_db.definition(local_symbol_id);
 
-    let thunk_id = if section_info.part_id == config.primary_function_part_id {
-        object_layout.thunk_block_id
-    } else {
-        ThunkBlockId::FIRST
-    };
+    let thunk_id = crate::thunks::block_id_for_source_part(
+        object_layout,
+        &layout.thunk_block_part_ids,
+        section_info.part_id,
+        config.primary_function_part_id,
+    );
 
     let thunk_address_opt = layout
         .thunk_block_addresses

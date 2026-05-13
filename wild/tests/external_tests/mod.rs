@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 pub(super) fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
@@ -181,16 +182,72 @@ fn external_linker_name() -> &'static str {
 #[allow(unused)]
 fn run_external_test(external_test: &Path, extra_env: &[(&str, &str)]) -> Result<Output> {
     let fakes_dir = get_fakes_dir();
+    let bash = external_test_bash()?;
 
-    let mut command = Command::new("bash");
-    command
-        .current_dir(fakes_dir)
-        .arg("-c")
-        .arg(format!("{} 2>&1", external_test.display()));
+    let mut command = Command::new(bash);
+    command.current_dir(fakes_dir).arg(external_test);
 
     for (key, value) in extra_env {
         command.env(key, value);
     }
 
-    command.output().map_err(Into::into)
+    let mut output = command.output()?;
+    output.stdout.extend_from_slice(&output.stderr);
+    Ok(output)
+}
+
+fn external_test_bash() -> Result<&'static Path> {
+    static BASH: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
+
+    match BASH.get_or_init(find_external_test_bash) {
+        Ok(path) => Ok(path.as_path()),
+        Err(message) => Err(message.clone().into()),
+    }
+}
+
+fn find_external_test_bash() -> std::result::Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(path) = env::var("WILD_EXTERNAL_TEST_BASH") {
+        let path = PathBuf::from(path);
+        if bash_supports_pipe_ampersand(&path) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "WILD_EXTERNAL_TEST_BASH={} does not support Bash pipe-and-stderr shorthand `|&`",
+            path.display()
+        ));
+    }
+
+    if let Ok(path) = which::which("bash") {
+        candidates.push(path);
+    }
+
+    candidates.extend(
+        ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+
+    for candidate in candidates {
+        if bash_supports_pipe_ampersand(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(
+        "External mold tests require Bash with `|&` support. Install Bash 4+ or set \
+         WILD_EXTERNAL_TEST_BASH to a compatible bash binary."
+            .to_owned(),
+    )
+}
+
+fn bash_supports_pipe_ampersand(path: &Path) -> bool {
+    Command::new(path)
+        .arg("-c")
+        .arg("true |& cat >/dev/null")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }

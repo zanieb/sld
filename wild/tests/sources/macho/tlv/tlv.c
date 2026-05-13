@@ -1,5 +1,6 @@
 //#ExpectSym:_main section="__text"
 //#ExpectSym:_counter section="__thread_vars"
+//#EnableLinker:apple-ld
 //#ExpectSectionBytes:__thread_data=0x2a000000
 //#RunEnabled:true
 
