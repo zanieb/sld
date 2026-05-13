@@ -2078,12 +2078,8 @@ impl platform::Platform for MachO {
             }
         };
 
-        let mut rules = Vec::with_capacity(DEFAULT_SECTION_RULES.len() + 7);
+        let mut rules = Vec::with_capacity(DEFAULT_SECTION_RULES.len() + 6);
         rules.push(gc_rule(b"__text", crate::output_section_id::TEXT));
-        rules.push(gc_rule(
-            b"__gcc_except_tab",
-            crate::output_section_id::GCC_EXCEPT_TABLE,
-        ));
         rules.extend(DEFAULT_SECTION_RULES.iter().cloned());
         rules.push(gc_rule(b"__const", crate::output_section_id::RODATA));
         rules.push(gc_rule(b"__cstring", crate::output_section_id::CSTRING));
@@ -3288,6 +3284,10 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::EH_FRAME),
+    SectionRule::exact_section_keep(
+        b"__gcc_except_tab",
+        crate::output_section_id::GCC_EXCEPT_TABLE,
+    ),
     SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
     SectionRule::exact_section_keep(b".rustc", crate::output_section_id::RUSTC_METADATA),
     SectionRule::exact_section_keep(
