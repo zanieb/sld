@@ -47,6 +47,7 @@ use object::Endianness;
 use object::SymbolIndex;
 use object::macho;
 use object::macho::N_ABS;
+use object::macho::N_ALT_ENTRY;
 use object::macho::N_EXT;
 use object::macho::N_NO_DEAD_STRIP;
 use object::macho::N_PEXT;
@@ -2768,6 +2769,9 @@ fn mark_macho_subsection_live<'data>(
                     {
                         return None;
                     }
+                    if candidate.n_desc.get(LE) & N_ALT_ENTRY != 0 {
+                        return None;
+                    }
                     let candidate_section = object
                         .symbol_section(candidate, candidate_index)
                         .ok()
@@ -2833,6 +2837,9 @@ fn compact_dead_macho_subsections<'data>(
         let Ok(Some(section_index)) = object.object.symbol_section(symbol, symbol_index) else {
             continue;
         };
+        if symbol.n_desc.get(LE) & N_ALT_ENTRY != 0 {
+            continue;
+        }
         let Ok(offset) = object
             .object
             .symbol_offset_in_section(symbol, section_index)
