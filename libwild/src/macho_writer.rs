@@ -76,6 +76,7 @@ use crate::platform::Arch;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
 use crate::platform::RelocationList;
+use crate::platform::SectionHeader;
 use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
 use crate::sharding::ShardKey;
@@ -200,6 +201,11 @@ impl ChainedRebases {
                     };
                     let live_unwind_ranges =
                         macho_writer_live_unwind_relocation_ranges(object, layout, section_index)?;
+                    let live_subsection_ranges = macho_writer_live_subsection_relocation_ranges(
+                        object,
+                        layout,
+                        section_index,
+                    )?;
                     let mut skip_subtractor_pair = false;
                     for rel in object.relocations(section_index)?.relocations {
                         let rel = rel.info(LE);
@@ -211,6 +217,12 @@ impl ChainedRebases {
                             continue;
                         }
                         if live_unwind_ranges.as_ref().is_some_and(|ranges| {
+                            !ranges.iter().any(|range| range.contains(&input_offset))
+                        }) {
+                            skip_subtractor_pair = false;
+                            continue;
+                        }
+                        if live_subsection_ranges.as_ref().is_some_and(|ranges| {
                             !ranges.iter().any(|range| range.contains(&input_offset))
                         }) {
                             skip_subtractor_pair = false;
@@ -1300,6 +1312,8 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let section_header = object_layout.object.section(section_index)?;
     let live_unwind_ranges =
         macho_writer_live_unwind_relocation_ranges(object_layout, layout, section_index)?;
+    let live_subsection_ranges =
+        macho_writer_live_subsection_relocation_ranges(object_layout, layout, section_index)?;
     for rel in relocations.relocations {
         let mut rel = rel.info(LE);
         let input_offset = u64::from(rel.r_address);
@@ -1307,6 +1321,15 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             continue;
         }
         if live_unwind_ranges.as_ref().is_some_and(|ranges| {
+            !ranges
+                .iter()
+                .any(|range| range.contains(&(input_offset as usize)))
+        }) {
+            paired_addend = 0;
+            paired_subtractor = None;
+            continue;
+        }
+        if live_subsection_ranges.as_ref().is_some_and(|ranges| {
             !ranges
                 .iter()
                 .any(|range| range.contains(&(input_offset as usize)))
@@ -2417,6 +2440,38 @@ fn macho_writer_live_unwind_relocation_ranges(
         }
         _ => Ok(None),
     }
+}
+
+fn macho_writer_live_subsection_relocation_ranges(
+    object: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+    section_index: object::SectionIndex,
+) -> Result<Option<Vec<std::ops::Range<usize>>>> {
+    if !layout.symbol_db.args.dead_strip
+        || object.object.flags & macho::MH_SUBSECTIONS_VIA_SYMBOLS == 0
+    {
+        return Ok(None);
+    }
+
+    let section = object.object.section(section_index)?;
+    let section_name = object.object.section_name(section)?;
+    if section.should_retain() || section_name != b"__const" {
+        return Ok(None);
+    }
+
+    let section_size = object.object.section_size(section)?;
+    let mut ranges = Vec::new();
+    for range in object
+        .format_specific
+        .live_subsection_ranges(section_index, section_size)
+    {
+        let start =
+            usize::try_from(range.start).context("Mach-O __const subsection start exceeds usize")?;
+        let end = usize::try_from(range.end).context("Mach-O __const subsection end exceeds usize")?;
+        ranges.push(start..end);
+    }
+
+    Ok(Some(ranges))
 }
 
 fn live_eh_frame_ranges(
