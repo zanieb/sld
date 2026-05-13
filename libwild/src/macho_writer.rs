@@ -192,6 +192,7 @@ impl ChainedRebases {
                         continue;
                     }
                     let section_index = object::SectionIndex(section_index);
+                    let relax_deltas = object.section_relax_deltas.get(section_index.0);
                     let Some(section_address) =
                         object.section_resolutions[section_index.0].address()
                     else {
@@ -203,6 +204,12 @@ impl ChainedRebases {
                     for rel in object.relocations(section_index)?.relocations {
                         let rel = rel.info(LE);
                         let input_offset = rel.r_address as usize;
+                        if relax_deltas
+                            .is_some_and(|deltas| deltas.deletes_input_offset(input_offset as u64))
+                        {
+                            skip_subtractor_pair = false;
+                            continue;
+                        }
                         if live_unwind_ranges.as_ref().is_some_and(|ranges| {
                             !ranges.iter().any(|range| range.contains(&input_offset))
                         }) {
@@ -231,7 +238,10 @@ impl ChainedRebases {
                         if !is_chained_rebase_relocation(&rel_info) {
                             continue;
                         }
-                        let place = section_address + u64::from(rel.r_address);
+                        let output_offset = relax_deltas
+                            .map(|deltas| deltas.input_to_output_offset(input_offset as u64))
+                            .unwrap_or(input_offset as u64);
+                        let place = section_address + output_offset;
                         if place >= data_start && place + 8 <= data_end {
                             let (resolution, local_symbol_id) =
                                 get_resolution(rel, object, layout)?;
