@@ -554,6 +554,9 @@ impl platform::Platform for Elf {
     fn finalise_object_sizes<'data>(
         object: &mut layout::ObjectLayoutState<'data, Elf>,
         common: &mut layout::CommonGroupState<'data, Elf>,
+        _output_sections: &crate::output_section_id::OutputSections<Elf>,
+        _per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,
+        _symbol_db: &SymbolDb<'data, Elf>,
     ) {
         // TODO: Deduplicate CIEs from different objects, then only allocate space for those CIEs
         // that we "won".
@@ -1537,6 +1540,7 @@ impl platform::Platform for Elf {
                 symbol_db,
                 flags.get(),
                 &state.sections,
+                state.section_relax_deltas(),
             ) {
                 // If we've decided to emit the symbol even though it's not referenced (because it's
                 // in a section we're emitting), then make sure we have a resolution for it.

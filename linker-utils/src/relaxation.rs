@@ -96,6 +96,19 @@ impl SectionRelaxDeltas {
             .map_or(0, |i| self.deltas[i].bytes_deleted)
     }
 
+    #[must_use]
+    pub fn deletes_input_offset(&self, input_offset: u64) -> bool {
+        let idx = self
+            .deltas
+            .partition_point(|delta| delta.input_offset <= input_offset);
+        if idx == 0 {
+            return false;
+        }
+
+        let delta = self.deltas[idx - 1];
+        input_offset < delta.input_offset + u64::from(delta.bytes_deleted)
+    }
+
     // Converts an input section offset to the corresponding output section offset by subtracting
     // the cumulative bytes deleted strictly before `input_offset`.
     #[must_use]

@@ -197,9 +197,18 @@ impl ChainedRebases {
                     else {
                         continue;
                     };
+                    let live_unwind_ranges =
+                        macho_writer_live_unwind_relocation_ranges(object, layout, section_index)?;
                     let mut skip_subtractor_pair = false;
                     for rel in object.relocations(section_index)?.relocations {
                         let rel = rel.info(LE);
+                        let input_offset = rel.r_address as usize;
+                        if live_unwind_ranges.as_ref().is_some_and(|ranges| {
+                            !ranges.iter().any(|range| range.contains(&input_offset))
+                        }) {
+                            skip_subtractor_pair = false;
+                            continue;
+                        }
                         if rel.r_type == macho::ARM64_RELOC_ADDEND {
                             continue;
                         }
@@ -1275,11 +1284,33 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         .context("Attempted to apply relocations to a section that we didn't load")?;
     let section_part_id =
         object_layout.section_part_id(section_index, &layout.symbol_db.section_part_ids);
+    let relax_deltas = object_layout.section_relax_deltas.get(section_index.0);
     let mut paired_addend = 0;
     let mut paired_subtractor = None;
     let section_header = object_layout.object.section(section_index)?;
+    let live_unwind_ranges =
+        macho_writer_live_unwind_relocation_ranges(object_layout, layout, section_index)?;
     for rel in relocations.relocations {
-        let rel = rel.info(LE);
+        let mut rel = rel.info(LE);
+        let input_offset = u64::from(rel.r_address);
+        if relax_deltas.is_some_and(|deltas| deltas.deletes_input_offset(input_offset)) {
+            continue;
+        }
+        if live_unwind_ranges.as_ref().is_some_and(|ranges| {
+            !ranges
+                .iter()
+                .any(|range| range.contains(&(input_offset as usize)))
+        }) {
+            paired_addend = 0;
+            paired_subtractor = None;
+            continue;
+        }
+        if let Some(deltas) = relax_deltas {
+            rel.r_address = deltas
+                .input_to_output_offset(input_offset)
+                .try_into()
+                .context("Compacted Mach-O relocation offset exceeds u32")?;
+        }
         if rel.r_type == macho::ARM64_RELOC_ADDEND {
             paired_addend = macho_addend(rel);
             continue;
@@ -2086,6 +2117,20 @@ fn eh_frame_fde_infos<'data>(
     let gcc_except_table_start = gcc_except_table.mem_offset;
     let gcc_except_table_end = gcc_except_table_start + gcc_except_table.mem_size;
     let data = object.object.raw_section_data(eh_frame_section)?;
+    let filter_live_unwind = macho_writer_unwind_atom_gc_enabled(object, layout);
+    let live_fdes = object
+        .format_specific
+        .live_eh_frame_fdes
+        .get(eh_frame_section_index.0);
+    let live_cies = object
+        .format_specific
+        .live_eh_frame_cies
+        .get(eh_frame_section_index.0);
+    let live_ranges = if filter_live_unwind {
+        live_eh_frame_ranges(data, live_fdes, live_cies)?
+    } else {
+        Vec::new()
+    };
 
     let mut relocation_values = HashMap::new();
     let mut relocation_got_values = HashMap::new();
@@ -2098,6 +2143,14 @@ fn eh_frame_fde_infos<'data>(
             continue;
         }
         if rel.r_type == macho::ARM64_RELOC_SUBTRACTOR {
+            continue;
+        }
+        if filter_live_unwind
+            && !live_ranges
+                .iter()
+                .any(|range| range.contains(&(rel.r_address as usize)))
+        {
+            paired_addend = 0;
             continue;
         }
 
@@ -2131,6 +2184,11 @@ fn eh_frame_fde_infos<'data>(
 
         let cie_pointer = read_u32(data, offset + size_of::<u32>())?;
         if cie_pointer != 0 {
+            if filter_live_unwind && !live_fdes.is_some_and(|fdes| fdes.contains(&(offset as u64)))
+            {
+                offset += size_of::<u32>() + length;
+                continue;
+            }
             let pc_begin_offset = offset + 2 * size_of::<u32>();
             if let Some(function_address) = relocation_values.get(&pc_begin_offset) {
                 let pc_begin_size = relocation_sizes
@@ -2232,6 +2290,11 @@ fn read_compact_unwind_entries<'data>(
     }
 
     let mut paired_addend = 0;
+    let filter_live_unwind = macho_writer_unwind_atom_gc_enabled(object, layout);
+    let live_entries = object
+        .format_specific
+        .live_compact_unwind_entries
+        .get(section_index.0);
     for rel in object.relocations(section_index)?.relocations {
         let rel = rel.info(LE);
         if rel.r_type == macho::ARM64_RELOC_ADDEND {
@@ -2246,6 +2309,13 @@ fn read_compact_unwind_entries<'data>(
         let offset = rel.r_address as usize;
         let entry_index = offset / MACHO_COMPACT_UNWIND_ENTRY_SIZE;
         let field_offset = offset % MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+        let entry_start = entry_index * MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+        if filter_live_unwind
+            && !live_entries.is_some_and(|entries| entries.contains(&(entry_start as u64)))
+        {
+            paired_addend = 0;
+            continue;
+        }
         let entry = entries.get_mut(entry_index).with_context(|| {
             format!("Mach-O __compact_unwind relocation at invalid offset {offset:#x}")
         })?;
@@ -2276,7 +2346,106 @@ fn read_compact_unwind_entries<'data>(
         paired_addend = 0;
     }
 
-    Ok(entries)
+    if filter_live_unwind {
+        Ok(entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| {
+                let entry_start = entry_index * MACHO_COMPACT_UNWIND_ENTRY_SIZE;
+                live_entries
+                    .is_some_and(|entries| entries.contains(&(entry_start as u64)))
+                    .then_some(entry)
+            })
+            .collect())
+    } else {
+        Ok(entries)
+    }
+}
+
+fn macho_writer_unwind_atom_gc_enabled(
+    object: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+) -> bool {
+    layout.symbol_db.args.dead_strip && object.object.flags & macho::MH_SUBSECTIONS_VIA_SYMBOLS != 0
+}
+
+fn macho_writer_live_unwind_relocation_ranges(
+    object: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+    section_index: object::SectionIndex,
+) -> Result<Option<Vec<std::ops::Range<usize>>>> {
+    if !macho_writer_unwind_atom_gc_enabled(object, layout) {
+        return Ok(None);
+    }
+    let section = object.object.section(section_index)?;
+    match object.object.section_name(section)? {
+        b"__eh_frame" => {
+            let data = object.object.raw_section_data(section)?;
+            let live_fdes = object
+                .format_specific
+                .live_eh_frame_fdes
+                .get(section_index.0);
+            let live_cies = object
+                .format_specific
+                .live_eh_frame_cies
+                .get(section_index.0);
+            Ok(Some(live_eh_frame_ranges(data, live_fdes, live_cies)?))
+        }
+        b"__compact_unwind" => {
+            let ranges = object
+                .format_specific
+                .live_compact_unwind_entries
+                .get(section_index.0)
+                .into_iter()
+                .flatten()
+                .map(|entry_start| {
+                    let entry_start = *entry_start as usize;
+                    entry_start..entry_start + MACHO_COMPACT_UNWIND_ENTRY_SIZE
+                })
+                .collect();
+            Ok(Some(ranges))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn live_eh_frame_ranges(
+    data: &[u8],
+    live_fdes: Option<&std::collections::BTreeSet<u64>>,
+    live_cies: Option<&std::collections::BTreeSet<u64>>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    while offset + size_of::<u32>() <= data.len() {
+        let length = read_u32(data, offset)? as usize;
+        if length == 0 {
+            break;
+        }
+        ensure!(
+            length != 0xffff_ffff,
+            "Mach-O 64-bit __eh_frame lengths are not supported"
+        );
+        let entry_end = offset
+            .checked_add(size_of::<u32>())
+            .and_then(|entry| entry.checked_add(length))
+            .context("Mach-O __eh_frame entry length overflow")?;
+        ensure!(
+            entry_end <= data.len(),
+            "Mach-O __eh_frame entry at offset {offset:#x} extends past the section"
+        );
+
+        let cie_pointer = read_u32(data, offset + size_of::<u32>())?;
+        if cie_pointer == 0 {
+            if live_cies.is_some_and(|cies| cies.contains(&(offset as u64))) {
+                ranges.push(offset..entry_end);
+            }
+        } else if live_fdes.is_some_and(|fdes| fdes.contains(&(offset as u64))) {
+            ranges.push(offset..entry_end);
+        }
+
+        offset = entry_end;
+    }
+    Ok(ranges)
 }
 
 fn macho_image_offset(address: u64) -> Result<u32> {
@@ -2341,15 +2510,51 @@ fn write_section_raw<'out, 'data>(
             });
         }
         let object_section = object.object.section(section_index)?;
+        let relax_deltas = object.section_relax_deltas.get(section_index.0);
 
-        let section_size = object.object.section_size(object_section)?;
-        let (out, padding) = out.split_at_mut(section_size as usize);
-        object.object.copy_section_data(object_section, out)?;
-        padding.fill(0);
-        Ok(WrittenSection {
-            bytes: out,
-            reused: false,
-        })
+        match relax_deltas {
+            None => {
+                let section_size = object.object.section_size(object_section)?;
+                let (out, padding) = out.split_at_mut(section_size as usize);
+                object.object.copy_section_data(object_section, out)?;
+                padding.fill(0);
+                Ok(WrittenSection {
+                    bytes: out,
+                    reused: false,
+                })
+            }
+            Some(deltas) => {
+                let input_data = object.object.raw_section_data(object_section)?;
+                let effective_size = sec.size as usize;
+
+                let mut input_pos = 0usize;
+                let mut output_pos = 0usize;
+
+                for delta in deltas.deltas() {
+                    let skip_start = delta.input_offset as usize;
+                    let copy_len = skip_start - input_pos;
+                    if copy_len > 0 {
+                        out[output_pos..output_pos + copy_len]
+                            .copy_from_slice(&input_data[input_pos..skip_start]);
+                        output_pos += copy_len;
+                    }
+                    input_pos = skip_start + delta.bytes_deleted as usize;
+                }
+
+                let remaining = input_data.len() - input_pos;
+                if remaining > 0 {
+                    out[output_pos..output_pos + remaining]
+                        .copy_from_slice(&input_data[input_pos..]);
+                    output_pos += remaining;
+                }
+                out[output_pos..].fill(0);
+
+                Ok(WrittenSection {
+                    bytes: &mut out[..effective_size],
+                    reused: false,
+                })
+            }
+        }
     } else {
         Ok(WrittenSection {
             bytes: &mut [],
@@ -2998,6 +3203,7 @@ fn write_symbols<'data>(
             &layout.symbol_db,
             flags.get(),
             &object.sections,
+            &object.section_relax_deltas,
         ) else {
             continue;
         };

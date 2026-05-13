@@ -872,6 +872,9 @@ impl platform::Platform for Wasm {
     fn finalise_object_sizes<'data>(
         object: &mut crate::layout::ObjectLayoutState<'data, Self>,
         common: &mut crate::layout::CommonGroupState<'data, Self>,
+        _output_sections: &crate::output_section_id::OutputSections<Self>,
+        _per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,
+        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) {
         todo!()
     }
