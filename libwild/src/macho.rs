@@ -2881,7 +2881,8 @@ fn compact_dead_macho_subsections<'data>(
         let section_name = object.object.section_name(section_header).ok();
         if section_header.should_retain()
             || !(section_header.is_executable()
-                || section_name == Some(b"__gcc_except_tab".as_slice()))
+                || section_name == Some(b"__gcc_except_tab".as_slice())
+                || section_name == Some(b"__const".as_slice()))
         {
             continue;
         }
