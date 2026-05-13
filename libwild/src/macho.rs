@@ -2078,8 +2078,12 @@ impl platform::Platform for MachO {
             }
         };
 
-        let mut rules = Vec::with_capacity(DEFAULT_SECTION_RULES.len() + 6);
+        let mut rules = Vec::with_capacity(DEFAULT_SECTION_RULES.len() + 7);
         rules.push(gc_rule(b"__text", crate::output_section_id::TEXT));
+        rules.push(gc_rule(
+            b"__gcc_except_tab",
+            crate::output_section_id::GCC_EXCEPT_TABLE,
+        ));
         rules.extend(DEFAULT_SECTION_RULES.iter().cloned());
         rules.push(gc_rule(b"__const", crate::output_section_id::RODATA));
         rules.push(gc_rule(b"__cstring", crate::output_section_id::CSTRING));
@@ -2250,7 +2254,12 @@ fn macho_subsection_gc_enabled<'data>(
     }
 
     let section = state.object.section(section_index)?;
-    Ok(section.is_executable() && !section.should_retain())
+    let section_name = state.object.section_name(section)?;
+    Ok(
+        !section.should_retain()
+            && (section.is_executable()
+                || section_name == b"__gcc_except_tab"),
+    )
 }
 
 fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
@@ -2852,7 +2861,11 @@ fn compact_dead_macho_subsections<'data>(
         let Ok(section_header) = object.object.section(section_index) else {
             continue;
         };
-        if !section_header.is_executable() || section_header.should_retain() {
+        let section_name = object.object.section_name(section_header).ok();
+        if section_header.should_retain()
+            || !(section_header.is_executable()
+                || section_name == Some(b"__gcc_except_tab".as_slice()))
+        {
             continue;
         }
         let Ok(section_size) = object.object.section_size(section_header) else {
@@ -3284,10 +3297,6 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::EH_FRAME),
-    SectionRule::exact_section_keep(
-        b"__gcc_except_tab",
-        crate::output_section_id::GCC_EXCEPT_TABLE,
-    ),
     SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
     SectionRule::exact_section_keep(b".rustc", crate::output_section_id::RUSTC_METADATA),
     SectionRule::exact_section_keep(
