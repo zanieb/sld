@@ -65,6 +65,7 @@ use crate::macho::load_dylib_command_count;
 use crate::macho::load_dylib_command_size;
 use crate::macho::load_dylib_commands;
 use crate::macho::load_dylib_paths;
+use crate::macho::macho_live_eh_frame_cies;
 use crate::output_section_id;
 use crate::output_section_id::SectionName;
 use crate::output_section_map::OutputSectionMap;
@@ -87,6 +88,7 @@ use crate::verbose_timing_phase;
 use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::RelocationSize;
+use linker_utils::relaxation::SectionRelaxDeltas;
 use linker_utils::relaxation::opt_input_to_output;
 use object::BigEndian;
 use object::Endianness;
@@ -682,6 +684,8 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 mod tests {
     use super::compact_unwind_dwarf_offset_hint;
     use super::path_matches_library;
+    use super::rewrite_compacted_macho_eh_frame_cie_pointers;
+    use linker_utils::relaxation::SectionRelaxDeltas;
 
     #[test]
     fn framework_matching_uses_path_components() {
@@ -717,6 +721,29 @@ mod tests {
         assert_eq!(compact_unwind_dwarf_offset_hint(0), 0);
         assert_eq!(compact_unwind_dwarf_offset_hint(0x00ff_ffff), 0x00ff_ffff);
         assert_eq!(compact_unwind_dwarf_offset_hint(0x0100_0000), 0);
+    }
+
+    #[test]
+    fn compacted_eh_frame_rewrites_fde_cie_pointer() {
+        let input = [
+            4, 0, 0, 0, // Live CIE length.
+            0, 0, 0, 0, // Live CIE marker.
+            4, 0, 0, 0, // Dead CIE length.
+            0, 0, 0, 0, // Dead CIE marker.
+            4, 0, 0, 0, // Live FDE length.
+            20, 0, 0, 0, // Input pointer back to the live CIE.
+        ];
+        let deltas = SectionRelaxDeltas::new(vec![(8, 8)]);
+        let mut out = [
+            4, 0, 0, 0, // Live CIE length.
+            0, 0, 0, 0, // Live CIE marker.
+            4, 0, 0, 0, // Live FDE length.
+            20, 0, 0, 0, // Stale pointer before rewriting.
+        ];
+
+        rewrite_compacted_macho_eh_frame_cie_pointers(&input, &deltas, &mut out).unwrap();
+
+        assert_eq!(&out[12..16], &[12, 0, 0, 0]);
     }
 }
 
@@ -2173,12 +2200,9 @@ fn eh_frame_fde_infos<'data>(
         .format_specific
         .live_eh_frame_fdes
         .get(eh_frame_section_index.0);
-    let live_cies = object
-        .format_specific
-        .live_eh_frame_cies
-        .get(eh_frame_section_index.0);
+    let relax_deltas = object.section_relax_deltas.get(eh_frame_section_index.0);
     let live_ranges = if filter_live_unwind {
-        live_eh_frame_ranges(data, live_fdes, live_cies)?
+        live_eh_frame_ranges(data, live_fdes)?
     } else {
         Vec::new()
     };
@@ -2302,7 +2326,8 @@ fn eh_frame_fde_infos<'data>(
                 fde_infos.insert(
                     *function_address,
                     FdeInfo {
-                        output_offset: eh_frame_output_offset + offset as u64,
+                        output_offset: eh_frame_output_offset
+                            + opt_input_to_output(relax_deltas, offset as u64),
                         length: function_length,
                         personality_offset,
                         lsda_offset,
@@ -2315,6 +2340,69 @@ fn eh_frame_fde_infos<'data>(
     }
 
     Ok(Some(fde_infos))
+}
+
+fn rewrite_compacted_macho_eh_frame_cie_pointers(
+    input_data: &[u8],
+    deltas: &SectionRelaxDeltas,
+    out: &mut [u8],
+) -> Result {
+    let mut offset = 0usize;
+    while offset + size_of::<u32>() <= input_data.len() {
+        let length = read_u32(input_data, offset)? as usize;
+        if length == 0 {
+            break;
+        }
+        ensure!(
+            length != 0xffff_ffff,
+            "Mach-O 64-bit __eh_frame lengths are not supported"
+        );
+        let entry_end = offset
+            .checked_add(size_of::<u32>())
+            .and_then(|entry| entry.checked_add(length))
+            .context("Mach-O __eh_frame entry length overflow")?;
+        ensure!(
+            entry_end <= input_data.len(),
+            "Mach-O __eh_frame entry at offset {offset:#x} extends past the section"
+        );
+
+        let cie_pointer = read_u32(input_data, offset + size_of::<u32>())?;
+        if cie_pointer != 0 && !deltas.deletes_input_offset(offset as u64) {
+            let cie_pointer_offset = offset + size_of::<u32>();
+            let cie_start = cie_pointer_offset
+                .checked_sub(cie_pointer as usize)
+                .with_context(|| {
+                    format!(
+                        "Mach-O __eh_frame FDE at offset {offset:#x} references invalid CIE pointer {cie_pointer:#x}"
+                    )
+                })?;
+            ensure!(
+                !deltas.deletes_input_offset(cie_start as u64),
+                "Compacted Mach-O __eh_frame kept FDE at offset {offset:#x} but deleted its CIE at offset {cie_start:#x}"
+            );
+
+            let output_fde_start = usize::try_from(deltas.input_to_output_offset(offset as u64))
+                .context("Compacted Mach-O __eh_frame FDE output offset exceeds usize")?;
+            let output_cie_start = usize::try_from(deltas.input_to_output_offset(cie_start as u64))
+                .context("Compacted Mach-O __eh_frame CIE output offset exceeds usize")?;
+            let output_cie_pointer_offset = output_fde_start + size_of::<u32>();
+            let output_cie_pointer = output_cie_pointer_offset
+                .checked_sub(output_cie_start)
+                .context("Compacted Mach-O __eh_frame CIE pointer underflow")?;
+            let output_cie_pointer = u32::try_from(output_cie_pointer)
+                .context("Compacted Mach-O __eh_frame CIE pointer exceeds u32")?;
+            let output_range =
+                output_cie_pointer_offset..output_cie_pointer_offset + size_of::<u32>();
+            let output = out
+                .get_mut(output_range)
+                .ok_or_else(|| error!("Write past end of compacted Mach-O __eh_frame buffer"))?;
+            output.copy_from_slice(&output_cie_pointer.to_le_bytes());
+        }
+
+        offset = entry_end;
+    }
+
+    Ok(())
 }
 
 fn read_compact_unwind_entries<'data>(
@@ -2436,11 +2524,7 @@ fn macho_writer_live_unwind_relocation_ranges(
                 .format_specific
                 .live_eh_frame_fdes
                 .get(section_index.0);
-            let live_cies = object
-                .format_specific
-                .live_eh_frame_cies
-                .get(section_index.0);
-            Ok(Some(live_eh_frame_ranges(data, live_fdes, live_cies)?))
+            Ok(Some(live_eh_frame_ranges(data, live_fdes)?))
         }
         b"__compact_unwind" => {
             let ranges = object
@@ -2495,8 +2579,8 @@ fn macho_writer_live_subsection_relocation_ranges(
 fn live_eh_frame_ranges(
     data: &[u8],
     live_fdes: Option<&std::collections::BTreeSet<u64>>,
-    live_cies: Option<&std::collections::BTreeSet<u64>>,
 ) -> Result<Vec<std::ops::Range<usize>>> {
+    let live_cies = macho_live_eh_frame_cies(data, live_fdes)?;
     let mut ranges = Vec::new();
     let mut offset = 0usize;
     while offset + size_of::<u32>() <= data.len() {
@@ -2519,7 +2603,7 @@ fn live_eh_frame_ranges(
 
         let cie_pointer = read_u32(data, offset + size_of::<u32>())?;
         if cie_pointer == 0 {
-            if live_cies.is_some_and(|cies| cies.contains(&(offset as u64))) {
+            if live_cies.contains(&(offset as u64)) {
                 ranges.push(offset..entry_end);
             }
         } else if live_fdes.is_some_and(|fdes| fdes.contains(&(offset as u64))) {
@@ -2631,6 +2715,9 @@ fn write_section_raw<'out, 'data>(
                     output_pos += remaining;
                 }
                 out[output_pos..].fill(0);
+                if object.object.section_name(object_section)? == b"__eh_frame" {
+                    rewrite_compacted_macho_eh_frame_cie_pointers(input_data, deltas, out)?;
+                }
 
                 Ok(WrittenSection {
                     bytes: &mut out[..effective_size],
