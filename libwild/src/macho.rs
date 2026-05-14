@@ -197,9 +197,11 @@ fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 mod tests {
     use super::MachO;
     use super::macho_eh_frame_fde_count;
+    use super::macho_live_eh_frame_cies;
     use crate::platform;
     use crate::platform::Symbol as _;
     use object::macho::N_SECT;
+    use std::collections::BTreeSet;
 
     #[test]
     fn macho_eh_frame_fde_count_ignores_cies() {
@@ -212,6 +214,23 @@ mod tests {
         ];
 
         assert_eq!(macho_eh_frame_fde_count(&data).unwrap(), 1);
+    }
+
+    #[test]
+    fn macho_live_eh_frame_cies_only_keeps_live_fde_dependencies() {
+        let data = [
+            4, 0, 0, 0, // Referenced CIE length.
+            0, 0, 0, 0, // Referenced CIE marker.
+            4, 0, 0, 0, // Unreferenced CIE length.
+            0, 0, 0, 0, // Unreferenced CIE marker.
+            4, 0, 0, 0, // Live FDE length.
+            20, 0, 0, 0, // Pointer back to the first CIE.
+        ];
+
+        let live_fdes = BTreeSet::from([16]);
+        let live_cies = macho_live_eh_frame_cies(&data, Some(&live_fdes)).unwrap();
+
+        assert_eq!(live_cies, BTreeSet::from([0]));
     }
 
     #[test]
@@ -2766,6 +2785,77 @@ fn macho_read_u32(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+pub(crate) fn macho_live_eh_frame_cies(
+    data: &[u8],
+    live_fdes: Option<&BTreeSet<u64>>,
+) -> Result<BTreeSet<u64>> {
+    let Some(live_fdes) = live_fdes else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut entry_bounds = Vec::new();
+    let mut entry_by_start = HashMap::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let length = macho_read_u32(data, offset)? as usize;
+        if length == 0 {
+            break;
+        }
+        ensure!(
+            length != 0xffff_ffff,
+            "Mach-O 64-bit __eh_frame lengths are not supported"
+        );
+        let entry_end = offset
+            .checked_add(4)
+            .and_then(|entry| entry.checked_add(length))
+            .context("Mach-O __eh_frame entry length overflow")?;
+        ensure!(
+            entry_end <= data.len(),
+            "Mach-O __eh_frame entry at offset {offset:#x} extends past the section"
+        );
+
+        let bounds = EhFrameEntryBounds {
+            start: offset,
+            end: entry_end,
+            cie_pointer: macho_read_u32(data, offset + 4)?,
+        };
+        entry_bounds.push(bounds);
+        entry_by_start.insert(offset, bounds);
+        offset = entry_end;
+    }
+
+    let mut live_cies = BTreeSet::new();
+    for bounds in entry_bounds
+        .iter()
+        .copied()
+        .filter(|bounds| bounds.cie_pointer != 0 && live_fdes.contains(&(bounds.start as u64)))
+    {
+        let cie_pointer_offset = bounds.start + 4;
+        let cie_start = cie_pointer_offset
+            .checked_sub(bounds.cie_pointer as usize)
+            .with_context(|| {
+                format!(
+                    "Mach-O __eh_frame FDE at offset {:#x} references invalid CIE pointer {:#x}",
+                    bounds.start, bounds.cie_pointer
+                )
+            })?;
+        let cie_bounds = entry_by_start.get(&cie_start).copied().with_context(|| {
+            format!(
+                "Mach-O __eh_frame FDE at offset {:#x} references missing CIE at offset {cie_start:#x}",
+                bounds.start
+            )
+        })?;
+        ensure!(
+            cie_bounds.cie_pointer == 0,
+            "Mach-O __eh_frame FDE at offset {:#x} references non-CIE entry {cie_start:#x}",
+            bounds.start
+        );
+        live_cies.insert(cie_start as u64);
+    }
+
+    Ok(live_cies)
+}
+
 fn mark_macho_subsection_live<'data>(
     state: &mut crate::layout::ObjectLayoutState<'data, MachO>,
     symbol_index: object::SymbolIndex,
@@ -2982,10 +3072,9 @@ fn compact_dead_macho_eh_frame<'data>(
         .format_specific
         .live_eh_frame_fdes
         .get(section_index.0);
-    let live_cies = object
-        .format_specific
-        .live_eh_frame_cies
-        .get(section_index.0);
+    let Ok(live_cies) = macho_live_eh_frame_cies(data, live_fdes) else {
+        return;
+    };
 
     let mut raw_deltas = Vec::new();
     let mut offset = 0usize;
@@ -3018,7 +3107,7 @@ fn compact_dead_macho_eh_frame<'data>(
             break;
         };
         let keep = if cie_pointer == 0 {
-            live_cies.is_some_and(|entries| entries.contains(&(offset as u64)))
+            live_cies.contains(&(offset as u64))
         } else {
             live_fdes.is_some_and(|entries| entries.contains(&(offset as u64)))
         };
