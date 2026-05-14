@@ -3001,18 +3001,71 @@ fn compact_dead_macho_subsections<'data>(
         }
 
         let mut raw_deltas = Vec::new();
-        for (index, &(start, keep)) in merged_atoms.iter().enumerate() {
-            let end = merged_atoms
-                .get(index + 1)
-                .map_or(section_size, |(next_start, _)| *next_start);
-            if keep || end <= start {
-                continue;
+        if section_name == Some(b"__const".as_slice()) {
+            let mut suffix_live_alignments = vec![1u64; merged_atoms.len() + 1];
+            for index in (0..merged_atoms.len()).rev() {
+                let inherited = suffix_live_alignments[index + 1];
+                suffix_live_alignments[index] = if merged_atoms[index].1 {
+                    let offset = merged_atoms[index].0;
+                    let alignment = if offset == 0 {
+                        1
+                    } else {
+                        1u64 << offset.trailing_zeros()
+                    };
+                    inherited.max(alignment)
+                } else {
+                    inherited
+                };
             }
-            let Ok(bytes_deleted) = u32::try_from(end - start) else {
-                raw_deltas.clear();
-                break;
-            };
-            raw_deltas.push((start, bytes_deleted));
+
+            let mut index = 0usize;
+            while index < merged_atoms.len() {
+                let (run_start, keep) = merged_atoms[index];
+                if keep {
+                    index += 1;
+                    continue;
+                }
+
+                let mut next_live_index = index + 1;
+                while next_live_index < merged_atoms.len() && !merged_atoms[next_live_index].1 {
+                    next_live_index += 1;
+                }
+                let run_end = merged_atoms
+                    .get(next_live_index)
+                    .map_or(section_size, |(next_start, _)| *next_start);
+                if run_end <= run_start {
+                    index = next_live_index;
+                    continue;
+                }
+
+                let raw_delete = run_end - run_start;
+                let alignment = suffix_live_alignments[next_live_index];
+                let bytes_deleted = raw_delete - (raw_delete % alignment);
+                if bytes_deleted == 0 {
+                    index = next_live_index;
+                    continue;
+                }
+                let Ok(bytes_deleted_u32) = u32::try_from(bytes_deleted) else {
+                    raw_deltas.clear();
+                    break;
+                };
+                raw_deltas.push((run_start, bytes_deleted_u32));
+                index = next_live_index;
+            }
+        } else {
+            for (index, &(start, keep)) in merged_atoms.iter().enumerate() {
+                let end = merged_atoms
+                    .get(index + 1)
+                    .map_or(section_size, |(next_start, _)| *next_start);
+                if keep || end <= start {
+                    continue;
+                }
+                let Ok(bytes_deleted) = u32::try_from(end - start) else {
+                    raw_deltas.clear();
+                    break;
+                };
+                raw_deltas.push((start, bytes_deleted));
+            }
         }
         if raw_deltas.is_empty() {
             continue;
