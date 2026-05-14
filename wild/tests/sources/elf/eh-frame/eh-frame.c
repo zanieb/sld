@@ -2,6 +2,7 @@
 //#Object:runtime.c
 //#DiffIgnore: segment.LOAD.RW.alignment
 //#ExpectSym:_start section=".text"
+//#NoEmptyLoadSegment:true
 //#TestUpdateInPlace:true
 //#TestIncremental:true
 //#TestIncrementalStateContains:fde\t

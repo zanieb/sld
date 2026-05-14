@@ -3284,6 +3284,13 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
             }
         }
 
+        P::finalise_keep_sections(
+            &mut keep_sections,
+            total_sizes,
+            output_sections,
+            resources.symbol_db.args,
+        );
+
         let mut num_sections = keep_sections.values_iter().filter(|p| **p).count();
         if P::requires_symtab_shndx(num_sections) {
             *keep_sections.get_mut(output_section_id::SYMTAB_SHNDX_LOCAL) = true;
@@ -3308,22 +3315,40 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
         }
         output_sections.output_section_indexes = output_section_indexes;
 
+        let section_needs_segment_content = |section_id: OutputSectionId| {
+            matches!(
+                section_id,
+                output_section_id::FILE_HEADER
+                    | output_section_id::PROGRAM_HEADERS
+                    | output_section_id::SECTION_HEADERS
+            ) || section_id
+                .parts()
+                .any(|part_id| *total_sizes.get(part_id) > 0)
+        };
+
         // Determine which program segments contain sections that we're keeping.
         let mut keep_segments = program_segments
             .iter()
             .map(|details| details.always_keep())
             .collect_vec();
-        let mut active_segments = Vec::with_capacity(4);
+        let mut active_segments: Vec<ProgramSegmentId> = Vec::with_capacity(4);
         for event in output_order {
             match event {
                 OrderEvent::SegmentStart(segment_id) => active_segments.push(segment_id),
                 OrderEvent::SegmentEnd(segment_id) => active_segments.retain(|a| *a != segment_id),
                 OrderEvent::Section(section_id) => {
                     if *keep_sections.get(section_id) {
-                        for segment_id in &active_segments {
-                            keep_segments[segment_id.as_usize()] = true;
-                        }
-                        active_segments.clear();
+                        let needs_segment_content = section_needs_segment_content(section_id);
+                        active_segments.retain(|segment_id| {
+                            if needs_segment_content
+                                || !program_segments.is_load_segment(*segment_id)
+                            {
+                                keep_segments[segment_id.as_usize()] = true;
+                                false
+                            } else {
+                                true
+                            }
+                        });
                     }
                 }
                 OrderEvent::SetLocation(_) => {}

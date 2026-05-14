@@ -133,14 +133,23 @@ Size and layout snapshot:
   - Wild is missing `.llvm_addrsig`.
   - Wild is missing `PT_GNU_EH_FRAME` / GNU EH frame header metadata.
   - For `trivial`, mold also emitted `.got.plt`.
-- Wild vs GNU ld, both `trivial` and `data`:
-  - The only reported `linker-diff --wild-defaults` issue was `.eh_frame` section type:
-    Wild used `SHT_PROGBITS` (`0x1`), GNU ld used `SHT_X86_64_UNWIND` (`0x70000001`).
+- Wild vs GNU ld:
+  - The clearest low-level metadata difference is `.eh_frame` section type, but the live Linux
+    rerun showed this is input-sensitive rather than a simple "GNU is always X" rule. GNU ld
+    preserves the input type: `SHT_PROGBITS` input produces `SHT_PROGBITS` output, while
+    `SHT_X86_64_UNWIND` input produces `SHT_X86_64_UNWIND` output.
+  - Wild currently emits `SHT_PROGBITS` for both of those x86_64 `.eh_frame` shapes. That matches
+    mold's documented policy of canonicalizing `SHT_X86_64_UNWIND` back to `SHT_PROGBITS`, but it
+    differs from GNU ld when the input section already used `SHT_X86_64_UNWIND`.
 
 Program-header differences:
 
 - Wild emits `PHDR`, read-only `LOAD`, executable `LOAD`, writable `LOAD`, `GNU_STACK`, and
   `GNU_RELRO` for `trivial`; `data` adds a separate writable data `LOAD`.
+- A Linux/amd64 Rosetta run exposed a stricter runtime compatibility issue here: Wild could emit
+  all-zero writable `PT_LOAD` segments when the only kept sections in that segment were zero-sized
+  `.data` / `.bss` style inputs, and it could also keep RELRO padding without real RELRO content.
+  Rosetta rejects that shape with `bss_size overflow`.
 - mold emits `PHDR`, read-only `LOAD`, executable `LOAD`, writable/RELRO `LOAD`, writable GOT/data
   `LOAD`, `GNU_EH_FRAME`, `GNU_STACK`, and `GNU_RELRO`.
 - GNU ld emits fewer program headers for these static links: read-only `LOAD`, executable `LOAD`,
@@ -150,8 +159,9 @@ Initial ELF takeaways:
 
 - Wild's static freestanding output is compact and has matching executable code for the simple
   fixtures, but it lacks mold's generated EH frame header surface.
-- Compared with GNU ld, the most concrete low-level compatibility issue in these fixtures is the
-  `.eh_frame` section type.
+- Compared with GNU ld, the most concrete low-level metadata difference in these fixtures is the
+  input-sensitive `.eh_frame` section type policy. This should be treated as a deliberate
+  GNU-vs-mold compatibility decision, not as an obvious correctness bug.
 - Compared with mold, Wild intentionally or accidentally omits GOT/GOT.PLT scaffolding in these
   static cases. That is probably fine for these inputs, but it is an observable output-policy
   difference and should be checked against dynamic and relocation-heavy fixtures in a Linux run.
@@ -258,6 +268,13 @@ Harness updates made after the initial comparison:
   where unrelated ELF fixtures may name optional linkers such as `ld.lld`.
 - Removed `global-offset-table.sh` from the mold skip list after the Linux Apple Container run proved
   it now passes under Wild.
+- Added section-type assertions to the ELF integration harness. The new `.eh_frame` fixtures cover
+  both ordinary `SHT_PROGBITS` inputs, which GNU ld and Wild both emit as `SHT_PROGBITS`, and
+  `SHT_X86_64_UNWIND` inputs, where GNU ld preserves `SHT_X86_64_UNWIND` but Wild follows the
+  mold-style `SHT_PROGBITS` policy.
+- Added a `NoEmptyLoadSegment` ELF assertion and applied it to the `eh-frame` fixture that
+  reproduced the Rosetta `bss_size overflow`; Wild now keeps zero-sized sections without letting
+  them alone keep an empty `PT_LOAD` segment.
 
 1. Broaden Apple `ld` comparison for Mach-O.
    The integration path now has opt-in Apple `ld` execution for a couple of fixtures, but there is
