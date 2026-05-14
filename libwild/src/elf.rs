@@ -432,6 +432,40 @@ impl platform::Platform for Elf {
         }
     }
 
+    fn finalise_keep_sections(
+        keep_sections: &mut OutputSectionMap<bool>,
+        total_sizes: &OutputSectionPartMap<u64>,
+        output_sections: &OutputSections<Self>,
+        args: &ElfArgs,
+    ) {
+        if !args.relro {
+            return;
+        }
+
+        let has_relro_content = (0..output_sections.num_sections()).any(|i| {
+            let section_id = OutputSectionId::from_usize(i);
+            if section_id == output_section_id::RELRO_PADDING || !*keep_sections.get(section_id) {
+                return false;
+            }
+
+            let section_size: u64 = section_id
+                .parts()
+                .map(|part_id| *total_sizes.get(part_id))
+                .sum();
+            if section_size == 0 {
+                return false;
+            }
+
+            let info = output_sections.output_info(section_id);
+            info.section_attributes.flags.contains(shf::TLS)
+                || section_id
+                    .opt_built_in_details::<Elf>()
+                    .is_some_and(|details| details.is_relro)
+        });
+
+        *keep_sections.get_mut(output_section_id::RELRO_PADDING) = has_relro_content;
+    }
+
     fn is_zero_sized_section_content(section_id: OutputSectionId) -> bool {
         // We always consider empty sections as content except for sframe sections.
         section_id != output_section_id::SFRAME

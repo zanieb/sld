@@ -322,6 +322,16 @@ pub(crate) trait Platform:
     /// that need to be emitted even if empty.
     fn apply_force_keep_sections(keep_sections: &mut OutputSectionMap<bool>, args: &Self::Args);
 
+    /// Allows platforms to adjust the final section keep-list after size-based and force-keep
+    /// decisions have been applied.
+    fn finalise_keep_sections(
+        _keep_sections: &mut OutputSectionMap<bool>,
+        _total_sizes: &OutputSectionPartMap<u64>,
+        _output_sections: &OutputSections<Self>,
+        _args: &Self::Args,
+    ) {
+    }
+
     /// Returns whether an input section with zero size destined for the specified output section
     /// should be considered content and thus prevent the output section from being discarded.
     fn is_zero_sized_section_content(section_id: OutputSectionId) -> bool;

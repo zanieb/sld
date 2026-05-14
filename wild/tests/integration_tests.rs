@@ -57,6 +57,9 @@
 //! ExpectLoadAlignment:{alignment} Checks that the first PT_LOAD segment in the output binary has
 //! the specified alignment.
 //!
+//! NoEmptyLoadSegment:{bool} Checks that no PT_LOAD segment has both zero file size and zero
+//! memory size.
+//!
 //! ExpectProgramHeader:{type} Checks that the output binary contains a program header of the
 //! specified type.
 //!
@@ -69,6 +72,12 @@
 //!
 //! ExpectSectionBytes:{section_name}=0x{hex_bytes} Checks that the specified section contains
 //! exactly the given bytes.
+//!
+//! ExpectSectionType:{section_name}={section_type} Checks that the specified ELF section has the
+//! given section header type. The section type may be numeric or a supported `SHT_*` name.
+//!
+//! ExpectSectionTypeWild:{section_name}={section_type} As for ExpectSectionType, but only checks
+//! Wild's output.
 //!
 //! ExpectMachOBuildVersion:{platform} {min-os} {sdk} Checks that the output Mach-O contains an
 //! LC_BUILD_VERSION load command with the specified values.
@@ -307,6 +316,7 @@ use object::ObjectKind;
 use object::ObjectSection;
 use object::ObjectSymbol as _;
 use object::read::elf::ProgramHeader;
+use object::read::elf::SectionHeader as _;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -1302,7 +1312,9 @@ struct Assertions {
     expected_dynamic_entries: Vec<String>,
     absent_dynamic_entries: Vec<String>,
     expected_section_bytes: Vec<ExpectedSectionBytes>,
+    expected_section_types: Vec<ExpectedSectionType>,
     expected_macho_build_version: Option<ExpectedMachOBuildVersion>,
+    no_empty_load_segments: bool,
     output_file_matches: Vec<OutputFileMatch>,
     max_thunks: u64,
     expected_program_headers: Vec<ProgramHeaderType>,
@@ -1313,6 +1325,14 @@ struct Assertions {
 struct ExpectedSectionBytes {
     section_name: String,
     expected_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedSectionType {
+    section_name: String,
+    section_type_name: String,
+    section_type: u32,
+    wild_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1600,6 +1620,60 @@ fn parse_section_bytes_directive(directive: &str, arg: &str) -> Result<(String, 
     parse_named_bytes_directive(directive, arg)
 }
 
+fn parse_section_type_directive(
+    directive: &str,
+    arg: &str,
+    wild_only: bool,
+) -> Result<ExpectedSectionType> {
+    let (section_name, section_type_name) = arg
+        .split_once('=')
+        .with_context(|| format!("{directive} requires name=section_type, got `{arg}`"))?;
+    let section_type_name = section_type_name.trim();
+    Ok(ExpectedSectionType {
+        section_name: section_name.to_owned(),
+        section_type_name: section_type_name.to_owned(),
+        section_type: parse_section_type(section_type_name)
+            .with_context(|| format!("Invalid section type in {directive}: {section_type_name}"))?,
+        wild_only,
+    })
+}
+
+fn parse_section_type(section_type: &str) -> Result<u32> {
+    match section_type {
+        "SHT_NULL" => Ok(object::elf::SHT_NULL),
+        "SHT_PROGBITS" => Ok(object::elf::SHT_PROGBITS),
+        "SHT_SYMTAB" => Ok(object::elf::SHT_SYMTAB),
+        "SHT_STRTAB" => Ok(object::elf::SHT_STRTAB),
+        "SHT_RELA" => Ok(object::elf::SHT_RELA),
+        "SHT_HASH" => Ok(object::elf::SHT_HASH),
+        "SHT_DYNAMIC" => Ok(object::elf::SHT_DYNAMIC),
+        "SHT_NOTE" => Ok(object::elf::SHT_NOTE),
+        "SHT_NOBITS" => Ok(object::elf::SHT_NOBITS),
+        "SHT_REL" => Ok(object::elf::SHT_REL),
+        "SHT_DYNSYM" => Ok(object::elf::SHT_DYNSYM),
+        "SHT_INIT_ARRAY" => Ok(object::elf::SHT_INIT_ARRAY),
+        "SHT_FINI_ARRAY" => Ok(object::elf::SHT_FINI_ARRAY),
+        "SHT_PREINIT_ARRAY" => Ok(object::elf::SHT_PREINIT_ARRAY),
+        "SHT_GROUP" => Ok(object::elf::SHT_GROUP),
+        "SHT_SYMTAB_SHNDX" => Ok(object::elf::SHT_SYMTAB_SHNDX),
+        "SHT_RELR" => Ok(object::elf::SHT_RELR),
+        "SHT_GNU_HASH" => Ok(object::elf::SHT_GNU_HASH),
+        "SHT_GNU_VERDEF" => Ok(object::elf::SHT_GNU_VERDEF),
+        "SHT_GNU_VERNEED" => Ok(object::elf::SHT_GNU_VERNEED),
+        "SHT_GNU_VERSYM" => Ok(object::elf::SHT_GNU_VERSYM),
+        "SHT_GNU_SFRAME" => Ok(object::elf::SHT_GNU_SFRAME),
+        "SHT_RISCV_ATTRIBUTES" => Ok(object::elf::SHT_RISCV_ATTRIBUTES),
+        "SHT_X86_64_UNWIND" => Ok(object::elf::SHT_X86_64_UNWIND),
+        _ => {
+            if let Some(hex) = section_type.strip_prefix("0x") {
+                Ok(u32::from_str_radix(hex, 16)?)
+            } else {
+                Ok(section_type.parse()?)
+            }
+        }
+    }
+}
+
 fn parse_named_bytes_directive(directive: &str, arg: &str) -> Result<(String, Vec<u8>)> {
     let (name, hex_str) = arg
         .split_once('=')
@@ -1804,6 +1878,26 @@ fn process_directive(
                     expected_bytes,
                 });
         }
+        "ExpectSectionType" => {
+            config
+                .assertions
+                .expected_section_types
+                .push(parse_section_type_directive(
+                    "ExpectSectionType",
+                    arg.trim(),
+                    false,
+                )?)
+        }
+        "ExpectSectionTypeWild" => {
+            config
+                .assertions
+                .expected_section_types
+                .push(parse_section_type_directive(
+                    "ExpectSectionTypeWild",
+                    arg.trim(),
+                    true,
+                )?)
+        }
         "ExpectMachOBuildVersion" => {
             config.assertions.expected_macho_build_version =
                 Some(ExpectedMachOBuildVersion::parse(arg.trim())?);
@@ -1827,6 +1921,9 @@ fn process_directive(
                     .with_context(|| format!("Invalid alignment: {alignment_str}"))?
             };
             config.assertions.expected_load_alignment = Some(alignment);
+        }
+        "NoEmptyLoadSegment" => {
+            config.assertions.no_empty_load_segments = parse_bool(arg, "NoEmptyLoadSegment")?;
         }
         "ExpectProgramHeader" => {
             let header_type: ProgramHeaderType = arg
@@ -5235,7 +5332,9 @@ impl Assertions {
                 self.verify_dynamic_entries(&elf_obj)?;
                 self.verify_symbols_absent(&self.no_sym, elf_obj.dynamic_symbols(), "dynsym")?;
                 self.verify_symbols_absent(&self.no_dynsym, elf_obj.dynamic_symbols(), "dynsym")?;
+                self.verify_no_empty_load_segments(&elf_obj)?;
                 self.verify_program_headers(&elf_obj)?;
+                self.verify_section_types(&elf_obj, linker_used)?;
             }
             object::File::MachO64(macho_obj) => {
                 self.verify_macho_build_version(&macho_obj)?;
@@ -5248,6 +5347,9 @@ impl Assertions {
                 if self.expected_load_alignment.is_some() {
                     bail!("ExpectLoadAlignment is not supported for MachO",);
                 }
+                if self.no_empty_load_segments {
+                    bail!("NoEmptyLoadSegment is not supported for MachO",);
+                }
                 if !self.expected_dynamic_entries.is_empty() {
                     bail!("ExpectDynamic is not supported for MachO",);
                 }
@@ -5259,6 +5361,9 @@ impl Assertions {
                 }
                 if !self.absent_program_headers.is_empty() {
                     bail!("NoProgramHeader is not supported for MachO");
+                }
+                if !self.expected_section_types.is_empty() {
+                    bail!("ExpectSectionType is not supported for MachO");
                 }
             }
             _ => bail!("Unsupported object file format"),
@@ -5319,6 +5424,37 @@ impl Assertions {
                 expected.section_name,
                 expected.expected_bytes,
                 data,
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_section_types<'data>(
+        &self,
+        obj: &object::read::elf::ElfFile64<'data, object::Endianness>,
+        linker_used: &Linker,
+    ) -> Result {
+        if self.expected_section_types.is_empty() {
+            return Ok(());
+        }
+
+        let endian = obj.endian();
+        for expected in &self.expected_section_types {
+            if expected.wild_only && !linker_used.is_wild() {
+                continue;
+            }
+
+            let section = obj
+                .section_by_name(&expected.section_name)
+                .with_context(|| format!("Section `{}` not found", expected.section_name))?;
+            let actual = section.elf_section_header().sh_type(endian);
+            ensure!(
+                actual == expected.section_type,
+                "Section `{}` type mismatch: expected {} ({:#x}), got {:#x}",
+                expected.section_name,
+                expected.section_type_name,
+                expected.section_type,
+                actual,
             );
         }
         Ok(())
@@ -5434,6 +5570,27 @@ impl Assertions {
         }
 
         bail!("No LOAD segment found");
+    }
+
+    fn verify_no_empty_load_segments<'data>(
+        &self,
+        obj: &object::read::elf::ElfFile64<'data, object::Endianness>,
+    ) -> Result {
+        if !self.no_empty_load_segments {
+            return Ok(());
+        }
+
+        let endian = obj.endian();
+        for segment in obj.elf_program_headers() {
+            if segment.p_type(endian) == object::elf::PT_LOAD
+                && segment.p_filesz(endian) == 0
+                && segment.p_memsz(endian) == 0
+            {
+                bail!("Found empty PT_LOAD segment");
+            }
+        }
+
+        Ok(())
     }
 
     fn verify_symbols_absent<'a, I>(
