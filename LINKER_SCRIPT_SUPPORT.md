@@ -19,9 +19,9 @@ end lists the features required to link the Linux kernel.
 | `SECTIONS { ... }` | ✅ | |
 | `ENTRY(symbol)` | ✅ | |
 | `VERSION { ... }` | ✅ | |
-| `PROVIDE(sym = expr)` | ✅ | |
-| `PROVIDE_HIDDEN(sym = expr)` | ✅ | |
-| `ASSERT(expr, "msg")` | ✅ | |
+| `PROVIDE(sym = expr)` | 🧪 | Top-level values currently support absolute numeric values and simple symbol expressions with optional `+`/`-` numeric offsets |
+| `PROVIDE_HIDDEN(sym = expr)` | 🧪 | Same expression limits as top-level `PROVIDE(...)` |
+| `ASSERT(expr, "msg")` | 🧪 | Assertions are evaluated after layout, but symbol references and full location-counter semantics are not yet implemented |
 | `MEMORY { ... }` | 🧪 | Region parsing supported; attribute flags and `>region` placement not yet implemented |
 | `REGION_ALIAS(alias, region)` | ❌ | |
 | `SEARCH_DIR(path)` | ❌ | |
@@ -29,7 +29,7 @@ end lists the features required to link the Linux kernel.
 | `TARGET(bfdname)` | ❌ | |
 | `NOCROSSREFS(sections...)` | ❌ | |
 | `INSERT [AFTER\|BEFORE] section` | ❌ | |
-| Top-level symbol assignment (`sym = expr`) | ✅ | |
+| Top-level symbol assignment (`sym = expr`) | 🧪 | Supports numeric values, symbol redirects with optional `+`/`-` numeric offsets, and `SEGMENT_START(...)`; arbitrary expressions are not yet supported |
 | Compound assignment operators (`+=`, `-=`, etc.) | ❌ | |
 
 ## SECTIONS Block
@@ -40,13 +40,13 @@ end lists the features required to link the Linux kernel.
 | Input section matchers (`*(pattern)`, `file(pattern)`) | ✅ | |
 | Glob patterns in section and file names | ✅ | |
 | `KEEP(...)` to prevent garbage collection | ✅ | |
-| `PROVIDE(sym = expr)` inside sections | ✅ | |
-| `PROVIDE_HIDDEN(sym = expr)` inside sections | ✅ | |
-| Symbol assignment inside sections (`sym = .`) | 🧪 | Only assignment of the location counter (`sym = .`) is supported; arbitrary expressions on the right-hand side are not |
+| `PROVIDE(sym = expr)` inside sections | 🧪 | The symbol is placed at the current section boundary; the right-hand-side expression is not yet evaluated |
+| `PROVIDE_HIDDEN(sym = expr)` inside sections | 🧪 | Same placement behavior as section-local `PROVIDE(...)`, with hidden visibility |
+| Symbol assignment inside sections (`sym = expr`) | 🧪 | Supports `sym = .` plus `SEGMENT_START(...)`; other right-hand-side expressions are not yet honored |
 | Location counter assignment (`. = expr`) | 🧪 | Hex address literals (e.g. `. = 0x1000`) supported between output sections only; not inside section contents |
 | `ALIGN(n)` on the location counter (`. = ALIGN(n)`) | ✅ | |
 | Per-section `ALIGN(n)` specifier | ✅ | |
-| `ASSERT(expr, "msg")` inside `SECTIONS` | ✅ | |
+| `ASSERT(expr, "msg")` inside `SECTIONS` | 🧪 | Same evaluator limits as top-level `ASSERT(...)` |
 | `OVERLAY { ... }` | ❌ | |
 | Output section type specifiers (`(NOLOAD)`, `(COPY)`, etc.) | 📅 | |
 | `FILL(value)` and `=fillexp` | 📅 | |
@@ -69,13 +69,13 @@ end lists the features required to link the Linux kernel.
 | Unary operators: `-`, `!`, `~` | ✅ | |
 | Numeric literals: decimal and hexadecimal | ✅ | |
 | Numeric literal K/M suffixes (e.g. `64K`, `2M`) | ✅ | |
-| Symbol references and location counter (`.`) | ✅ | |
+| Symbol references and location counter (`.`) | 🧪 | Parsed generally, but assertion evaluation skips symbol references and treats `.` as `0` |
 | Parenthesised sub-expressions | ✅ | |
 | `SIZEOF(section)` | ✅ | |
 | `ALIGNOF(section)` | ✅ | |
 | `ADDR(section)` | ✅ | |
 | `LOADADDR(section)` | 🧪 | Implemented as alias for `ADDR` (returns VMA); full LMA requires `AT(addr)` support |
-| `ALIGN(expr)` | ✅ | |
+| `ALIGN(expr)` | 🧪 | Standalone evaluation is supported; assertion evaluation does not yet model a non-zero current location counter |
 | `LENGTH(region)` | ✅ | |
 | `ORIGIN(region)` | ✅ | |
 | `MIN(a, b)` | ✅ | |
@@ -83,7 +83,7 @@ end lists the features required to link the Linux kernel.
 | Ternary operator (`condition ? a : b`) | 📅 | |
 | `DEFINED(sym)` | 📅 | |
 | `SIZEOF_HEADERS` | 📅 | |
-| `SEGMENT_START(segment, default)` | ✅ | Supports `"text"`, `"data"`, `"bss"`, `"rodata"`; returns `-Ttext`/`-Tdata`/`-Tbss` override if provided, otherwise `default`; unknown segment names always return `default` |
+| `SEGMENT_START(segment, default)` | ✅ | Supports `"text"`, `"data"`, `"bss"`, `"rodata"`; `"text"`, `"data"`, and `"bss"` use `-Ttext`/`-Tdata`/`-Tbss` when provided, while `"rodata"` and unknown segment names return `default` |
 
 ## MEMORY Command
 
