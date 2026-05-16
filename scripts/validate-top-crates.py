@@ -33,7 +33,7 @@ from typing import Any
 
 
 CRATES_API = "https://crates.io/api/v1"
-USER_AGENT = "sld-top-crates-validation (https://github.com/wild-linker/wild)"
+USER_AGENT = "sld-top-crates-validation"
 
 
 @dataclasses.dataclass(frozen=True)

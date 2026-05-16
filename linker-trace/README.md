@@ -1,5 +1,4 @@
 # linker-trace
 
-This crate provides data structures for storing trace information from the [sld
-linker](https://github.com/wild-linker/wild). This trace information can then be consumed by
-linker-diff.
+This crate provides data structures for storing trace information from the sld linker. This trace
+information can then be consumed by linker-diff.
