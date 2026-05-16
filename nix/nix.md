@@ -1,10 +1,9 @@
 # Nix
 
-Sld includes a Nix flake, an overlay, and a derivation for building Sld.
-this allows users to use the latest git revision of Sld without having to
-wait for a release to be packaged in Nixpkgs.
+sld includes a Nix flake, an overlay, and a derivation for building sld from
+this repository.
 
-There are two ways of using an unstable Sld, one is with Nix Flakes. Note that
+There are two ways of using an unstable sld, one is with Nix Flakes. Note that
 until NixOS 25.11 is branched, unstable Nixpkgs is required.
 
 ```nix
@@ -13,13 +12,13 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
     # Have Nixpkgs
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    # Include Sld
+    # Include sld
     sld = {
       url = "github:wild-linker/wild";
-      # If using the Sld Flake (not required)
+      # If using the sld Flake (not required)
       # inputs.nixpkgs.follows = "nixpkgs";
       #
-      # If not using the Sld flake, and just using the overlay
+      # If not using the sld flake, and just using the overlay
       flake = false;
     };
   };
@@ -32,7 +31,7 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
     }:
     let
       # Create an instance of Nixpkgs targeting x64 Linux with the
-      # Sld overlay applied
+      # sld overlay applied
       pkgs = import nixpkgs {
         system = "x86_64-linux";
         overlays = [
@@ -40,18 +39,18 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
         ];
       };
 
-      # Create a stdenv that uses the Sld linker
+      # Create a stdenv that uses the sld linker
       sldStdenv = pkgs.useWildLinker pkgs.stdenv;
     in
     {
-      # Add an output of some very cool package that is linked with the Sld linker
+      # Add an output of some very cool package that is linked with the sld linker
       #
       # Note that if a Rust package is being linked with `buildRustPackage`, you will
       # need to create a `rustPlatform` using `makeRustPlatform` with this stdenv. See
       # below how to do that.
       packages.x86_64-linux.default = pkgs.callPackage ./package.nix { stdenv = sldStdenv; };
 
-      # A devShell for the very cool package that uses Sld.
+      # A devShell for the very cool package that uses sld.
       #
       # It also has rust-analyzer in its environment
       devShell.x86_64-linux.default = pkgs.mkShell.override { stdenv = sldStdenv; } {
@@ -88,7 +87,7 @@ setup is required. This applies to Flake-based packages, or other solutions.
 ```nix
 let
   # First steps are the same as above. Create a Nixpkgs instance
-  # with Sld.
+  # with sld.
   pkgs = import nixpkgs {
     system = "x86_64-linux";
     overlays = [
@@ -96,13 +95,13 @@ let
     ];
   };
 
-  # Create a stdenv that uses Sld as its linker
+  # Create a stdenv that uses sld as its linker
   sldStdenv = pkgs.useWildLinker pkgs.stdenv;
 
   # Next a custom rustPlatform is required.
   #
   # This uses Nixpkgs rustc and cargo, but uses
-  # the stdenv that has Sld.
+  # the stdenv that has sld.
   sldRustPlatform = pkgs.makeRustPlatform {
     inherit (pkgs) rustc cargo;
     stdenv = sldStdenv;

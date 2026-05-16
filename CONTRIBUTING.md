@@ -6,7 +6,7 @@ you're trying to do easier.
 
 ## LLM / AI use policy
 
-It's OK to use an LLM or AI to help with your work on the Sld linker. However, there must be a
+It's OK to use an LLM or AI to help with your work on the sld linker. However, there must be a
 human in the loop. We want to communicate with you, not a bot. Please do not use an AI agent to
 communicate with us and don't just copy and paste AI-written responses to review comments. If your
 English isn't good, it's fine to use automatic translation, however please let us know that you're
@@ -70,7 +70,7 @@ then use `cargo test` as usual.
 
 ## Running tests for other architectures on x86_64
 
-Sld supports testing on non-native architectures using QEMU.
+sld supports testing on non-native architectures using QEMU.
 
 ### Setup
 
@@ -140,7 +140,7 @@ Currently, the behavior for the following test options can be configured using t
 - `run_all_diffs`: Enables diffing the output of sld against that of the existing linkers.
   By default, diffs are skipped. Set to `true` to enable.
 
-A sample configuration file is provided as `test-config.toml.sample`. By default, Sld uses
+A sample configuration file is provided as `test-config.toml.sample`. By default, sld uses
 `test-config.toml` as the configuration file. If you have written your configuration in a different
 file, specify its location using the `SLD_TEST_CONFIG` environment variable as follows:
 
@@ -164,7 +164,7 @@ When working on tests, you can temporarily disable the formatting check by setti
 
 ## Running external tests
 
-Sld can run some external test suites. Currently only the test suite of mold is supported.
+sld can run some external test suites. Currently only the test suite of mold is supported.
 
 You can run the mold tests as follows:
 
@@ -287,7 +287,7 @@ inconsistent internal state (a bug), returns an error rather than panicking. The
 not to avoid the panic per se, but rather because by returning an error, we can attach more
 contextual information to the error to help diagnose the problem. For example, we can add
 information about what symbol we were processing and which input file we were looking at. This is
-usually more useful for us than a stack trace showing where it was in the code. Also, since Sld is
+usually more useful for us than a stack trace showing where it was in the code. Also, since sld is
 very multi-threaded, if there's a bug that causes all the threads to panic, the output can get
 pretty messed up.
 
@@ -332,7 +332,7 @@ linkers need to do.
     their name, common symbols aren't commonly used. They are however used in libc, so are necessary
     if you want to be able to link pretty much anything.
   * Everything else with the [linker tag](https://maskray.me/blog/tags/linker/)
-* For Sld specific content, there's [David Lattimore's](https://davidlattimore.github.io/) blog.
+* For sld specific content, there's [David Lattimore's](https://davidlattimore.github.io/) blog.
 * There are also various specification documents. These may not be the best to read start-to-finish,
   but can be good when you need some specific details on something.
   * [ELF-64 Object File Format](https://uclibc.org/docs/elf-64-gen.pdf)

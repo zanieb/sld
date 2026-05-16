@@ -2705,7 +2705,7 @@ impl PersistedState {
             None
         };
         if version == STATE_VERSION && sld_version.is_none() {
-            return Err(crate::error!("Missing Sld version in incremental state"));
+            return Err(crate::error!("Missing sld version in incremental state"));
         }
         let link_start = if lines
             .peek()
@@ -4144,7 +4144,7 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
     let object::SectionFlags::Elf { sh_flags } = flags else {
         return false;
     };
-    // Sections that Sld actually merges are written by the merge-strings path, so they don't
+    // Sections that sld actually merges are written by the merge-strings path, so they don't
     // produce direct-copy patch records. Merge-flagged sections that reach this point were copied
     // directly, for example under --no-string-merge.
     sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
@@ -12942,7 +12942,7 @@ mod tests {
 
         let error = PersistedState::parse(&rendered).unwrap_err();
 
-        assert!(error.to_string().contains("Missing Sld version"));
+        assert!(error.to_string().contains("Missing sld version"));
     }
 
     #[test]

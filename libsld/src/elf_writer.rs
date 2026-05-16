@@ -397,7 +397,7 @@ fn write_program_headers(
             .p_type
             .set(e, segment_details.segment_type.raw());
 
-        // Support executable stack (Sld defaults to non-executable stack)
+        // Support executable stack (sld defaults to non-executable stack)
         let mut segment_flags = segment_details.segment_flags;
         if layout.program_segments.is_stack_segment(segment_id) && layout.args().execstack {
             segment_flags |= pf::EXECUTABLE;

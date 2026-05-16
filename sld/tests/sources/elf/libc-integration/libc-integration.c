@@ -115,7 +115,7 @@
 //#CompSoArgs:-g -fPIC
 //#LinkerDriver:gcc
 //#LinkArgs:-pie -dynamic -Wl,--strip-debug -Wl,--gc-sections -Wl,-z,now,-z,pack-relative-relocs
-// Sld is the only linker that adds GLIBC_ABI_DT_RELR dynamic symbol
+// sld is the only linker that adds GLIBC_ABI_DT_RELR dynamic symbol
 // dependency.
 //#SkipLinker:ld
 //#Contains:GLIBC_ABI_DT_RELR

@@ -2,7 +2,7 @@
 //! we'll link again using the linker specified in the environment variable. The output from the
 //! reference linker will be the same, but with '.ref-linker' appended. We'll then diff the two
 //! outputs and report any unexpected differences found. Setting the environment variable will also
-//! enable writing of trace and layout files by the Sld linker, which allow additional information
+//! enable writing of trace and layout files by the sld linker, which allow additional information
 //! to be added to the diff outputs.
 //!
 //! For this to work, the linker-diff binary needs to be installed in the same directory as sld.

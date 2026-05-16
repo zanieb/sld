@@ -7,8 +7,8 @@ processor with 92GiB of RAM. The output file is always on tmpfs.
 For benchmarks run on David's 2020 era laptop which were used in benchmark reports prior to 2026,
 see [lemp9.md](lemp9.md).
 
-The benchmarks include several other linkers for Linux as well as several recent versions of Sld.
-This allows us to both compare between linkers and to see how Sld's performance is changing over
+The benchmarks include several other linkers for Linux as well as several recent versions of sld.
+This allows us to both compare between linkers and to see how sld's performance is changing over
 time.
 
 We only include GNU ld (BFD) in a few of the benchmarks since it's generally a lot slower than the
@@ -30,7 +30,7 @@ and a pretty large binary.
 
 ### chrome-crel - time
 
-CREL relocations are a new format for relocations that is significantly more compact. Sld has
+CREL relocations are a new format for relocations that is significantly more compact. sld has
 supported these for a couple of releases, however we hadn't benchmarked non-trivial programs with
 CREL relocations until just prior to the 0.8.0 release. It turned out that we had a bug that caused
 memory usage to blow up, making it impractical to link non-trivial programs. This is now fixed, so
@@ -94,13 +94,13 @@ link.
 
 ### sld - time
 
-Sld linking itself.
+sld linking itself.
 
 ![Benchmark of linking sld](images/ryzen-9955hx/sld-time.svg)
 
 ### sld-riscv - time
 
-Sld linking a risc-v version of itself. We're still doing the linking on x86_64, but the binary
+sld linking a risc-v version of itself. We're still doing the linking on x86_64, but the binary
 being produced is for risc-v.
 
 ![Benchmark of linking sld-riscv](images/ryzen-9955hx/sld-riscv-time.svg)

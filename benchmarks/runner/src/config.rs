@@ -32,7 +32,7 @@ pub(crate) struct BenchConfig {
     /// Paths relative to the save-dir to mutate before each timed run.
     #[serde(default)]
     pub(crate) mutate_files: Vec<Mutation>,
-    /// Strings that must appear in Sld's incremental log after each timed Sld run.
+    /// Strings that must appear in sld's incremental log after each timed sld run.
     #[serde(default)]
     pub(crate) expect_sld_log: Vec<String>,
     /// Whether every timed run must produce output bytes that differ from the warmup output.

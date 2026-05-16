@@ -1,6 +1,6 @@
 # Project Governance
 
-This document describes how the Sld project is governed.
+This document describes how the sld project is governed.
 
 ## Roles
 
@@ -13,7 +13,7 @@ This document describes how the Sld project is governed.
 
 ### Contributors
 
-People who contribute to Sld can be added to the GitHub org. This can be done when an individual
+People who contribute to sld can be added to the GitHub org. This can be done when an individual
 requests to be added. They should have already made a few contributions. We may periodically remove
 people who haven't contributed in more than a year.
 
@@ -54,7 +54,7 @@ reach consensus on issues, however the actual decision / voting still happens vi
 
 ### Zulip
 
-The Sld project has a [Zulip instance](http://wild.zulipchat.com/) where discussions can also take
+The sld project has a [Zulip instance](http://wild.zulipchat.com/) where discussions can also take
 place.
 
 ## Releasing
@@ -93,11 +93,11 @@ have a specific lead.
 
 ## Wind down process
 
-In the event that the Sld project ends, any assets held by the project are to be transferred to the
+In the event that the sld project ends, any assets held by the project are to be transferred to the
 Rust Foundation.
 
 ## Code of Conduct
 
-The Sld project adheres to the [Rust code of
+The sld project adheres to the [Rust code of
 conduct](https://rust-lang.org/policies/code-of-conduct/). If you have any moderation concerns or
 queries, please email [wild-mod@googlegroups.com](mailto:wild-mod@googlegroups.com).

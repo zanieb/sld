@@ -14,7 +14,7 @@
 //#ExpectSym:defsym_hex address=0x1244
 //#DiffIgnore:section.riscv.attributes
 //#DiffIgnore:segment.RISCV_ATTRIBUTES.*
-// GNU ld emits `.riscv.attributes`, but Sld does not
+// GNU ld emits `.riscv.attributes`, but sld does not
 //#DiffIgnore:riscv_attributes.*
 
 static int foo1 __attribute__((used, section(".data.foo"))) = 0x01;

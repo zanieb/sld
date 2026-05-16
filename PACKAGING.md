@@ -1,10 +1,10 @@
-# Recommendations for Packaging Sld linker
+# Recommendations for Packaging sld linker
 
 ## Binaries
 
-This repository consists of Sld linker and linker-diff binaries. We recommend providing the `sld`
+This repository consists of sld linker and linker-diff binaries. We recommend providing the `sld`
 binary and symlink `ld.sld` pointing to it, as this enables `-fuse-ld=sld` usage with Clang.
-Linker-diff is mainly a tool to aid Sld development, so you most likely don't want to package it.
+Linker-diff is mainly a tool to aid sld development, so you most likely don't want to package it.
 
 ## Building
 
@@ -14,12 +14,12 @@ for the explanation.
 
 ### Optional features
 
-Sld has two optional build-time features:
+sld has two optional build-time features:
 
 - `fork` (enabled by default) – an optimisation of process clean-up phase using `fork()`. Can be
   disabled in the runtime via `--no-fork` flag.
 - `mimalloc` (disabled by default) – build and use Mimalloc as the allocator instead of the system
-  one. It performs marginally worse than Glibc in Sld's case, but much better than Musl.
+  one. It performs marginally worse than Glibc in sld's case, but much better than Musl.
 
 ## Testing
 
@@ -30,12 +30,12 @@ used if absent) and `SLD_TEST_IGNORE_FORMAT`.
 To tweak the configuration, you can copy `test-config.toml.example` to `test-config.toml` and edit
 it to your liking. You can learn more about the options
 at [Configuration file for tests](./CONTRIBUTING.md#configuration-file-for-tests). Just be careful
-with `run_all_diffs` option, it's meant mostly for Sld development and may cause false positives.
+with `run_all_diffs` option, it's meant mostly for sld development and may cause false positives.
 
 Setting `SLD_TEST_IGNORE_FORMAT` disables format checks of C/C++ source files in tests which you
 might prefer because your `clang-format` may give different results.
 
 ## Issues
 
-If you, or the users of your package, encounter any issues or pain points with Sld, don't hesitate
+If you, or the users of your package, encounter any issues or pain points with sld, don't hesitate
 to report them to us or reach out for help.

@@ -13,7 +13,7 @@
   stdenv,
 }:
 assert lib.assertMsg (lib.versionAtLeast rustc.version "1.94.0")
-  "Sld requires at least Rust 1.94.0, this instance of nixpkgs has Rust ${rustc.version}";
+  "sld requires at least Rust 1.94.0, this instance of nixpkgs has Rust ${rustc.version}";
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
@@ -79,7 +79,7 @@ craneLib.buildPackage (
       stdenv.cc.cc.lib
     ];
 
-    # Do the install check instead just as a smoke-tests that Sld
+    # Do the install check instead just as a smoke-tests that sld
     # built correctly.
     doInstallCheck = true;
     nativeInstallCheckInputs = [ versionCheckHook ];

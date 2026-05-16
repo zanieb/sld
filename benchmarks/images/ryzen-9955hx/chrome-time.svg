@@ -31,17 +31,17 @@ font-size="16" fill="#FFFFFF" transform="rotate(270, 5, 288)">ms</text>
 <text x="355" y="580" fill="#FFFFFF" text-anchor="middle">+120%</text>
 <rect fill="#00FF00" opacity="0.8" x="457" y="394" width="136" height="66" />
 <line stroke="#FFFFFF" x1="525" y1="394" x2="525" y2="394" />
-<text x="525" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
+<text x="525" y="484" fill="#FFFFFF" text-anchor="middle">sld</text>
 <text x="525" y="502" fill="#FFFFFF" text-anchor="middle">0.6.0</text>
 <text x="525" y="580" fill="#FFFFFF" text-anchor="middle">+17%</text>
 <rect fill="#00FF00" opacity="0.8" x="627" y="395" width="136" height="65" />
 <line stroke="#FFFFFF" x1="695" y1="395" x2="695" y2="395" />
-<text x="695" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
+<text x="695" y="484" fill="#FFFFFF" text-anchor="middle">sld</text>
 <text x="695" y="502" fill="#FFFFFF" text-anchor="middle">0.7.0</text>
 <text x="695" y="580" fill="#FFFFFF" text-anchor="middle">+15%</text>
 <rect fill="#00FF00" opacity="0.8" x="797" y="404" width="136" height="56" />
 <line stroke="#FFFFFF" x1="865" y1="404" x2="865" y2="404" />
-<text x="865" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
+<text x="865" y="484" fill="#FFFFFF" text-anchor="middle">sld</text>
 <text x="865" y="502" fill="#FFFFFF" text-anchor="middle">0.8.0</text>
 <text x="865" y="580" fill="#FFFFFF" text-anchor="middle">+0%</text>
 </svg>

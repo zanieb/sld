@@ -8,7 +8,7 @@
 //#RunEnabled:false
 // We're linking different .so files, so this is expected.
 //#DiffIgnore:.dynamic.DT_NEEDED
-// TODO: Sld probably should set dynamic linker here
+// TODO: sld probably should set dynamic linker here
 //#EnableLinker:lld
 //#RunEnabled:false
 

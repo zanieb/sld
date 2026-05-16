@@ -1,13 +1,13 @@
-# Benchmarking Sld
+# Benchmarking sld
 
 ## Benchmarking against other linkers
 
-If you decide to benchmark Sld against other linkers, in order to make it a fair comparison, you
-should ensure that the other linkers aren't doing work on something that Sld doesn't support. In
+If you decide to benchmark sld against other linkers, in order to make it a fair comparison, you
+should ensure that the other linkers aren't doing work on something that sld doesn't support. In
 particular:
 
-* Sld defaults to `--gc-sections`, so for a fair comparison, that should be passed to all the linkers.
-* Sld defaults to `-z now`, so best to pass that to all linkers.
+* sld defaults to `--gc-sections`, so for a fair comparison, that should be passed to all the linkers.
+* sld defaults to `-z now`, so best to pass that to all linkers.
 
 ## How to benchmark
 
@@ -15,7 +15,7 @@ particular:
 
 For benchmarking the linker, it's preferable to run just the linker, not the whole build process.
 
-The way to do that is by capturing the linker invocation so that it can be rerun. Sld has a
+The way to do that is by capturing the linker invocation so that it can be rerun. sld has a
 built-in way to do that.
 
 You can benchmark linking of either a debug or a release build of a crate, this depends on what
@@ -56,9 +56,9 @@ amounts of extra work.
 
 ### Benchmarking incremental mode
 
-The benchmark runner can pass extra flags for specific benchmark entries. To measure Sld's
+The benchmark runner can pass extra flags for specific benchmark entries. To measure sld's
 incremental no-change path for an existing save-dir, add another benchmark entry that points at the
-same save-dir and passes `--incremental` only to Sld:
+same save-dir and passes `--incremental` only to sld:
 
 ```toml
 [bench.ripgrep-incremental]
@@ -124,12 +124,12 @@ expect_output_change = true
 
 The checked-in `benchmarks/incremental-linux.toml` file uses that automatic input discovery for
 `ruff`, `ty`, and `uv`, and leaves `bfd`, `lld`, and `mold` enabled so the same changed-input run can
-show Sld incremental speedup against the default linker and mold. When `report --print-stats` sees
-paired full and incremental benchmarks, it also prints the incremental speedup over the full Sld
+show sld incremental speedup against the default linker and mold. When `report --print-stats` sees
+paired full and incremental benchmarks, it also prints the incremental speedup over the full sld
 link for the same project.
 
 The checked-in incremental Linux benchmarks pass `--no-fork` to linkers that support it. This keeps
-Sld and mold timings on the actual linker process and prevents incremental timed runs from racing
+sld and mold timings on the actual linker process and prevents incremental timed runs from racing
 with a still-running forked child that is writing incremental state.
 
 Those same benchmarks pin explicit changed-input object sections. The automatic section selector is
@@ -137,7 +137,7 @@ useful for ad-hoc experiments, but large Rust debug links can contain early obje
 patch metadata that should fall back instead of patching.
 
 `expect_sld_log` is optional, but useful when benchmarking incremental mode: after the warmup
-that seeds incremental state, it fails timed Sld runs whose incremental log doesn't contain the
+that seeds incremental state, it fails timed sld runs whose incremental log doesn't contain the
 expected fast-path message, so you don't accidentally measure a full fallback relink.
 
 ### Run benchmark with hyperfine
@@ -229,8 +229,8 @@ poop '/tmp/sld/ripgrep/6/run-with sld' '/tmp/sld/ripgrep/6/run-with mold' '/tmp/
 
 Using this method, you can benchmark:
 
-* between Sld and one or more other linkers
-* between different options passed to Sld - You can pass arbitrary additional arguments to run-with.
+* between sld and one or more other linkers
+* between different options passed to sld - You can pass arbitrary additional arguments to run-with.
   The first argument needs to be the name of the linker to use. All additional arguments are passed through to the
   linker as-is
 

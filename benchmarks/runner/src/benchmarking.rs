@@ -687,11 +687,11 @@ fn should_verify_sld_incremental_log(bin: &Bin, bench: &Benchmark, check_sld_log
 fn verify_sld_incremental_log(output_path: &Path, expected: &[String]) -> Result {
     let path = incremental_log_path(output_path);
     let log = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read Sld incremental log `{}`", path.display()))?;
+        .with_context(|| format!("Failed to read sld incremental log `{}`", path.display()))?;
     for expected in expected {
         if !log.contains(expected) {
             bail!(
-                "Sld incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
+                "sld incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
                 path.display()
             );
         }
@@ -767,7 +767,7 @@ fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> 
     Ok(benchmarks)
 }
 
-/// Filter benchmarks to just those that have at least one supported Sld version.
+/// Filter benchmarks to just those that have at least one supported sld version.
 fn filter_benchmarks_by_sld_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -> Vec<Benchmark> {
     let Some(maximum_sld_version) = bins
         .iter()

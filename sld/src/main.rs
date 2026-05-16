@@ -12,7 +12,7 @@ fn main() {
     }
 }
 
-/// The current Sld version as written by build.rs.
+/// The current sld version as written by build.rs.
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
 
 fn run() -> libsld::error::Result {

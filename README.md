@@ -1,11 +1,11 @@
-# Sld linker
+# sld linker
 
-Sld is a linker with the goal of being very fast for iterative development.
+sld is a linker with the goal of being very fast for iterative development.
 
 The plan is to eventually make it fully incremental. Initial incremental support can reuse an
 existing output for unchanged relinks, update rewritten inputs whose contents are unchanged, and
 patch some same-layout changed object files in place. It still conservatively falls back to a full
-relink when arguments change or when an input change is outside the currently patchable subset. Sld
+relink when arguments change or when an input change is outside the currently patchable subset. sld
 is already pretty fast even without fully general fine-grained incremental updates.
 
 ## Installation
@@ -46,20 +46,11 @@ cargo install --locked --bin sld --git https://github.com/wild-linker/wild.git s
 
 ### Nix
 
-To use a stable Sld from Nixpkgs:
-
-```nix
-let
- sldStdenv = pkgs.useWildLinker pkgs.stdenv;
-in
-pkgs.callPackage ./package { stdenv = sldStdenv; }
-```
-
-to use the latest unstable git revision of sld, see [the nix documentation](./nix/nix.md)
+For flake, overlay, and derivation usage, see [the nix documentation](./nix/nix.md).
 
 ## Using as your default linker
 
-If you'd like to use Sld as your default linker for building Rust code, you can put the following
+If you'd like to use sld as your default linker for building Rust code, you can put the following
 in `~/.cargo/config.toml`.
 
 On Linux:
@@ -107,14 +98,14 @@ On Illumos:
 linker = "/usr/bin/clang"
 
 rustflags = [
-    # Will silently delegate to GNU ld or Sun ld unless the absolute path to Sld is provided.
+    # Will silently delegate to GNU ld or Sun ld unless the absolute path to sld is provided.
     "-Clink-arg=-fuse-ld=/absolute/path/to/sld"
 ]
 ```
 
 ## Using sld in CI
 
-If you'd like to use Sld as your linker for Rust code in CI, see
+If you'd like to use sld as your linker for Rust code in CI, see
 [wild-action](https://github.com/wild-linker/action).
 
 ## Q&A
@@ -122,8 +113,8 @@ If you'd like to use Sld as your linker for Rust code in CI, see
 ### Why another linker?
 
 Mold is already very fast, however it doesn't do incremental linking and the author has stated that
-they don't intend to. Sld has initial incremental support, and fine-grained incremental updates are
-the end-goal. By writing Sld in Rust, it's hoped that the complexity of incremental linking will be
+they don't intend to. sld has initial incremental support, and fine-grained incremental updates are
+the end-goal. By writing sld in Rust, it's hoped that the complexity of incremental linking will be
 achievable.
 
 ### What's working?
@@ -141,8 +132,8 @@ The following is working with the caveat that there may be bugs:
 * Output to statically linked, position-independent binaries (static-PIE)
 * Output to dynamically linked binaries
 * Output to shared objects (.so files)
-* Rust proc-macros, when linked with Sld work
-* Most of the top downloaded crates on crates.io have been tested with Sld and pass their tests
+* Rust proc-macros, when linked with sld work
+* Most of the top downloaded crates on crates.io have been tested with sld and pass their tests
 * Debug info
 * GNU jobserver support
 * Partial linker script support. See the [linker script support matrix](LINKER_SCRIPT_SUPPORT.md) for details.
@@ -157,7 +148,7 @@ Here are some of the larger things that aren't yet done, roughly sorted by curre
 * Windows support
 * Linker plugin LTO (initial support is behind `--features=plugins`).
 
-### How can I verify that Sld was used to link a binary?
+### How can I verify that sld was used to link a binary?
 
 Install `readelf` (available from binutils package), then run:
 
@@ -168,7 +159,7 @@ readelf --string-dump .comment my-executable
 Look for a line like:
 
 ```
-Linker: Sld version 0.1.0
+Linker: sld version 0.1.0
 ```
 
 You can probably also get away with `strings` (also available from binutils package):
@@ -184,7 +175,7 @@ and "mold". The new name keeps that convention while staying short and direct.
 
 ## Benchmarks
 
-The goal of Sld is to eventually be very fast via fine-grained incremental linking. However, we
+The goal of sld is to eventually be very fast via fine-grained incremental linking. However, we
 also want to be as fast as we can be for non-incremental linking and for the initial link when
 incremental linking is enabled.
 
@@ -214,8 +205,8 @@ benchmark shows the time to link it.
 
 ![Benchmark of linking librustc-driver](benchmarks/images/ryzen-9955hx/librustc-driver-time.svg)
 
-For something much smaller, this is the time to link Sld itself. This also shows a few different
-Sld versions, so you can see how the link time has been tracking over releases.
+For something much smaller, this is the time to link sld itself. This also shows a few different
+sld versions, so you can see how the link time has been tracking over releases.
 
 ![Benchmark of linking sld](benchmarks/images/ryzen-9955hx/sld-time.svg)
 
@@ -227,7 +218,7 @@ Here's linking rust-analyzer on a Raspberry Pi 5.
 
 ## Linking Rust code
 
-The following is a `cargo test` command-line that can be used to build and test a crate using Sld.
+The following is a `cargo test` command-line that can be used to build and test a crate using sld.
 This has been run successfully on a few popular crates (e.g. ripgrep, serde, tokio, rand, bitflags).
 It assumes that the "sld" binary is on your path. It also depends on the Clang compiler being
 installed, since GCC doesn't allow using an arbitrary linker.
@@ -245,17 +236,17 @@ RUSTFLAGS="-Clinker=clang -Clink-args=-fuse-ld=sld" cargo test
 
 For more information on contributing to `sld` see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-For a high-level overview of Sld's design, see [DESIGN.md](DESIGN.md).
+For a high-level overview of sld's design, see [DESIGN.md](DESIGN.md).
 
 ## Chat server
 
-We have a Zulip server for Sld-related chat. You can join
+We have a Zulip server for sld-related chat. You can join
 [here](https://wild.zulipchat.com/join/bbopdeg6howwjpaiyowngyde/).
 
 ## Further reading
 
 Many of the posts on [David's blog](https://davidlattimore.github.io/) are about various aspects of
-the Sld linker.
+the sld linker.
 
 ## Sponsorship
 
@@ -265,7 +256,7 @@ time.
 
 # Code of Conduct
 
-The Sld project adheres to the [Rust code of
+The sld project adheres to the [Rust code of
 conduct](https://rust-lang.org/policies/code-of-conduct/). If you have any moderation concerns or
 queries, please email wild-mod@googlegroups.com.
 
@@ -275,5 +266,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT l
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-Sld by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+sld by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.

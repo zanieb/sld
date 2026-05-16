@@ -24,7 +24,7 @@ current code follows the same basic direction:
 3. Incremental reuse, where an existing output can be accepted before loading all inputs.
 4. Incremental changed-input patching, where the previous output is updated in place.
 
-If a fast path is unsafe or unavailable, Sld falls back to a full relink and logs the reason.
+If a fast path is unsafe or unavailable, sld falls back to a full relink and logs the reason.
 
 Typical log lines include:
 
@@ -122,7 +122,7 @@ The current implementation is aligned with the design note in the ways that matt
 - It falls back rather than pretending unsupported cases are incremental.
 
 The major gap is also clear: changed-input incrementality is not yet broad enough, or cheap enough,
-to be consistently faster than a full Sld relink across all large Rust projects.
+to be consistently faster than a full sld relink across all large Rust projects.
 
 ## Recent Implementation Notes
 

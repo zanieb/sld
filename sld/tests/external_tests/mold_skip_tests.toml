@@ -25,7 +25,7 @@ tests = [
   "omagic.sh",
   "package-metadata.sh",
   "relocatable-merge-sections.sh",
-  "repro.sh",                          # Note in this test's second half that it uses a custom environment variable called `MOLD_REPRO`. While Sld currently doesn't support `--repro`, it will eventually be moved to the "ignore" group once support is added.
+  "repro.sh",                          # Note in this test's second half that it uses a custom environment variable called `MOLD_REPRO`. While sld currently doesn't support `--repro`, it will eventually be moved to the "ignore" group once support is added.
   "require-defined.sh",
   "response-file-quoting.sh",
   "retain-symbols-file.sh",
@@ -157,8 +157,8 @@ tests = [
   "duplicate-error.sh",             # Different message formats
   "empty-input.sh",                 # Different message formats
   "gc-sections.sh",                 # Passes when `--no-gc-sections` is passed.
-  "hash-style.sh",                  # Sld doesn't support `--hash-style=none`.
-  "hidden-undef.sh",                # Sld correctly errors, but message format differs from mold's.
+  "hash-style.sh",                  # sld doesn't support `--hash-style=none`.
+  "hidden-undef.sh",                # sld correctly errors, but message format differs from mold's.
   "help.sh",
   "invalid-version-script.sh",      # Different message formats
   "linker-script-error.sh",         # Different message formats
@@ -168,7 +168,7 @@ tests = [
   "no-allow-shlib-undefined.sh",    # Different message formats
   "no-allow-shlib-undefined3.sh",   # Different message formats
   "no-allow-shlib-undefined4.sh",   # GNU ld and LLD also fail
-  "plt-symbols.sh",                 # Sld currently doesn't create entries in the symbol table with the `$plt` suffix unless `--got-plt-syms` is specified
+  "plt-symbols.sh",                 # sld currently doesn't create entries in the symbol table with the `$plt` suffix unless `--got-plt-syms` is specified
   "run-clang.sh",                   # This test checks the comment section to verify if it's linked with mold.
   "start-lib.sh",                   # Passes when `--no-gc-sections` is passed.
   "stdout.sh",
@@ -183,7 +183,7 @@ tests = [
 ]
 
 [skipped_groups.uncommon]
-reason = "These tests use uncommon features and are therefore likely not supported by Sld, at least for the time being."
+reason = "These tests use uncommon features and are therefore likely not supported by sld, at least for the time being."
 tests = [
   "filler.sh",
   "no-quick-exit.sh",

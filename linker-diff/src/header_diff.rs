@@ -200,7 +200,7 @@ pub(crate) fn check_dynamic_headers(report: &mut Report, objects: &[crate::Binar
 
 pub(crate) fn report_section_diffs(report: &mut Report, objects: &[Binary]) {
     // Find section names defined by our first reference object. We ignore empty sections though,
-    // since Sld will output empty sections if they have start/stop symbols that are referenced.
+    // since sld will output empty sections if they have start/stop symbols that are referenced.
     let mut common_names: HashSet<&[u8]> = objects[1]
         .sections_by_name
         .iter()

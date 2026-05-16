@@ -4,8 +4,8 @@
 //! references to symbols that are in different locations in the different binaries. A high level
 //! output of how this works follows.
 //!
-//! We depend on Sld's binary output having a corresponding .layout file. This allows us to know
-//! all the input sections that Sld put into the binary and where it put them.
+//! We depend on sld's binary output having a corresponding .layout file. This allows us to know
+//! all the input sections that sld put into the binary and where it put them.
 //!
 //! We then start by looking for symbols that have exactly one definition in each binary. We can
 //! then tie the input section that defined that symbol to its corresponding location in all of the

@@ -2,7 +2,7 @@
 
 Linker-diff is a command-line utility that diffs two ELF binaries (shared objects or executables).
 At least one of the binaries being diffed needs layout information as can optionally be produced by
-the Sld linker.
+the sld linker.
 
 ## Usage
 

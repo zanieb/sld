@@ -7,7 +7,7 @@
 // On aarch64, GNU ld puts the copy relocation for this symbol in .data.rel.ro
 // rather than .bss.
 //#DiffIgnore:dynsym.__stack_chk_guard.section
-// Sld doesn't output this symbol.
+// sld doesn't output this symbol.
 //#DiffIgnore:version._ZSt21ios_base_library_initv
 //#Object:cpp-integration-2.cc
 
@@ -29,7 +29,7 @@
 //#LinkArgs:-static -Wl,-z,now,-no-relax
 //#DiffIgnore:rel.extra-got-plt-got
 //#DiffIgnore:section.rela.plt.link
-// Sld uses similar order as LLD, which is different from GNU ld.
+// sld uses similar order as LLD, which is different from GNU ld.
 //#DiffIgnore:init_array
 // TODO: Missing `endbr64` relaxations.
 //#DiffIgnore:rel.match_failed.R_X86_64_GOTPCRELX

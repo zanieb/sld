@@ -240,7 +240,7 @@ fn write_sld_speedups(
         }
         writeln!(
             f,
-            "  Sld speedup over {bin}: {speedup:.2}x",
+            "  sld speedup over {bin}: {speedup:.2}x",
             bin = batch.bin,
             speedup = mean(batch, mode) / sld_mean,
         )?;
@@ -264,13 +264,13 @@ fn write_incremental_sld_speedups(
 
     for batch in &baseline.batches {
         let baseline_name = if batch.bin.identifier.kind == LinkerKind::Sld {
-            "Sld".to_owned()
+            "sld".to_owned()
         } else {
             batch.bin.to_string()
         };
         writeln!(
             f,
-            "  Sld incremental speedup over {baseline} {baseline_name}: {speedup:.2}x",
+            "  sld incremental speedup over {baseline} {baseline_name}: {speedup:.2}x",
             baseline = baseline.config.name,
             speedup = mean(batch, mode) / incremental_mean,
         )?;
@@ -540,8 +540,8 @@ mod tests {
         }
         .to_string();
 
-        assert!(display.contains("Sld speedup over Mold 1.0.0: 4.00x"));
-        assert!(display.contains("Sld speedup over GNU ld 1.0.0: 10.00x"));
+        assert!(display.contains("sld speedup over Mold 1.0.0: 4.00x"));
+        assert!(display.contains("sld speedup over GNU ld 1.0.0: 10.00x"));
     }
 
     #[test]
@@ -583,9 +583,9 @@ mod tests {
         }
         .to_string();
 
-        assert!(display.contains("Sld incremental speedup over ruff Sld: 4.00x"));
-        assert!(display.contains("Sld incremental speedup over ruff Mold 1.0.0: 6.00x"));
-        assert!(display.contains("Sld incremental speedup over ruff GNU ld 1.0.0: 10.00x"));
+        assert!(display.contains("sld incremental speedup over ruff sld: 4.00x"));
+        assert!(display.contains("sld incremental speedup over ruff Mold 1.0.0: 6.00x"));
+        assert!(display.contains("sld incremental speedup over ruff GNU ld 1.0.0: 10.00x"));
     }
 
     #[test]

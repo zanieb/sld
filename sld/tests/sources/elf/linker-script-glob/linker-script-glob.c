@@ -14,7 +14,7 @@
 //#ExpectSym:val_hello_baz section="other"
 //#DiffIgnore:section.riscv.attributes
 //#DiffIgnore:segment.RISCV_ATTRIBUTES.*
-// GNU ld emits `.riscv.attributes`, but Sld does not
+// GNU ld emits `.riscv.attributes`, but sld does not
 //#DiffIgnore:riscv_attributes.*
 
 static int val_0 __attribute__((used, section(".mydata.0"))) = 0;
