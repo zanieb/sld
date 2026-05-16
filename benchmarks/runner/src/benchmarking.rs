@@ -16,9 +16,11 @@ use object::ObjectSection as _;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Instant;
@@ -64,6 +66,7 @@ pub(crate) fn run_bench(args: &BenchArgs, config: &Config) -> Result {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn check_tmpfs(args: &BenchArgs) -> Result {
     let tmpfile = std::path::absolute(&args.tmp)?;
     let tmpdir = tmpfile.parent().unwrap();
@@ -86,6 +89,11 @@ fn check_tmpfs(args: &BenchArgs) -> Result {
             stdout.trim(),
         );
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_tmpfs(_args: &BenchArgs) -> Result {
     Ok(())
 }
 
@@ -601,8 +609,14 @@ fn run_once(
     }
 
     let output_path = output_path_for_bin(args.tmp.as_path(), bin);
+    let linker = linker_invocation(args, bin)?;
     let mut command = Command::new(&bench.path);
-    command.env("OUT", output_path.as_os_str()).arg(&bin.path);
+    command
+        .env("OUT", output_path.as_os_str())
+        .arg(&linker.path);
+    for (key, value) in linker.env {
+        command.env(key, value);
+    }
     for arg in extra_flags {
         if bin.identifier.kind.supports_arg(arg) {
             command.arg(arg);
@@ -664,6 +678,93 @@ fn run_once(
         stime: res_use.rusage.stime,
         utime: res_use.rusage.utime,
     }))
+}
+
+struct LinkerInvocation {
+    path: PathBuf,
+    env: Vec<(&'static str, OsString)>,
+}
+
+fn linker_invocation(args: &BenchArgs, bin: &Bin) -> Result<LinkerInvocation> {
+    if bin.identifier.kind == LinkerKind::AppleClang {
+        let path = apple_clang_wrapper_path(args, bin);
+        ensure_apple_clang_wrapper(&path)?;
+        return Ok(LinkerInvocation {
+            path,
+            env: vec![("SLD_BENCH_REAL_LINKER", bin.path.as_os_str().to_owned())],
+        });
+    }
+
+    Ok(LinkerInvocation {
+        path: bin.path.clone(),
+        env: Vec::new(),
+    })
+}
+
+fn apple_clang_wrapper_path(args: &BenchArgs, bin: &Bin) -> PathBuf {
+    let mut path = args.tmp.clone();
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("linker-benchmark-out"));
+    file_name.push(format!(".apple-clang-wrapper.{}", bin.index));
+    path.set_file_name(file_name);
+    path
+}
+
+fn ensure_apple_clang_wrapper(path: &Path) -> Result {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create `{}`", parent.display()))?;
+    }
+
+    std::fs::write(path, APPLE_CLANG_WRAPPER)
+        .with_context(|| format!("Failed to write `{}`", path.display()))?;
+    make_executable(path)
+}
+
+const APPLE_CLANG_WRAPPER: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -z "${SLD_BENCH_REAL_LINKER:-}" ]; then
+  echo "SLD_BENCH_REAL_LINKER is not set" >&2
+  exit 1
+fi
+
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-flavor" ] && [ "${2:-}" = "darwin" ]; then
+    shift 2
+    continue
+  fi
+
+  if [ "$1" = "--no-fork" ]; then
+    shift
+    continue
+  fi
+
+  ARGS+=("$1")
+  shift
+done
+
+exec "$SLD_BENCH_REAL_LINKER" "${ARGS[@]}"
+"#;
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for `{}`", path.display()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o700);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("Failed to chmod `{}`", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result {
+    Ok(())
 }
 
 fn output_path_for_bin(tmp: &Path, bin: &Bin) -> std::path::PathBuf {
@@ -793,10 +894,12 @@ fn filter_benchmarks_by_sld_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) ->
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_apple_clang_wrapper;
     use super::ensure_relative_path;
     use super::find_first_relocatable_elf_with_section;
     use super::grow_elf_section;
     use super::incremental_log_path;
+    use super::make_executable;
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
     use super::output_path_for_bin;
@@ -814,6 +917,7 @@ mod tests {
     use object::ObjectSection as _;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
 
     #[test]
     fn mutation_paths_must_be_save_dir_relative() {
@@ -1107,6 +1211,41 @@ mod tests {
         assert_eq!(
             output_path_for_bin(Path::new("/tmp/linker-benchmark-out"), &bin),
             PathBuf::from("/tmp/linker-benchmark-out.7")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apple_clang_wrapper_strips_sld_darwin_flavor() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_linker = dir.path().join("real-linker");
+        std::fs::write(
+            &real_linker,
+            "#!/usr/bin/env bash\nfor ARG in \"$@\"; do printf '<%s>\\n' \"$ARG\"; done\n",
+        )
+        .unwrap();
+        make_executable(&real_linker).unwrap();
+
+        let wrapper = dir.path().join("apple-clang-wrapper");
+        ensure_apple_clang_wrapper(&wrapper).unwrap();
+
+        let output = Command::new(&wrapper)
+            .env("SLD_BENCH_REAL_LINKER", &real_linker)
+            .args([
+                "input.o",
+                "-flavor",
+                "darwin",
+                "--no-fork",
+                "-flavor",
+                "gnu",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "<input.o>\n<-flavor>\n<gnu>\n"
         );
     }
 

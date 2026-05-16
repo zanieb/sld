@@ -1,0 +1,4 @@
+name = "macOS linker benchmarks"
+
+[bench.uv]
+sld_extra_flags = ["--no-fork"]

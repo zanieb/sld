@@ -240,4 +240,12 @@ expect_output_change = true
 
         Config::load(&config_path).unwrap();
     }
+
+    #[test]
+    fn checked_in_macos_config_parses() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir.parent().unwrap().join("macos.toml");
+
+        Config::load(&config_path).unwrap();
+    }
 }
