@@ -3,7 +3,6 @@ name = "linker-layout"
 description = "Data structures for storing linker layout information"
 version.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 
