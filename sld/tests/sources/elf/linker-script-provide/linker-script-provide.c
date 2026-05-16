@@ -22,7 +22,7 @@
 //#DiffIgnore:rel.R_AARCH64_ADR_GOT_PAGE.R_AARCH64_ADR_GOT_PAGE
 //#DiffIgnore:section.riscv.attributes
 //#DiffIgnore:segment.RISCV_ATTRIBUTES.*
-// GNU ld emits `.riscv.attributes`, but Sld does not
+// GNU ld emits `.riscv.attributes`, but sld does not
 //#DiffIgnore:riscv_attributes.*
 // GNU ld behaves strangely when a symbol referenced in a linker script is
 // empty. See this:

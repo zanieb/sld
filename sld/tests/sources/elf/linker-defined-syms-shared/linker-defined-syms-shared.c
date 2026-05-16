@@ -16,8 +16,8 @@
 //#NoDynSym:edata
 //#NoDynSym:_edata
 
-// Sld keeps them in .symtab as LOCAL. GNU ld removes them entirely with
-// --gc-sections, so we only assert this for Sld.
+// sld keeps them in .symtab as LOCAL. GNU ld removes them entirely with
+// --gc-sections, so we only assert this for sld.
 //#SkipLinker:ld
 //#ExpectSym:etext binding=local
 //#ExpectSym:_etext binding=local
@@ -28,7 +28,7 @@
 //#ExpectSym:_edata binding=local
 
 // data_var and bss_var ensure .data and .bss sections exist so that
-// edata, _edata, end and _end symbols are emitted by Sld.
+// edata, _edata, end and _end symbols are emitted by sld.
 int data_var = 1;
 int bss_var;
 

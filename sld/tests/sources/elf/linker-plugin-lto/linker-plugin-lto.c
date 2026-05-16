@@ -39,7 +39,7 @@
 //#LinkArgs:-Wl,-znow -flto -nostdlib
 //#Object:runtime.c
 //#Object:linker-plugin-lto-2.c
-//#ExpectError:(contains LLVM-IR, but the linker plugin|Sld was compiled without linker-plugin support)
+//#ExpectError:(contains LLVM-IR, but the linker plugin|sld was compiled without linker-plugin support)
 
 //#Config:gcc-link-clang:error
 //#Compiler:gcc
@@ -49,7 +49,7 @@
 //#LinkArgs:-Wl,-znow -flto -nostdlib
 //#Object:runtime.c
 //#Object:linker-plugin-lto-2.c
-//#ExpectError:(contains GCC-IR, but the linker plugin|Sld was compiled without linker-plugin support)
+//#ExpectError:(contains GCC-IR, but the linker plugin|sld was compiled without linker-plugin support)
 //#Cross:false
 
 // LTO, but no linker plugin was supplied by the compiler. We could try to find
@@ -62,7 +62,7 @@
 //#LinkArgs:-Wl,-znow -nostdlib
 //#Object:runtime.c
 //#Object:linker-plugin-lto-2.c
-//#ExpectError:(contains LLVM-IR, but linker plugin was not supplied|Sld was compiled without linker-plugin support)
+//#ExpectError:(contains LLVM-IR, but linker plugin was not supplied|sld was compiled without linker-plugin support)
 
 // The only LTO input is in an archive and we end up not using it.
 //#Config:clang-empty-lto:default
@@ -91,7 +91,7 @@
 //#SkipLinker:ld
 //#LinkArgs:-Wl,-znow -flto -nostdlib -Wl,-plugin-opt=jobs=foo
 //#Archive:empty.c:-flto
-//#ExpectError:(Error from linker plugin: Invalid parallelism level: foo|Sld was compiled without linker-plugin support)
+//#ExpectError:(Error from linker plugin: Invalid parallelism level: foo|sld was compiled without linker-plugin support)
 
 #include "../common/runtime.h"
 

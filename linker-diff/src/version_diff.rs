@@ -120,7 +120,7 @@ fn read_gnu_version(bin: &crate::Binary) -> Result<FieldValues> {
         let version_index = version_index_raw & VERSYM_VERSION;
         let hidden = version_index_raw & VERSYM_HIDDEN == VERSYM_HIDDEN;
 
-        // TODO: Currently Sld doesn't differentiate between local and global symbols.
+        // TODO: Currently sld doesn't differentiate between local and global symbols.
         let version_name = if version_index <= 1 {
             b"local or global"
         } else {
@@ -130,7 +130,7 @@ fn read_gnu_version(bin: &crate::Binary) -> Result<FieldValues> {
                 .name()
         };
 
-        // GNU ld creates an empty symbol for each version, Sld doesn't, so we skip it.
+        // GNU ld creates an empty symbol for each version, sld doesn't, so we skip it.
         if dynsym.elf_symbol().st_type() == elf::STT_OBJECT
             && dynsym.elf_symbol().is_absolute(e)
             && sym_name == version_name

@@ -1025,7 +1025,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
 }
 
 pub(crate) fn linker_plugin_disabled_error() -> Error {
-    error!("Sld was compiled without linker-plugin support, but LTO inputs were detected")
+    error!("sld was compiled without linker-plugin support, but LTO inputs were detected")
 }
 
 struct SymbolVecWriters<'out> {

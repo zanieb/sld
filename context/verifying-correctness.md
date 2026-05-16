@@ -14,7 +14,7 @@ This note collects the verification strategy that exists in the tree today:
 
 ## Correctness model
 
-Sld's incremental tests are built around four invariants:
+sld's incremental tests are built around four invariants:
 
 1. An unchanged relink must preserve the exact output bytes and reuse the previous output.
 2. A rewritten-but-byte-identical input must refresh saved metadata without changing the output.
@@ -60,7 +60,7 @@ records that should remain afterward.
 
 For a normal incremental fixture, the harness performs this sequence:
 
-1. Run a full Sld link that serves as the comparison baseline.
+1. Run a full sld link that serves as the comparison baseline.
 2. Run the first incremental link.
 3. Byte-compare that initial incremental output with the baseline unless the fixture intentionally
    reserves extra incremental capacity.
@@ -103,7 +103,7 @@ for the next update.
 ## Changed-input patch tests
 
 When `TestIncrementalChanged:true` is present, the harness mutates one or more inputs and proves that
-Sld responds correctly.
+sld responds correctly.
 
 For patchable cases, it checks:
 

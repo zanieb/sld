@@ -124,7 +124,7 @@ pub(crate) enum SegmentName {
     Rodata,
     Data,
     Bss,
-    /// Any segment name not in the known set. Sld has no `-T` override for
+    /// Any segment name not in the known set. sld has no `-T` override for
     /// these, so they always resolve to the default value.
     Other,
 }

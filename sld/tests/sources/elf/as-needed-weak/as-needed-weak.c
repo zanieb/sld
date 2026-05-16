@@ -6,7 +6,7 @@
 // references. This matches the behaviour of GNU ld and lld (mold differs).
 // If fn1 is non-null the lib was incorrectly activated; exit with fn1() (1)
 // so the test fails. If fn1 is null the lib was correctly excluded; exit 42.
-// force-dynamic-linking.c is linked without --as-needed so both Sld and GNU
+// force-dynamic-linking.c is linked without --as-needed so both sld and GNU
 // ld produce a dynamic binary, enabling a meaningful diff.
 //#DiffIgnore:.dynamic.DT_NEEDED
 //#DiffIgnore:section.got

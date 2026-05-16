@@ -1,8 +1,8 @@
-//! An over-engineered, opinionated tool for benchmarking linkers, in particular Sld.
+//! An over-engineered, opinionated tool for benchmarking linkers, in particular sld.
 //!
 //! Things that make this specific to linkers and/or sld.
 //!
-//! * It assumes benchmarks are in the form of Sld-generated save-dirs. i.e. a directory (the name
+//! * It assumes benchmarks are in the form of sld-generated save-dirs. i.e. a directory (the name
 //!   of which is the name of the benchmark) where that directory contains a rust-with script.
 //! * It accommodates that some of the linkers fork on startup, then do shutdown work after the
 //!   linker terminates. To prevent this from affecting subsequent runs, it inserts a delay based on
@@ -201,7 +201,7 @@ struct LinkerIdentifier {
     kind: LinkerKind,
     version: String,
     variant: Option<String>,
-    /// The commit hash of the linker. Set for Sld when the path to the linker doesn't include the
+    /// The commit hash of the linker. Set for sld when the path to the linker doesn't include the
     /// version number. i.e. when we've concluded that this isn't a release version.
     hash: Option<String>,
     /// If we've got has, then this is one patch level higher than version.
@@ -298,7 +298,7 @@ mod duration_serde {
 impl LinkerKind {
     fn as_str(self) -> &'static str {
         match self {
-            LinkerKind::Sld => "Sld",
+            LinkerKind::Sld => "sld",
             LinkerKind::Lld => "LLD",
             LinkerKind::Mold => "Mold",
             LinkerKind::Bfd => "GNU ld",
@@ -392,8 +392,8 @@ impl LinkerIdentifier {
         let mut variant = None;
 
         if let Some(mut rest) = version_line
-            .strip_prefix("Sld version ")
-            .or_else(|| version_line.strip_prefix("Sld "))
+            .strip_prefix("sld version ")
+            .or_else(|| version_line.strip_prefix("sld "))
         {
             version = take_word(&mut rest)?.to_owned();
             if !bin_path.to_string_lossy().contains(&version) {
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn parses_current_sld_version_output() {
         let identifier = LinkerIdentifier::parse(
-            "Sld 0.8.0 non-git-build (compatible with GNU linkers)",
+            "sld 0.8.0 non-git-build (compatible with GNU linkers)",
             Path::new("/tmp/sld"),
         )
         .unwrap();
@@ -603,7 +603,7 @@ mod tests {
                         path: PathBuf::from("/tmp/sld"),
                         identifier: LinkerIdentifier {
                             kind: LinkerKind::Sld,
-                            version: "Sld 0.0.0 non-git-build".to_owned(),
+                            version: "sld 0.0.0 non-git-build".to_owned(),
                             variant: None,
                             hash: Some("non-git-build".to_owned()),
                             effective_version: vec![0, 0, 1],

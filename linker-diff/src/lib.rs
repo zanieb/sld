@@ -82,8 +82,8 @@ pub struct Config {
     #[arg(long, value_delimiter = ',', value_parser = parse_string_equality)]
     pub equiv: Vec<(String, String)>,
 
-    /// Apply defaults for things that should be ignored currently for Sld. These defaults are
-    /// subject to change as Sld changes.
+    /// Apply defaults for things that should be ignored currently for sld. These defaults are
+    /// subject to change as sld changes.
     #[arg(long)]
     pub sld_defaults: bool,
 
@@ -209,13 +209,13 @@ impl Config {
                 "rel.match_failed.R_X86_64_GOTPC32_TLSDESC",
                 "rel.match_failed.R_X86_64_CODE_4_GOTPC32_TLSDESC",
                 "rel.missing-opt.R_X86_64_TLSDESC_CALL.SkipTlsDescCall.*",
-                // Sld eliminates GOTPCRELX in statically linked executables even for undefined
+                // sld eliminates GOTPCRELX in statically linked executables even for undefined
                 // symbols, whereas other linkers don't. This is a valid optimisation that other
                 // linkers don't currently do.
                 "rel.extra-opt.R_X86_64_GOTPCRELX.CallIndirectToRelative.static-*",
-                // Sld applies MovIndirectToLea relaxation to _DYNAMIC symbol in static builds
+                // sld applies MovIndirectToLea relaxation to _DYNAMIC symbol in static builds
                 // because it's marked as NON_INTERPOSABLE. GNU ld keeps the GOT-relative access.
-                // Both are correct, but Sld's approach is more optimized.
+                // Both are correct, but sld's approach is more optimized.
                 "rel.extra-opt.R_X86_64_REX_GOTPCRELX.MovIndirectToLea.static-*",
                 // We don't yet support emitting warnings.
                 "section.gnu.warning",
@@ -255,13 +255,13 @@ impl Config {
                 "segment.PHDR.*",
                 "segment.GNU_RELRO.*",
                 "segment.GNU_STACK.*",
-                // Sld currently generates PT_NOTE even for non-alloc note sections, while the
+                // sld currently generates PT_NOTE even for non-alloc note sections, while the
                 // other linkers don't.
                 "segment.NOTE.*",
                 // TODO: RISC-V
                 "segment.LOAD.RW.alignment",
                 // TODO: Latest lld sometimes doesn’t create a .note.gnu.property section even when
-                // Sld does.
+                // sld does.
                 "segment.GNU_PROPERTY.alignment",
                 "segment.GNU_PROPERTY.flags",
                 // TODO: We consider SFrame sections experimental and disabled by default.
@@ -272,7 +272,7 @@ impl Config {
                 // whether range-extension thunks are needed varies.
                 "rel.plt.extra-thunk",
                 "rel.plt.absent-thunk",
-                // On some systems Sld outputs these symbols while GNU ld does not.
+                // On some systems sld outputs these symbols while GNU ld does not.
             ]
             .into_iter()
             .map(ToOwned::to_owned),
@@ -291,7 +291,7 @@ impl Config {
                     // Also on Alpine Linux, aarch64, it seems that GNU ld is emitting an
                     // unnecessary GLOB_DAT relocation in a GOT entry.
                     "rel.missing-got-dynamic.executable",
-                    // GNU ld replaces calls to undefined symbols with nop. Sld instead encodes
+                    // GNU ld replaces calls to undefined symbols with nop. sld instead encodes
                     // bl 0x0 so that if the call site is reached, it will crash rather than
                     // silently continuing execution.
                     "rel.missing-opt.R_AARCH64_CALL26.ReplaceWithNop.*",
@@ -327,7 +327,7 @@ impl Config {
                     "literal-byte-mismatch*",
                     "error.*",
                     "section-diff-failed*",
-                    // GNU ld replaces calls to undefined symbols with nop. Sld instead encodes
+                    // GNU ld replaces calls to undefined symbols with nop. sld instead encodes
                     // bl 0x0 so that if the call site is reached, it will crash rather than
                     // silently continuing execution.
                     "rel.missing-opt.R_LARCH_B26.ReplaceWithNop.*",
@@ -921,7 +921,7 @@ impl<'data> NameIndex<'data> {
             }
 
             if let Ok(mut name) = sym.name_bytes() {
-                // Sld doesn't emit local symbols that start with ".L". The other linkers mostly do
+                // sld doesn't emit local symbols that start with ".L". The other linkers mostly do
                 // the same. However, GNU ld and lld, if they encounter a GOT-forming relocation to
                 // such a symbol, even if they then optimise away the GOT-forming relocation, will
                 // emit the symbol. This behaviour seems weird and not worth replicating, so we just

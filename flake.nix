@@ -33,12 +33,12 @@
       # Which is `import sld`
       overlays.default = import self;
 
-      # Output Sld as a stand-alone package.
+      # Output sld as a stand-alone package.
       packages = forAllSystems (system: {
         default = common.${system}.pkgs.sld-unwrapped;
       });
 
-      # Tests to ensure Sld continues working on Nixos
+      # Tests to ensure sld continues working on Nixos
       # We run unit tests, and some smoke tests that are in Nixpkgs.
       checks = forAllSystems (
         system:
@@ -67,7 +67,7 @@
         }
       );
 
-      # devShell for developing Sld
+      # devShell for developing sld
       devShells = forAllSystems (system: {
         default = common.${system}.pkgs.callPackage ./nix/shell.nix { };
       });

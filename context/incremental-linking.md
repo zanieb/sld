@@ -1,6 +1,6 @@
-# Incremental linking in Sld
+# Incremental linking in sld
 
-Sld's incremental mode is built for iterative development: keep the output of a previous link
+sld's incremental mode is built for iterative development: keep the output of a previous link
 around, decide whether it is still usable, and do the smallest correct update that the saved state
 allows. The implementation is deliberately conservative. It prefers a full relink over a risky
 incremental update, but the current fast paths already cover more than "nothing changed".
@@ -32,7 +32,7 @@ target/debug/app.incr/
 ```
 
 The per-output state directory contains the persisted metadata, section sidecars, snapshots, and a
-local `log`. Sld also appends a global incremental log that can be printed with:
+local `log`. sld also appends a global incremental log that can be printed with:
 
 ```sh
 sld log
@@ -43,7 +43,7 @@ is set.
 
 ## The current fast-path ladder
 
-Sld's incremental behavior is easiest to understand as a ladder of progressively more expensive
+sld's incremental behavior is easiest to understand as a ladder of progressively more expensive
 choices.
 
 | Situation | Result |
@@ -64,12 +64,12 @@ reused existing output before loading inputs
 patched N changed input file(s) before loading inputs
 ```
 
-Those messages mean Sld took a metadata-driven fast path without first loading every input into the
+Those messages mean sld took a metadata-driven fast path without first loading every input into the
 ordinary full-link pipeline.
 
 ## Reusing unchanged output
 
-The cheapest case is a no-change relink. Sld reads the saved state, checks that the output and
+The cheapest case is a no-change relink. sld reads the saved state, checks that the output and
 tracked inputs still match, and returns the existing binary immediately. The implementation logs:
 
 ```text
@@ -79,8 +79,8 @@ reused existing output before loading inputs
 That path is important for developer loops that relink aggressively even when the final linker
 inputs did not actually change.
 
-Sld also handles a subtler case: a build system rewrites an object file, but the bytes are the same.
-Instead of treating the fresh inode or mtime as a semantic change, Sld compares against the saved
+sld also handles a subtler case: a build system rewrites an object file, but the bytes are the same.
+Instead of treating the fresh inode or mtime as a semantic change, sld compares against the saved
 snapshot, refreshes the stored file identity, and still reuses the output. The log records:
 
 ```text
@@ -93,7 +93,7 @@ even though the linked program is unchanged.
 
 ## Patching changed inputs
 
-When an input really changed, Sld can now patch some outputs in place instead of always relinking
+When an input really changed, sld can now patch some outputs in place instead of always relinking
 from scratch. The rough rule is:
 
 1. The changed bytes must be explainable by persisted incremental metadata.
@@ -102,7 +102,7 @@ from scratch. The rough rule is:
 3. Any dependent relocation, generated-section, dynamic-relocation, or frame metadata must be
    patchable consistently.
 
-When that succeeds, Sld updates the binary, persists refreshed metadata, and logs both the number
+When that succeeds, sld updates the binary, persists refreshed metadata, and logs both the number
 of changed files and the number of narrowed sections:
 
 ```text
@@ -127,7 +127,7 @@ logic is in `sld/tests/integration_tests.rs`.
 
 ## Capacity growth and padding
 
-Some changed-input updates need more room than the previous output layout reserved. Sld exposes:
+Some changed-input updates need more room than the previous output layout reserved. sld exposes:
 
 ```sh
 --incremental-padding-percent=N
@@ -170,7 +170,7 @@ messages so that a performance experiment cannot silently become a full fallback
 
 ## State safety
 
-Sld's incremental state is part of the correctness contract:
+sld's incremental state is part of the correctness contract:
 
 - state writes are versioned,
 - output updates are bracketed by an `update-in-progress` marker,
@@ -202,21 +202,21 @@ mechanism whose core job is to preserve and reason about prior layout.
 2. Add a paired incremental benchmark that points at the same save-dir.
 3. Warm up once to seed incremental state.
 4. Time only the reuse or changed-input path you want to study.
-5. Assert on Sld's incremental log so the benchmark fails if it accidentally measures a fallback.
+5. Assert on sld's incremental log so the benchmark fails if it accidentally measures a fallback.
 
 The checked-in `benchmarks/incremental-linux.toml` file provides concrete changed-input benchmarks
 for `ruff`, `ty`, and `uv`. Each one:
 
 - passes `--incremental`,
 - mutates a specific ELF text section,
-- expects Sld to log a changed-input patch before loading inputs,
+- expects sld to log a changed-input patch before loading inputs,
 - requires the output binary to change,
 - keeps ordinary `bfd`, `lld`, and `mold` timings in the same report for comparison.
 
 When the report command sees paired full and incremental cases, it prints:
 
-- Sld's speedup over the other linker bins, and
-- Sld incremental speedup over the corresponding full Sld link.
+- sld's speedup over the other linker bins, and
+- sld incremental speedup over the corresponding full sld link.
 
 The benchmark docs also call out two important measurement details:
 
@@ -226,7 +226,7 @@ The benchmark docs also call out two important measurement details:
 
 ## What this means in practice
 
-Today, incremental Sld is useful in three distinct ways:
+Today, incremental sld is useful in three distinct ways:
 
 1. No-change relinks can return almost immediately by reusing the prior output.
 2. Rewritten-but-identical inputs avoid unnecessary relinks while keeping saved identities fresh.

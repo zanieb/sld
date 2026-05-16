@@ -90,7 +90,7 @@ jobs:
           mkdir "$n"
           cp "target/${{ matrix.target }}/dist/sld" "$n"
           cp README.md LICENSE* CHANGELOG.md "$n"
-          readelf -p .comment "$n/sld" | grep "Linker: Sld" || echo "::warning::'$n' wasn't linked with sld"
+          readelf -p .comment "$n/sld" | grep "Linker: sld" || echo "::warning::'$n' wasn't linked with sld"
           tar zcf $n.tar.gz $n
 
       - name: Release

@@ -10,7 +10,7 @@
 //#DiffIgnore:eh_frame.*
 //#DiffIgnore:segment.GNU_EH_FRAME.*
 //#DiffIgnore:segment.RISCV_ATTRIBUTES.*
-// Sld emits `.riscv.attributes`, but GNU ld does not
+// sld emits `.riscv.attributes`, but GNU ld does not
 //#DiffIgnore:riscv_attributes.*
 */
 

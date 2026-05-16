@@ -9,7 +9,7 @@
 // while sld uses separate RO/RX/RW segments.
 //#DiffIgnore:segment.LOAD.RWX.alignment
 //#DiffIgnore:segment.LOAD.RX.alignment
-// Sld uses alignment 1 for .text when the linker script doesn't specify it;
+// sld uses alignment 1 for .text when the linker script doesn't specify it;
 // GNU ld uses the architecture's natural instruction alignment (4 on aarch64).
 //#DiffIgnore:section.text.alignment
 
@@ -19,7 +19,7 @@
 //#Config:no-overrides:default
 //#Variant:0
 
-// Config 2: -Ttext/-Tdata/-Tbss overrides. Both Sld and GNU ld honor these
+// Config 2: -Ttext/-Tdata/-Tbss overrides. Both sld and GNU ld honor these
 // alongside a linker script. lld ignores -T* when a linker script is present,
 // so we skip it here.
 //#Config:with-T-overrides:default

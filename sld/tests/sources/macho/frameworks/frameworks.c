@@ -10,7 +10,7 @@
 
 void main(void) {
   CFStringRef value = CFSTR("sld");
-  if (CFStringGetLength(value) == 4) {
+  if (CFStringGetLength(value) == 3) {
     exit_syscall(42);
   }
   exit_syscall(1);

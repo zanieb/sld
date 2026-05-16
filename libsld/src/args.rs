@@ -370,7 +370,7 @@ impl CommonArgs {
     /// Returns a string that identifies this linker. This is written into the .comment
     /// section which usually also contains the versions of compilers that were used.
     pub(crate) fn linker_identity(&self) -> String {
-        format!("Sld {} (compatible with GNU linkers)", self.version)
+        format!("sld {} (compatible with GNU linkers)", self.version)
     }
 
     /// Adds a linker script to our outputs. Note, this is only called for scripts specified via

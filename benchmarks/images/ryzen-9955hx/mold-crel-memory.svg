@@ -35,7 +35,7 @@ font-size="16" fill="#FFFFFF" transform="rotate(270, 5, 288)">MiB</text>
 <text x="524" y="580" fill="#FFFFFF" text-anchor="middle">+181%</text>
 <rect fill="#00FF00" opacity="0.8" x="694" y="331" width="227" height="129" />
 <line stroke="#FFFFFF" x1="807" y1="330" x2="807" y2="332" />
-<text x="807" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
+<text x="807" y="484" fill="#FFFFFF" text-anchor="middle">sld</text>
 <text x="807" y="502" fill="#FFFFFF" text-anchor="middle">0.8.0</text>
 <text x="807" y="580" fill="#FFFFFF" text-anchor="middle">+0%</text>
 </svg>

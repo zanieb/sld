@@ -28,7 +28,7 @@
 //! SoSingleLinker:{linker name} If specified, we will use the named linker for liking shared
 //! objects regardless of the linker under test.
 //!
-//! SldExtraLinkArgs:... Extra linker arguments that should only be passed to the Sld linker.
+//! SldExtraLinkArgs:... Extra linker arguments that should only be passed to the sld linker.
 //!
 //! CompArgs:... Arguments to be passed to the compiler when building object files.
 //!
@@ -77,7 +77,7 @@
 //! given section header type. The section type may be numeric or a supported `SHT_*` name.
 //!
 //! ExpectSectionTypeSld:{section_name}={section_type} As for ExpectSectionType, but only checks
-//! Sld's output.
+//! sld's output.
 //!
 //! ExpectMachOBuildVersion:{platform} {min-os} {sdk} Checks that the output Mach-O contains an
 //! LC_BUILD_VERSION load command with the specified values.
@@ -114,7 +114,7 @@
 //! ExpectWarning:{message regex} Verifies that the linker emits a warning matching the specified
 //! regex. Warning must be written to stderr. May be specified multiple times - all must match.
 //!
-//! ExpectWarningSld:{message regex} As for ExpectWarning, but only checks Sld's warning output.
+//! ExpectWarningSld:{message regex} As for ExpectWarning, but only checks sld's warning output.
 //!
 //! SecEquiv:{sec-name}={sec-name} Tells linker-diff that the two section names should be considered
 //! as equivalent.
@@ -236,8 +236,8 @@
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
 //!
-//! MaxThunks:{count} Maximum number of range-extension thunks that should be allocated by Sld.
-//! Defaults to 0. The test will fail if Sld allocates more than this many thunks. Tests that need
+//! MaxThunks:{count} Maximum number of range-extension thunks that should be allocated by sld.
+//! Defaults to 0. The test will fail if sld allocates more than this many thunks. Tests that need
 //! thunks must specify a sufficiently large value here.
 //!
 //! RemoveSection:{section-name} Remove the section with the specified name from the output binary.
@@ -1200,7 +1200,7 @@ impl Config {
     fn full_link_config_equivalent_to_incremental(&self) -> Config {
         let mut out = self.clone();
         if self.platform == PlatformKind::Elf {
-            // ELF incremental mode currently disables section GC, so compare against a full Sld
+            // ELF incremental mode currently disables section GC, so compare against a full sld
             // link with the same effective section reachability.
             let no_gc_sections = match self.linker_driver {
                 LinkerDriver::Compiler(_) => "-Wl,--no-gc-sections",
@@ -2669,7 +2669,7 @@ impl ProgramInputs {
                             )
                         })?;
                     }
-                    // Make the compiler-produced replacement a fresh file before Sld snapshots it.
+                    // Make the compiler-produced replacement a fresh file before sld snapshots it.
                     rewrite_file_with_same_contents(&changed_input.path)?;
                     let _ = std::fs::remove_file(&pre_replacement_path);
                 } else {
@@ -4909,7 +4909,7 @@ impl LinkCommand {
             });
             parsed_args.parse(get_args)?;
 
-            // Respect Sld's normal fork policy. On macOS, bypassing it can exercise a different
+            // Respect sld's normal fork policy. On macOS, bypassing it can exercise a different
             // output-write path from production and leave stale unsigned Mach-O test binaries.
             if libsld::should_fork(&parsed_args) {
                 return self.run_in_subprocess(config);
@@ -5510,7 +5510,7 @@ impl Assertions {
                     if was_linked_with_sld(obj) {
                         bail!(
                             "Object was supposed to be linked with {linker}, but .comment \
-                             indicates it was linked with Sld"
+                             indicates it was linked with sld"
                         );
                     }
                 }
@@ -5993,7 +5993,7 @@ fn was_linked_with_sld<'data>(
     };
     actual_comments
         .iter()
-        .any(|comment| comment.starts_with("Linker: Sld "))
+        .any(|comment| comment.starts_with("Linker: sld "))
 }
 
 fn read_comments<'data>(
@@ -6888,7 +6888,7 @@ impl PlatformKind {
     fn default_args_for_linking(self) -> ArgumentSet {
         match self {
             PlatformKind::Elf => ArgumentSet {
-                // Sld linker uses -znow by default!
+                // sld linker uses -znow by default!
                 args: vec!["-z".to_owned(), "now".to_owned()],
             },
             PlatformKind::MachO => ArgumentSet::empty(),

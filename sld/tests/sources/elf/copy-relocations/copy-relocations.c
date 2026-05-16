@@ -72,7 +72,7 @@ void _start(void) {
   }
 
   // Strong only. Note, we don't check get_w2 since linker behaviour differs in
-  // this case. GNU ld doesn't export the weak alias, lld and Sld do.
+  // this case. GNU ld doesn't export the weak alias, lld and sld do.
   s2 = 12;
   if (get_s2() != 12) {
     exit_syscall(40);

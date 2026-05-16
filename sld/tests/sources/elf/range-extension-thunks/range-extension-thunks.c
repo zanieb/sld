@@ -5,7 +5,7 @@
 // thunks.
 //
 // On aarch64, thunks may be needed in order to branch more than 128 MiB. LLD
-// places the PLT after .text, while GNU ld and Sld places it before. For this
+// places the PLT after .text, while GNU ld and sld places it before. For this
 // reason, we put stuff in middle.c with 128 MiB of padding on either side. That
 // way it doesn't matter which side the PLT is placed on, we'll need a thunk to
 // branch to it.

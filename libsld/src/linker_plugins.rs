@@ -346,7 +346,7 @@ impl LoadedPlugin {
 
         if cfg!(target_feature = "crt-static") {
             bail!(
-                "Linker plugins cannot be used when Sld was built as a statically linked binary"
+                "Linker plugins cannot be used when sld was built as a statically linked binary"
             );
         }
 
