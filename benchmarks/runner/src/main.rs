@@ -215,6 +215,7 @@ enum LinkerKind {
     Lld,
     Mold,
     Bfd,
+    AppleClang,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -302,6 +303,7 @@ impl LinkerKind {
             LinkerKind::Lld => "LLD",
             LinkerKind::Mold => "Mold",
             LinkerKind::Bfd => "GNU ld",
+            LinkerKind::AppleClang => "Apple clang",
         }
     }
 
@@ -417,6 +419,14 @@ impl LinkerIdentifier {
         } else if let Some(mut rest) = version_line.strip_prefix("mold ") {
             kind = LinkerKind::Mold;
             version = take_word(&mut rest)?.to_owned();
+        } else if let Some(mut rest) = version_line.strip_prefix("Apple clang version ") {
+            kind = LinkerKind::AppleClang;
+            version = take_word(&mut rest)?.to_owned();
+            let rest = rest.trim();
+            variant = rest
+                .strip_prefix("(")
+                .and_then(|v| v.strip_suffix(")"))
+                .map(str::to_owned);
         } else if let Some(mut rest) =
             version_line.strip_prefix("GNU ld (GNU Binutils for Ubuntu) ")
         {
@@ -581,6 +591,19 @@ mod tests {
         assert_eq!(identifier.kind, LinkerKind::Bfd);
         assert_eq!(identifier.version, "2.40");
         assert_eq!(identifier.variant.as_deref(), Some("Debian"));
+    }
+
+    #[test]
+    fn parses_apple_clang_version_output() {
+        let identifier = LinkerIdentifier::parse(
+            "Apple clang version 21.0.0 (clang-2100.0.123.102)",
+            Path::new("/usr/bin/clang"),
+        )
+        .unwrap();
+
+        assert_eq!(identifier.kind, LinkerKind::AppleClang);
+        assert_eq!(identifier.version, "21.0.0");
+        assert_eq!(identifier.variant.as_deref(), Some("clang-2100.0.123.102"));
     }
 
     #[test]

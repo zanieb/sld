@@ -54,6 +54,10 @@ to edit the `run-with` script to change / delete these flags. This will make com
 linkers more fair, since some of these unsupported flags may involve other linkers doing significant
 amounts of extra work.
 
+Native macOS benchmarks use the same saved-link workflow, but Darwin save-dirs need a slightly
+different capture and replay path when comparing sld against Apple clang. See
+[context/benchmarking-macos.md](context/benchmarking-macos.md).
+
 ### Benchmarking incremental mode
 
 The benchmark runner can pass extra flags for specific benchmark entries. To measure sld's

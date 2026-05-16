@@ -478,6 +478,7 @@ fn colour_for(linker: LinkerKind) -> &'static str {
         LinkerKind::Lld => "#0000FF",
         LinkerKind::Mold => "#FF00FF",
         LinkerKind::Bfd => "#009999",
+        LinkerKind::AppleClang => "#FF9900",
     }
 }
 
