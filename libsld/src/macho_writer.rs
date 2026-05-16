@@ -244,16 +244,16 @@ impl ChainedRebases {
                             skip_subtractor_pair = false;
                             continue;
                         }
-                        if is_tlv_init_relocation(object.object.section(section_index)?, rel)? {
+                        if is_tlv_init_relocation(object.object.section(section_index)?, rel) {
                             continue;
                         }
                         let rel_info = A::relocation_from_raw(rel)?;
                         if !is_chained_rebase_relocation(&rel_info) {
                             continue;
                         }
-                        let output_offset = relax_deltas
-                            .map(|deltas| deltas.input_to_output_offset(input_offset as u64))
-                            .unwrap_or(input_offset as u64);
+                        let output_offset = relax_deltas.map_or(input_offset as u64, |deltas| {
+                            deltas.input_to_output_offset(input_offset as u64)
+                        });
                         let place = section_address + output_offset;
                         if place >= data_start && place + 8 <= data_end {
                             let (resolution, local_symbol_id) =
@@ -1289,8 +1289,7 @@ fn write_thunks<A: Arch<Platform = MachO>>(
         let target_address = resolution
             .format_specific
             .stub_address
-            .map(|address| address.get())
-            .unwrap_or(resolution.raw_value);
+            .map_or(resolution.raw_value, |address| address.get());
         let thunk_buf = buffer
             .split_off_mut(..thunk_size)
             .ok_or_else(|| crate::file_writer::insufficient_allocation("Mach-O thunk space"))?;
@@ -1399,7 +1398,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             );
             continue;
         }
-        if is_tlv_init_relocation(section_header, rel)? {
+        if is_tlv_init_relocation(section_header, rel) {
             apply_tlv_init_relocation::<A>(object_layout, rel, paired_addend, layout, out)?;
             paired_addend = 0;
             continue;
@@ -1436,10 +1435,10 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     Ok(())
 }
 
-fn is_tlv_init_relocation(section: &SectionEntry, rel: RelocationInfo) -> Result<bool> {
-    Ok(section.name() == b"__thread_vars"
+fn is_tlv_init_relocation(section: &SectionEntry, rel: RelocationInfo) -> bool {
+    section.name() == b"__thread_vars"
         && rel.r_type == macho::ARM64_RELOC_UNSIGNED
-        && rel.r_address % 24 == 16)
+        && rel.r_address % 24 == 16
 }
 
 fn is_zero_fill_section(section_flags: crate::macho::SectionFlags) -> bool {
@@ -1571,19 +1570,16 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         RelocationKind::Got | RelocationKind::GotRelative => resolution
             .format_specific
             .got_address
-            .map(|address| address.get())
-            .unwrap_or(raw_value)
+            .map_or(raw_value, |address| address.get())
             .wrapping_add(paired_addend as u64),
         RelocationKind::Relative if uses_tlv_got => resolution
             .format_specific
             .got_address
-            .map(|address| address.get())
-            .unwrap_or(raw_value),
+            .map_or(raw_value, |address| address.get()),
         RelocationKind::PltRelative => resolution
             .format_specific
             .stub_address
-            .map(|address| address.get())
-            .unwrap_or(raw_value),
+            .map_or(raw_value, |address| address.get()),
         RelocationKind::Relative
             if rel.r_type == macho::ARM64_RELOC_BRANCH26
                 && resolution.format_specific.stub_address.is_some() =>
@@ -1593,14 +1589,15 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         _ => raw_value,
     };
 
-    let target_name = local_symbol_id
-        .map(|symbol_id| {
+    let target_name = local_symbol_id.map_or_else(
+        || format!("section ordinal {}", rel.r_symbolnum),
+        |symbol_id| {
             layout
                 .symbol_db
                 .symbol_name_for_display(symbol_id)
                 .to_string()
-        })
-        .unwrap_or_else(|| format!("section ordinal {}", rel.r_symbolnum));
+        },
+    );
 
     let mask = get_page_mask(rel_info.mask);
     let mut value = match rel_info.kind {
@@ -1610,8 +1607,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         RelocationKind::AbsoluteLowPart if uses_tlv_got => resolution
             .format_specific
             .got_address
-            .map(|address| address.get())
-            .unwrap_or(target_value)
+            .map_or(target_value, |address| address.get())
             .bitand(mask.symbol_plus_addend),
         RelocationKind::AbsoluteLowPart => target_value.bitand(mask.symbol_plus_addend),
         RelocationKind::Relative | RelocationKind::GotRelative | RelocationKind::PltRelative => {
@@ -1783,12 +1779,7 @@ fn write_stubs(out: &mut [u8], layout: &MachOLayout, chained_rebases: &ChainedRe
     let mut imports = chained_rebases
         .imports
         .iter()
-        .filter_map(|import| {
-            import
-                .stub_address
-                .zip(import.got_address)
-                .map(|(stub, got)| (stub, got))
-        })
+        .filter_map(|import| import.stub_address.zip(import.got_address))
         .collect::<Vec<_>>();
     imports.sort_by_key(|(stub_address, _)| *stub_address);
 
@@ -1942,8 +1933,9 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
         }
     }
 
-    let page_count = (entries.len() + MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT - 1)
-        / MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT;
+    let page_count = entries
+        .len()
+        .div_ceil(MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT);
     let index_count = page_count + 1;
     let common_encodings_offset = 7 * size_of::<u32>();
     let common_encodings_count = UNWIND_COMMON_ENCODINGS.len();
@@ -2050,10 +2042,9 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
 
     let text = layout.section_layouts.get(output_section_id::TEXT);
     let text_end = macho_image_offset(text.mem_offset + text.mem_size)?;
-    let last_entry_end = entries
-        .last()
-        .map(|entry| entry.function_offset.saturating_add(entry.length.max(1)))
-        .unwrap_or(text_end);
+    let last_entry_end = entries.last().map_or(text_end, |entry| {
+        entry.function_offset.saturating_add(entry.length.max(1))
+    });
     let sentinel_function_offset = text_end.max(last_entry_end);
     let sentinel_offset = index_offset + page_count * 3 * size_of::<u32>();
     write_u32(out, sentinel_offset, sentinel_function_offset)?;
@@ -2474,8 +2465,7 @@ fn read_compact_unwind_entries<'data>(
                 entry.personality = resolution
                     .format_specific
                     .got_address
-                    .map(|address| address.get().wrapping_add(field_addend))
-                    .unwrap_or(value);
+                    .map_or(value, |address| address.get().wrapping_add(field_addend));
             }
             24 => entry.lsda = value,
             _ => bail!(
@@ -2567,9 +2557,10 @@ fn macho_writer_live_subsection_relocation_ranges(
         .format_specific
         .live_subsection_ranges(section_index, section_size)
     {
-        let start =
-            usize::try_from(range.start).context("Mach-O __const subsection start exceeds usize")?;
-        let end = usize::try_from(range.end).context("Mach-O __const subsection end exceeds usize")?;
+        let start = usize::try_from(range.start)
+            .context("Mach-O __const subsection start exceeds usize")?;
+        let end =
+            usize::try_from(range.end).context("Mach-O __const subsection end exceeds usize")?;
         ranges.push(start..end);
     }
 

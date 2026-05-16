@@ -231,10 +231,11 @@ mod path_serde {
     use serde::Deserialize as _;
     use serde::Deserializer;
     use serde::Serializer;
+    use std::path::Path;
     use std::path::PathBuf;
 
     #[cfg(unix)]
-    pub(crate) fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -256,7 +257,7 @@ mod path_serde {
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {

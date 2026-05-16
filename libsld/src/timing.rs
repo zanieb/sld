@@ -20,9 +20,7 @@ pub fn setup() -> Result {
     if perfetto_output_file().is_some() {
         perfetto_recorder::start().map_err(
             |_: perfetto_recorder::TracingDisabledAtBuildTime| {
-                anyhow!(
-                    "{PERFETTO_ENV_VAR} was set, but sld was built without --features perfetto"
-                )
+                anyhow!("{PERFETTO_ENV_VAR} was set, but sld was built without --features perfetto")
             },
         )?;
     }

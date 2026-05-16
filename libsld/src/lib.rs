@@ -400,9 +400,8 @@ impl Default for Linker {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn incremental_update_is_not_finalised_when_input_check_fails() {

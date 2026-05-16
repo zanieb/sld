@@ -345,9 +345,7 @@ impl LoadedPlugin {
         timing_phase!("Load linker plugin");
 
         if cfg!(target_feature = "crt-static") {
-            bail!(
-                "Linker plugins cannot be used when sld was built as a statically linked binary"
-            );
+            bail!("Linker plugins cannot be used when sld was built as a statically linked binary");
         }
 
         // Safety: Truthfully, we don't control the file we're loading. The user gave it to us and

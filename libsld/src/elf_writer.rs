@@ -523,7 +523,7 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
             )?;
         }
         FileLayout::Prelude(s) => {
-            write_prelude::<A>(s, buffers, table_writer, layout, incremental)?
+            write_prelude::<A>(s, buffers, table_writer, layout, incremental)?;
         }
         FileLayout::Epilogue(s) => write_epilogue::<A>(s, buffers, table_writer, layout)?,
         FileLayout::SyntheticSymbols(s) => write_synthetic_symbols::<A>(s, table_writer, layout)?,

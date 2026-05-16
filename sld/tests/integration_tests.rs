@@ -304,11 +304,11 @@ mod external_tests;
 
 use itertools::Itertools;
 use libloading::Library;
-use libtest_mimic::Trial;
 use libsld::bail;
 use libsld::ensure;
 use libsld::error;
 use libsld::error::Context as _;
+use libtest_mimic::Trial;
 use object::Endian as _;
 use object::LittleEndian;
 use object::Object as _;
@@ -986,8 +986,7 @@ fn get_glibc_version() -> Option<Vec<u32>> {
 
 /// Checks if the system's glibc supports SFrame-based stack unwinding for a given architecture.
 ///
-/// 1. Check environment variable overrides (SLD_SKIP_SFRAME_BACKTRACE /
-///    SLD_FORCE_SFRAME_BACKTRACE)
+/// 1. Check environment variable overrides (SLD_SKIP_SFRAME_BACKTRACE / SLD_FORCE_SFRAME_BACKTRACE)
 /// 2. Check glibc version (must be 2.42+)
 /// 3. Compile and run a test program that uses SFrame-only backtrace to verify it works at runtime
 fn is_sframe_backtrace_supported(arch: Architecture) -> bool {

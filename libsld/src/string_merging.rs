@@ -455,10 +455,11 @@ impl<'data> MergedStringsSection<'data> {
                 create_split_resources(&mut self.string_offsets, input_sections, reuse_pool, args);
 
             rayon::in_place_scope(|s| {
-                // Spawn some number of tasks to process input section groups. As these tasks complete,
-                // they'll spawn bucket processing tasks to take those inputs. As the bucket processing
-                // tasks complete, they will, as capacity permits, spawn additional input processing
-                // tasks. This continues until the last inputs and the last buckets have been processed.
+                // Spawn some number of tasks to process input section groups. As these tasks
+                // complete, they'll spawn bucket processing tasks to take those
+                // inputs. As the bucket processing tasks complete, they will, as
+                // capacity permits, spawn additional input processing tasks. This
+                // continues until the last inputs and the last buckets have been processed.
                 try_spawn_input_processing(&resources, s);
             });
 
@@ -559,7 +560,7 @@ impl<'data> MergedStringsSection<'data> {
                 }
                 MergeString::take_hashed(&mut remaining)
             };
-            let Some(output_offset) = self.output_offset_if_owned(input_offset, string.bytes)?
+            let Some(output_offset) = self.output_offset_if_owned(input_offset, string.bytes)
             else {
                 return Ok(None);
             };
@@ -588,18 +589,14 @@ impl<'data> MergedStringsSection<'data> {
         &self,
         input_offset: LinearInputOffset,
         string: &[u8],
-    ) -> Result<Option<u64>> {
-        let Some(bucket_offset) = self.string_offset_at_input(input_offset) else {
-            return Ok(None);
-        };
+    ) -> Option<u64> {
+        let bucket_offset = self.string_offset_at_input(input_offset)?;
         let bucket = &self.buckets[bucket_offset.bucket()];
         let offset_in_bucket = bucket_offset.offset_in_bucket();
         if !bucket.owns_string_at(offset_in_bucket, string) {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(
-            self.bucket_offsets[bucket_offset.bucket()] + offset_in_bucket,
-        ))
+        Some(self.bucket_offsets[bucket_offset.bucket()] + offset_in_bucket)
     }
 
     fn string_offset_at_input(&self, input_offset: LinearInputOffset) -> Option<BucketOffset> {
