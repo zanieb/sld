@@ -4,8 +4,8 @@ members = [
     "linker-layout",
     "linker-trace",
     "linker-utils",
-    "wild",
-    "libwild",
+    "sld",
+    "libsld",
     "benchmarks/runner",
 ]
 resolver = "2"

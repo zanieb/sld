@@ -6,11 +6,11 @@ skip_linkers = ["bfd"]
 [bench.c-hello-world]
 
 [bench.chrome]
-min_wild_version = "0.6.0"
+min_sld_version = "0.6.0"
 skip_linkers = ["bfd"]
 
 [bench.chrome-crel]
-min_wild_version = "0.8.0"
+min_sld_version = "0.8.0"
 skip_linkers = ["bfd"]
 
 [bench.clang-debug]
@@ -20,7 +20,7 @@ skip_linkers = ["bfd"]
 skip_linkers = ["bfd"]
 
 [bench.mold-crel]
-min_wild_version = "0.8.0"
+min_sld_version = "0.8.0"
 skip_linkers = ["bfd"]
 
 [bench.ripgrep]
@@ -31,12 +31,12 @@ skip_linkers = ["bfd"]
 [bench.rust-analyzer-incremental]
 save = "rust-analyzer"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
-expect_wild_log = ["reused existing output before loading inputs"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["reused existing output before loading inputs"]
 
 [bench.rust-analyzer-riscv]
 skip_linkers = ["bfd"]
-min_wild_version = "0.6.0"
+min_sld_version = "0.6.0"
 
 [bench.rust-hello-world]
 
@@ -52,20 +52,20 @@ skip_linkers = ["bfd"]
 # Too short to be interesting
 skip = true
 
-[bench.wild]
+[bench.sld]
 skip_linkers = ["bfd"]
 
-[bench.wild-incremental]
-save = "wild"
+[bench.sld-incremental]
+save = "sld"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
-expect_wild_log = ["reused existing output before loading inputs"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["reused existing output before loading inputs"]
 
-[bench.wild-lto]
-min_wild_version = "0.9.0"
+[bench.sld-lto]
+min_sld_version = "0.9.0"
 
-[bench.wild-riscv]
-min_wild_version = "0.6.0"
+[bench.sld-riscv]
+min_sld_version = "0.6.0"
 skip_linkers = ["bfd"]
 
 [bench.zed]

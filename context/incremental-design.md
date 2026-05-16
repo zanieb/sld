@@ -17,14 +17,14 @@ current code follows the same basic direction:
 
 ## Operating Modes
 
-`libwild/src/incremental.rs` currently behaves like four practical modes:
+`libsld/src/incremental.rs` currently behaves like four practical modes:
 
 1. Non-incremental linking.
 2. Initial incremental linking, which performs a full link and writes reusable state.
 3. Incremental reuse, where an existing output can be accepted before loading all inputs.
 4. Incremental changed-input patching, where the previous output is updated in place.
 
-If a fast path is unsafe or unavailable, Wild falls back to a full relink and logs the reason.
+If a fast path is unsafe or unavailable, Sld falls back to a full relink and logs the reason.
 
 Typical log lines include:
 
@@ -56,7 +56,7 @@ The current implementation persists several classes of data there:
 - Build ID state when the fast build ID path is available.
 - Markers and logs that record interrupted or incomplete updates.
 
-The state format is versioned in `libwild/src/incremental.rs`. New state revisions should be treated
+The state format is versioned in `libsld/src/incremental.rs`. New state revisions should be treated
 as compatibility boundaries, not incidental churn.
 
 ## Reuse, Patch, Fallback
@@ -90,7 +90,7 @@ cases involving:
 The implementation also intentionally falls back for changes outside the patchable subset, such as
 bytes that cannot be mapped to safe patch sections or section growth that exceeds available slack.
 
-The fixture suite under `wild/tests/sources/elf/incremental-*` is the best executable specification
+The fixture suite under `sld/tests/sources/elf/incremental-*` is the best executable specification
 of that boundary.
 
 ## Safety Invariants
@@ -122,7 +122,7 @@ The current implementation is aligned with the design note in the ways that matt
 - It falls back rather than pretending unsupported cases are incremental.
 
 The major gap is also clear: changed-input incrementality is not yet broad enough, or cheap enough,
-to be consistently faster than a full Wild relink across all large Rust projects.
+to be consistently faster than a full Sld relink across all large Rust projects.
 
 ## Recent Implementation Notes
 

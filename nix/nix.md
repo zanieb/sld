@@ -1,10 +1,10 @@
 # Nix
 
-Wild includes a Nix flake, an overlay, and a derivation for building Wild.
-this allows users to use the latest git revision of Wild without having to
+Sld includes a Nix flake, an overlay, and a derivation for building Sld.
+this allows users to use the latest git revision of Sld without having to
 wait for a release to be packaged in Nixpkgs.
 
-There are two ways of using an unstable Wild, one is with Nix Flakes. Note that
+There are two ways of using an unstable Sld, one is with Nix Flakes. Note that
 until NixOS 25.11 is branched, unstable Nixpkgs is required.
 
 ```nix
@@ -13,13 +13,13 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
     # Have Nixpkgs
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    # Include Wild
-    wild = {
+    # Include Sld
+    sld = {
       url = "github:wild-linker/wild";
-      # If using the Wild Flake (not required)
+      # If using the Sld Flake (not required)
       # inputs.nixpkgs.follows = "nixpkgs";
       #
-      # If not using the Wild flake, and just using the overlay
+      # If not using the Sld flake, and just using the overlay
       flake = false;
     };
   };
@@ -28,33 +28,33 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
     {
       self,
       nixpkgs,
-      wild,
+      sld,
     }:
     let
       # Create an instance of Nixpkgs targeting x64 Linux with the
-      # Wild overlay applied
+      # Sld overlay applied
       pkgs = import nixpkgs {
         system = "x86_64-linux";
         overlays = [
-          (import wild)
+          (import sld)
         ];
       };
 
-      # Create a stdenv that uses the Wild linker
-      wildStdenv = pkgs.useWildLinker pkgs.stdenv;
+      # Create a stdenv that uses the Sld linker
+      sldStdenv = pkgs.useWildLinker pkgs.stdenv;
     in
     {
-      # Add an output of some very cool package that is linked with the Wild linker
+      # Add an output of some very cool package that is linked with the Sld linker
       #
       # Note that if a Rust package is being linked with `buildRustPackage`, you will
       # need to create a `rustPlatform` using `makeRustPlatform` with this stdenv. See
       # below how to do that.
-      packages.x86_64-linux.default = pkgs.callPackage ./package.nix { stdenv = wildStdenv; };
+      packages.x86_64-linux.default = pkgs.callPackage ./package.nix { stdenv = sldStdenv; };
 
-      # A devShell for the very cool package that uses Wild.
+      # A devShell for the very cool package that uses Sld.
       #
       # It also has rust-analyzer in its environment
-      devShell.x86_64-linux.default = pkgs.mkShell.override { stdenv = wildStdenv; } {
+      devShell.x86_64-linux.default = pkgs.mkShell.override { stdenv = sldStdenv; } {
         inputsFrom = [ self.packages.x86_64-linux.default ];
         packages = [
           pkgs.rust-analyzer
@@ -72,14 +72,14 @@ let
   sources = import ./npins;
   pkgs = import sources.nixpkgs {
     overlays = [
-      (import sources.wild)
+      (import sources.sld)
     ];
   };
-  wildStdenv = pkgs.useWildLinker pkgs.stdenv;
+  sldStdenv = pkgs.useWildLinker pkgs.stdenv;
 in
 {
   # C Package
-  package = pkgs.callPackage ./package.nix { stdenv = wildStdenv; };
+  package = pkgs.callPackage ./package.nix { stdenv = sldStdenv; };
 }
 ```
 If building a Rust package with `rustPlatform.buildRustPackage`, a little more
@@ -88,26 +88,26 @@ setup is required. This applies to Flake-based packages, or other solutions.
 ```nix
 let
   # First steps are the same as above. Create a Nixpkgs instance
-  # with Wild.
+  # with Sld.
   pkgs = import nixpkgs {
     system = "x86_64-linux";
     overlays = [
-      (import wild)
+      (import sld)
     ];
   };
 
-  # Create a stdenv that uses Wild as its linker
-  wildStdenv = pkgs.useWildLinker pkgs.stdenv;
+  # Create a stdenv that uses Sld as its linker
+  sldStdenv = pkgs.useWildLinker pkgs.stdenv;
 
   # Next a custom rustPlatform is required.
   #
   # This uses Nixpkgs rustc and cargo, but uses
-  # the stdenv that has Wild.
-  wildRustPlatform = pkgs.makeRustPlatform {
+  # the stdenv that has Sld.
+  sldRustPlatform = pkgs.makeRustPlatform {
     inherit (pkgs) rustc cargo;
-    stdenv = wildStdenv;
+    stdenv = sldStdenv;
   };
 in
 # Then create whatever cool package you are building
-callPackage ./package.nix { rustPlatform = wildRustPlatform; }
+callPackage ./package.nix { rustPlatform = sldRustPlatform; }
 ```

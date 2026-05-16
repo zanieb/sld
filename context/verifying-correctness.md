@@ -14,7 +14,7 @@ This note collects the verification strategy that exists in the tree today:
 
 ## Correctness model
 
-Wild's incremental tests are built around four invariants:
+Sld's incremental tests are built around four invariants:
 
 1. An unchanged relink must preserve the exact output bytes and reuse the previous output.
 2. A rewritten-but-byte-identical input must refresh saved metadata without changing the output.
@@ -24,7 +24,7 @@ Wild's incremental tests are built around four invariants:
 4. Any case outside the currently patchable subset must log a clear fallback and complete as a
    correct full relink.
 
-`wild/tests/integration_tests.rs` encodes that model directly in `run_incremental_test`.
+`sld/tests/integration_tests.rs` encodes that model directly in `run_incremental_test`.
 
 ## The integration-test harness
 
@@ -60,7 +60,7 @@ records that should remain afterward.
 
 For a normal incremental fixture, the harness performs this sequence:
 
-1. Run a full Wild link that serves as the comparison baseline.
+1. Run a full Sld link that serves as the comparison baseline.
 2. Run the first incremental link.
 3. Byte-compare that initial incremental output with the baseline unless the fixture intentionally
    reserves extra incremental capacity.
@@ -96,14 +96,14 @@ The harness:
 updated 1 rewritten input file before loading inputs
 ```
 
-This protects the identity-refresh path in `libwild/src/incremental.rs`. It catches bugs where file
+This protects the identity-refresh path in `libsld/src/incremental.rs`. It catches bugs where file
 metadata changes would either force an unnecessary relink or leave stale file identities persisted
 for the next update.
 
 ## Changed-input patch tests
 
 When `TestIncrementalChanged:true` is present, the harness mutates one or more inputs and proves that
-Wild responds correctly.
+Sld responds correctly.
 
 For patchable cases, it checks:
 
@@ -119,8 +119,8 @@ patched N changed input file(s) before loading inputs
 patched M changed input sections before loading inputs
 ```
 
-Those checks appear in `wild/tests/integration_tests.rs`, and the test fixtures under
-`wild/tests/sources/elf/incremental-*` cover a broad changed-input surface.
+Those checks appear in `sld/tests/integration_tests.rs`, and the test fixtures under
+`sld/tests/sources/elf/incremental-*` cover a broad changed-input surface.
 
 ### Patch coverage already represented in-tree
 
@@ -187,13 +187,13 @@ full relink: previous incremental update did not complete
 
 - the stale marker is cleared.
 
-The corresponding runtime logic lives in `libwild/src/incremental.rs` around update-marker creation,
+The corresponding runtime logic lives in `libsld/src/incremental.rs` around update-marker creation,
 clearance, and stale-marker classification. This is a critical crash-recovery property: a partially
 updated output must never be treated as reusable state.
 
 ## Persisted-state and sidecar unit tests
 
-`libwild/src/incremental.rs` also has a large unit-test surface around the data model behind those
+`libsld/src/incremental.rs` also has a large unit-test surface around the data model behind those
 integration cases. Examples include:
 
 - `.incr` state-directory naming,
@@ -252,15 +252,15 @@ When changing incremental behavior, run the smallest useful stack first and wide
 demands:
 
 ```sh
-cargo test -p wild-linker --test integration_tests incremental
+cargo test -p sld-linker --test integration_tests incremental
 ```
 
 ```sh
-cargo test -p libwild incremental
+cargo test -p libsld incremental
 ```
 
 ```sh
-cargo test -p wild-linker --test integration_tests
+cargo test -p sld-linker --test integration_tests
 ```
 
 For benchmark-runner changes or changed-input performance claims, also exercise the incremental
@@ -271,7 +271,7 @@ Some sandboxed environments cannot read the shared Cargo registry cache. In thos
 isolated cache is a practical workaround:
 
 ```sh
-CARGO_HOME=/private/tmp/wild-cargo-home cargo test -p libwild incremental
+CARGO_HOME=/private/tmp/sld-cargo-home cargo test -p libsld incremental
 ```
 
 That keeps the verification itself from becoming noisy while preserving the same source-level test

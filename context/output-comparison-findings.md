@@ -1,9 +1,9 @@
-# Wild output comparison findings
+# Sld output comparison findings
 
 Date: 2026-05-12
 Host used for live runs: Darwin arm64, Apple `ld` 1266.8, Apple clang 21.0.0.
 
-This note compares Wild output against the closest available references in this checkout:
+This note compares Sld output against the closest available references in this checkout:
 
 - Apple `ld`, with live Mach-O links on the current macOS host.
 - GNU ld, through a live freestanding ELF comparison plus the repository's ELF comparison harness.
@@ -16,83 +16,83 @@ full Linux integration-test run.
 
 ## Existing comparison machinery
 
-The main ELF correctness surface is `wild/tests/integration_tests.rs`.
+The main ELF correctness surface is `sld/tests/integration_tests.rs`.
 
-- On Linux, `available_linkers_for_linux` enables GNU ld by default and then Wild. LLD, gold, and
+- On Linux, `available_linkers_for_linux` enables GNU ld by default and then Sld. LLD, gold, and
   mold are detected but disabled by default unless a fixture uses `EnableLinker`.
 - When `run_all_diffs = true`, the harness links the same fixture with the enabled linkers, runs
   `linker-diff`, and then executes the outputs if the platform can run them.
-- `linker-diff` is ELF-only. It needs at least one Wild output with layout information.
+- `linker-diff` is ELF-only. It needs at least one Sld output with layout information.
 - On macOS, `available_linkers_for_mac` now exposes Apple `ld` as an opt-in linker and still uses
-  `ld.lld` if present, plus Wild. In this environment `ld.lld` was not installed, so the original
-  21 Mach-O integration tests were Wild-only run/assertion checks before the opt-in Apple `ld`
+  `ld.lld` if present, plus Sld. In this environment `ld.lld` was not installed, so the original
+  21 Mach-O integration tests were Sld-only run/assertion checks before the opt-in Apple `ld`
   fixture coverage was added.
 - The external-test surface is currently the mold shell test suite. The harness can also rerun those
-  scripts through `WILD_EXTERNAL_LINKER=ld|lld|mold|gold|path` to distinguish Wild-specific failures
+  scripts through `SLD_EXTERNAL_LINKER=ld|lld|mold|gold|path` to distinguish Sld-specific failures
   from failures shared with another linker.
 
 ## Live Mach-O comparison against Apple ld
 
 Commands run:
 
-- `cargo test -p wild-linker --test integration_tests -- --list`
-- `cargo test -p wild-linker --test integration_tests -- macho/aarch64`
-- Manual Apple `ld` and Wild links for the `trivial`, `dynamic-import`, and `tlv` Mach-O fixtures.
+- `cargo test -p sld-linker --test integration_tests -- --list`
+- `cargo test -p sld-linker --test integration_tests -- macho/aarch64`
+- Manual Apple `ld` and Sld links for the `trivial`, `dynamic-import`, and `tlv` Mach-O fixtures.
 - `file`, direct execution, `otool -L`, `otool -hV`, `otool -l`, `vtool -show-build`, `dyld_info`,
   and `codesign --verify --verbose=2` on the manual outputs.
 
 Results:
 
-- The Mach-O integration suite listed 21 tests and all 21 passed with Wild.
-- For the three manual fixtures, both Apple `ld` and Wild produced arm64 Mach-O executables.
+- The Mach-O integration suite listed 21 tests and all 21 passed with Sld.
+- For the three manual fixtures, both Apple `ld` and Sld produced arm64 Mach-O executables.
 - All six manual outputs executed and exited with the expected code 42.
 - All six outputs passed `codesign --verify --verbose=2`.
 
 Structural differences observed in the three manual fixtures:
 
-| Fixture | Apple ld size | Wild size | Notable Wild differences |
+| Fixture | Apple ld size | Sld size | Notable Sld differences |
 | --- | ---: | ---: | --- |
-| `trivial` | 16,896 B | 59,600 B | Wild emits fewer load commands but much larger `__LINKEDIT` / code-signature data. |
-| `dynamic-import` | 49,976 B | 59,520 B | Wild uses `LC_DYLD_CHAINED_FIXUPS`; Apple ld uses `LC_DYLD_INFO_ONLY`, `LC_DYSYMTAB`, lazy bind info, function starts, data-in-code, source version. |
-| `tlv` | 33,432 B | 59,584 B | Both set `MH_HAS_TLV_DESCRIPTORS`; Wild is still substantially larger. |
+| `trivial` | 16,896 B | 59,600 B | Sld emits fewer load commands but much larger `__LINKEDIT` / code-signature data. |
+| `dynamic-import` | 49,976 B | 59,520 B | Sld uses `LC_DYLD_CHAINED_FIXUPS`; Apple ld uses `LC_DYLD_INFO_ONLY`, `LC_DYSYMTAB`, lazy bind info, function starts, data-in-code, source version. |
+| `tlv` | 33,432 B | 59,584 B | Both set `MH_HAS_TLV_DESCRIPTORS`; Sld is still substantially larger. |
 
 Other observed differences:
 
-- Wild records `/usr/lib/libSystem.B.dylib` with current version `0.0.0`; Apple `ld` records
+- Sld records `/usr/lib/libSystem.B.dylib` with current version `0.0.0`; Apple `ld` records
   `1356.0.0` on this host.
-- Wild's `LC_BUILD_VERSION` has no tool entry; Apple `ld` records tool `LD` version `1266.8`.
-- Wild uses a fixed-looking UUID value in the observed output:
+- Sld's `LC_BUILD_VERSION` has no tool entry; Apple `ld` records tool `LD` version `1266.8`.
+- Sld uses a fixed-looking UUID value in the observed output:
   `57494C44-2D4D-4143-484F-2D5555494421`.
-- Wild's `dynamic-import` symtab did not expose undefined `_printf` / `dyld_stub_binder` the same
+- Sld's `dynamic-import` symtab did not expose undefined `_printf` / `dyld_stub_binder` the same
   way as Apple `ld`; `dyld_info -imports` still showed `_printf` imported from libSystem.
 - `dyld_info -fixups` succeeded on the Apple `ld` output. It exited unsuccessfully with no output on
-  the Wild chained-fixups output, even though the binary executed correctly.
-- Wild placed the `dynamic-import` string section under `__DATA,__cstring`, while Apple `ld` placed
+  the Sld chained-fixups output, even though the binary executed correctly.
+- Sld placed the `dynamic-import` string section under `__DATA,__cstring`, while Apple `ld` placed
   it under `__TEXT,__cstring`.
-- Apple `ld` refused the direct `-nostdlib` trivial link without libSystem, while Wild produced a
+- Apple `ld` refused the direct `-nostdlib` trivial link without libSystem, while Sld produced a
   runnable binary and still added libSystem metadata.
 
 Confirmed Mach-O shortcoming from a normal clang-driver path:
 
-- `clang --ld-path=target/debug/wild dynamic-import.c` failed with `wild: error: Couldn't identify
+- `clang --ld-path=target/debug/sld dynamic-import.c` failed with `sld: error: Couldn't identify
   file type`.
 - Reproducing the clang link by hand showed that removing
-  `/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a` made the Wild
+  `/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a` made the Sld
   link succeed.
 - That runtime archive is a Mach-O universal binary containing per-architecture ar archives. Apple
-  `ld` handles it; Wild currently does not in this path.
+  `ld` handles it; Sld currently does not in this path.
 
 Visible Mach-O future-work areas from source inspection:
 
 - `README.md` still lists Mach-O support under "What isn't yet supported?" despite the existing
   partial implementation.
-- `libwild/src/macho_aarch64.rs` still has many `todo!()` architecture hooks.
-- `libwild/src/macho.rs` has TODOs around optional segments, section kind derivation, sorting, and
+- `libsld/src/macho_aarch64.rs` still has many `todo!()` architecture hooks.
+- `libsld/src/macho.rs` has TODOs around optional segments, section kind derivation, sorting, and
   moved data types.
-- `libwild/src/macho_writer.rs` has explicit unsupported cases for some subtractor relocations,
+- `libsld/src/macho_writer.rs` has explicit unsupported cases for some subtractor relocations,
   `__eh_frame` 64-bit lengths, compact-unwind subtractor relocations, and dynamic-library comments.
-- `libwild/src/args/macho.rs` supports only a small set of common Apple linker options and library
-  names; unknown `-l` values warn as unsupported depending on `WILD_UNSUPPORTED`.
+- `libsld/src/args/macho.rs` supports only a small set of common Apple linker options and library
+  names; unknown `-l` values warn as unsupported depending on `SLD_UNSUPPORTED`.
 
 ## Live ELF comparison against mold and GNU ld
 
@@ -100,53 +100,53 @@ Commands run:
 
 - Installed `mold` 2.41.0 and `x86_64-linux-gnu-binutils` 2.46.0 with Homebrew.
 - Compiled existing freestanding x86_64 Linux objects with Zig:
-  - `wild/tests/sources/elf/trivial/trivial.c`
-  - `wild/tests/sources/elf/data/data.c`
-  - `wild/tests/sources/elf/common/runtime.c`
+  - `sld/tests/sources/elf/trivial/trivial.c`
+  - `sld/tests/sources/elf/data/data.c`
+  - `sld/tests/sources/elf/common/runtime.c`
 - Linked both fixtures with:
-  - `target/debug/wild -flavor gnu -m elf_x86_64 --gc-sections -static`
+  - `target/debug/sld -flavor gnu -m elf_x86_64 --gc-sections -static`
   - `mold -m elf_x86_64 --gc-sections -static`
   - `x86_64-linux-gnu-ld -m elf_x86_64 --gc-sections -static`
 - Compared with `file`, `x86_64-linux-gnu-readelf`, `x86_64-linux-gnu-objdump`, and
-  `target/debug/linker-diff --wild-defaults`.
+  `target/debug/linker-diff --sld-defaults`.
 
 Results:
 
 - Both fixtures linked successfully with all three linkers.
 - All outputs were ELF64 x86-64 static executable files.
 - The linked text for `trivial` was semantically the same across the three outputs; address bases
-  and padding differed. Mold padded `_start` with `int3`, GNU ld padded with NOPs, and Wild did not
+  and padding differed. Mold padded `_start` with `int3`, GNU ld padded with NOPs, and Sld did not
   add the same visible post-function padding in that spot.
 
 Size and layout snapshot:
 
-| Fixture | Wild | mold | GNU ld | Notable differences |
+| Fixture | Sld | mold | GNU ld | Notable differences |
 | --- | ---: | ---: | ---: | --- |
-| `trivial` | 2,971 B | 4,576 B | 10,376 B | Wild is smallest; mold adds `.eh_frame_hdr`, `.got`, `.got.plt`, and `PT_GNU_EH_FRAME`; GNU ld uses page-spaced file offsets. |
-| `data` | 3,761 B | 5,232 B | 14,912 B | Same mold-vs-Wild unwind/GOT differences; Wild and mold both emit a `GNU_RELRO` segment, GNU ld does not for this static link. |
+| `trivial` | 2,971 B | 4,576 B | 10,376 B | Sld is smallest; mold adds `.eh_frame_hdr`, `.got`, `.got.plt`, and `PT_GNU_EH_FRAME`; GNU ld uses page-spaced file offsets. |
+| `data` | 3,761 B | 5,232 B | 14,912 B | Same mold-vs-Sld unwind/GOT differences; Sld and mold both emit a `GNU_RELRO` segment, GNU ld does not for this static link. |
 
 `linker-diff` findings:
 
-- Wild vs mold, both `trivial` and `data`:
-  - Wild is missing `.eh_frame_hdr`.
-  - Wild is missing `.got`.
-  - Wild is missing `.llvm_addrsig`.
-  - Wild is missing `PT_GNU_EH_FRAME` / GNU EH frame header metadata.
+- Sld vs mold, both `trivial` and `data`:
+  - Sld is missing `.eh_frame_hdr`.
+  - Sld is missing `.got`.
+  - Sld is missing `.llvm_addrsig`.
+  - Sld is missing `PT_GNU_EH_FRAME` / GNU EH frame header metadata.
   - For `trivial`, mold also emitted `.got.plt`.
-- Wild vs GNU ld:
+- Sld vs GNU ld:
   - The clearest low-level metadata difference is `.eh_frame` section type, but the live Linux
     rerun showed this is input-sensitive rather than a simple "GNU is always X" rule. GNU ld
     preserves the input type: `SHT_PROGBITS` input produces `SHT_PROGBITS` output, while
     `SHT_X86_64_UNWIND` input produces `SHT_X86_64_UNWIND` output.
-  - Wild currently emits `SHT_PROGBITS` for both of those x86_64 `.eh_frame` shapes. That matches
+  - Sld currently emits `SHT_PROGBITS` for both of those x86_64 `.eh_frame` shapes. That matches
     mold's documented policy of canonicalizing `SHT_X86_64_UNWIND` back to `SHT_PROGBITS`, but it
     differs from GNU ld when the input section already used `SHT_X86_64_UNWIND`.
 
 Program-header differences:
 
-- Wild emits `PHDR`, read-only `LOAD`, executable `LOAD`, writable `LOAD`, `GNU_STACK`, and
+- Sld emits `PHDR`, read-only `LOAD`, executable `LOAD`, writable `LOAD`, `GNU_STACK`, and
   `GNU_RELRO` for `trivial`; `data` adds a separate writable data `LOAD`.
-- A Linux/amd64 Rosetta run exposed a stricter runtime compatibility issue here: Wild could emit
+- A Linux/amd64 Rosetta run exposed a stricter runtime compatibility issue here: Sld could emit
   all-zero writable `PT_LOAD` segments when the only kept sections in that segment were zero-sized
   `.data` / `.bss` style inputs, and it could also keep RELRO padding without real RELRO content.
   Rosetta rejects that shape with `bss_size overflow`.
@@ -157,12 +157,12 @@ Program-header differences:
 
 Initial ELF takeaways:
 
-- Wild's static freestanding output is compact and has matching executable code for the simple
+- Sld's static freestanding output is compact and has matching executable code for the simple
   fixtures, but it lacks mold's generated EH frame header surface.
 - Compared with GNU ld, the most concrete low-level metadata difference in these fixtures is the
   input-sensitive `.eh_frame` section type policy. This should be treated as a deliberate
   GNU-vs-mold compatibility decision, not as an obvious correctness bug.
-- Compared with mold, Wild intentionally or accidentally omits GOT/GOT.PLT scaffolding in these
+- Compared with mold, Sld intentionally or accidentally omits GOT/GOT.PLT scaffolding in these
   static cases. That is probably fine for these inputs, but it is an observable output-policy
   difference and should be checked against dynamic and relocation-heavy fixtures in a Linux run.
 
@@ -173,7 +173,7 @@ The mold submodule was initialized at `17956fdfa1ea18171587d02a7439e7dab6732ea1`
 Counts from the current checkout:
 
 - Upstream mold shell tests present: 464.
-- Tests named in `wild/tests/external_tests/mold_skip_tests.toml`: 186.
+- Tests named in `sld/tests/external_tests/mold_skip_tests.toml`: 186.
 - Skip-list names missing from the checked-out mold corpus: 0.
 - On this arm64 host, the harness collects 373 mold tests: 222 expected-pass tests and 151
   `expect_failure` tests. The difference from 464 is mostly architecture filtering.
@@ -208,18 +208,18 @@ The highest-signal mold gaps are:
 
 Local execution check:
 
-- Running `cargo test -p wild-linker --features mold_tests --test integration_tests --
+- Running `cargo test -p sld-linker --features mold_tests --test integration_tests --
   external_test_suites/mold/test/hello-dynamic.sh --exact` failed on macOS before it could serve as
-  meaningful Wild-vs-mold evidence. The failure included Bash 3 syntax incompatibility with `|&`,
-  Apple clang target behavior, and `wild: error: -m llvm is not yet supported`.
-- The external mold harness now runs correctly in an Apple Linux container when the Wild checkout is
+  meaningful Sld-vs-mold evidence. The failure included Bash 3 syntax incompatibility with `|&`,
+  Apple clang target behavior, and `sld: error: -m llvm is not yet supported`.
+- The external mold harness now runs correctly in an Apple Linux container when the Sld checkout is
   mounted read-only, `/workspace/fakes-debug` is overlaid with a writable tmp directory whose
-  `mold`, `ld`, and `ld.lld` entries point at `/target-wild/debug/wild`, and Cargo builds offline
+  `mold`, `ld`, and `ld.lld` entries point at `/target-sld/debug/sld`, and Cargo builds offline
   from the mounted host cache.
 - With that setup, after removing `global-offset-table.sh` from the skip list, the Linux external
   mold run collected 373 tests and reported 373 passed / 0 failed.
 - The last two positive failures, `range-extension-thunk.sh` and `section-start.sh`, were relevant
-  AArch64 range / `--section-start` correctness tests. They now pass after teaching Wild to place
+  AArch64 range / `--section-start` correctness tests. They now pass after teaching Sld to place
   non-primary range-extension thunks in the source part and to keep ordinary `.text` before fixed
   custom executable sections.
 - The removed `global-offset-table.sh` skip was verified as an enabled positive test in the Linux
@@ -228,7 +228,7 @@ Local execution check:
 ## GNU ld comparison from repo evidence
 
 The ELF integration harness is designed around GNU ld as the default reference linker on Linux.
-With `run_all_diffs = true`, it is the main binary-output comparator for Wild. The live freestanding
+With `run_all_diffs = true`, it is the main binary-output comparator for Sld. The live freestanding
 ELF runs above cover only tiny static x86_64 fixtures; the broader GNU ld comparison still belongs
 in the integration harness on Linux.
 
@@ -255,7 +255,7 @@ Harness updates made after the initial comparison:
 
 - Added an opt-in `apple-ld` Mach-O linker in the integration harness, using Apple `ld` plus the
   active macOS SDK path. It is enabled for the Mach-O `trivial` and `tlv` fixtures.
-- Left `dynamic-import` Wild-only for now: Apple `ld` currently produces different `__got` bytes
+- Left `dynamic-import` Sld-only for now: Apple `ld` currently produces different `__got` bytes
   from the existing fixture assertion. Covering that comparison cleanly needs per-linker assertions
   or a split fixture config.
 - Enabled mold as an opt-in ELF reference for `custom-note` and `non-alloc`, with explicit ignores
@@ -267,13 +267,13 @@ Harness updates made after the initial comparison:
   unrelated source-test collection even without `--exact`. That matters on minimal Linux containers
   where unrelated ELF fixtures may name optional linkers such as `ld.lld`.
 - Removed `global-offset-table.sh` from the mold skip list after the Linux Apple Container run proved
-  it now passes under Wild.
+  it now passes under Sld.
 - Added section-type assertions to the ELF integration harness. The new `.eh_frame` fixtures cover
-  both ordinary `SHT_PROGBITS` inputs, which GNU ld and Wild both emit as `SHT_PROGBITS`, and
-  `SHT_X86_64_UNWIND` inputs, where GNU ld preserves `SHT_X86_64_UNWIND` but Wild follows the
+  both ordinary `SHT_PROGBITS` inputs, which GNU ld and Sld both emit as `SHT_PROGBITS`, and
+  `SHT_X86_64_UNWIND` inputs, where GNU ld preserves `SHT_X86_64_UNWIND` but Sld follows the
   mold-style `SHT_PROGBITS` policy.
 - Added a `NoEmptyLoadSegment` ELF assertion and applied it to the `eh-frame` fixture that
-  reproduced the Rosetta `bss_size overflow`; Wild now keeps zero-sized sections without letting
+  reproduced the Rosetta `bss_size overflow`; Sld now keeps zero-sized sections without letting
   them alone keep an empty `PT_LOAD` segment.
 
 1. Broaden Apple `ld` comparison for Mach-O.
@@ -283,7 +283,7 @@ Harness updates made after the initial comparison:
    output-size differences above.
 
 2. Fix or explicitly scope normal clang-driver Mach-O linking.
-   The universal `libclang_rt.osx.a` failure blocks a normal `clang --ld-path=wild file.c` path.
+   The universal `libclang_rt.osx.a` failure blocks a normal `clang --ld-path=sld file.c` path.
    Supporting universal Mach-O archives, or intentionally filtering the relevant architecture, looks
    like a concrete high-value bug.
 
@@ -300,9 +300,9 @@ Harness updates made after the initial comparison:
 5. Broaden the Linux Apple Container run.
    The full external mold run is now working and passes. The next concrete command set should
    cover the normal ELF integration harness and third-party-linker comparison modes:
-   - `WILD_TEST_CONFIG=test-config-ci.toml cargo test -p wild-linker --test integration_tests`
-   - selected `WILD_EXTERNAL_LINKER=ld|lld|mold cargo test -p wild-linker --features mold_tests --test integration_tests <test>`
-   - `WILD_IGNORE_SKIP=mold cargo test -p wild-linker --features mold_tests --test integration_tests` for a controlled failure census.
+   - `SLD_TEST_CONFIG=test-config-ci.toml cargo test -p sld-linker --test integration_tests`
+   - selected `SLD_EXTERNAL_LINKER=ld|lld|mold cargo test -p sld-linker --features mold_tests --test integration_tests <test>`
+   - `SLD_IGNORE_SKIP=mold cargo test -p sld-linker --features mold_tests --test integration_tests` for a controlled failure census.
 
 6. Expand mold as an integration-test reference.
    Mold is now enabled for a couple of low-noise fixtures, but most mold comparison still lives in

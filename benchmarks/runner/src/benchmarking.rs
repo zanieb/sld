@@ -38,7 +38,7 @@ pub(crate) fn run_bench(args: &BenchArgs, config: &Config) -> Result {
 
     let benchmarks = find_benchmarks(args, config)?;
 
-    let benchmarks = filter_benchmarks_by_wild_version(benchmarks, &bins);
+    let benchmarks = filter_benchmarks_by_sld_version(benchmarks, &bins);
 
     println!("Binaries:");
     for bin in &bins {
@@ -197,8 +197,8 @@ fn timed_run_groups(num_bins: usize, batch_size: u32) -> Vec<TimedRunGroup> {
 
 fn extra_flags_for_run(bin: &Bin, bench: &Benchmark, measure_memory: bool) -> Vec<String> {
     let mut extra_flags = bench.config.extra_flags.clone();
-    if bin.identifier.kind == LinkerKind::Wild {
-        extra_flags.extend(bench.config.wild_extra_flags.clone());
+    if bin.identifier.kind == LinkerKind::Sld {
+        extra_flags.extend(bench.config.sld_extra_flags.clone());
     }
     if measure_memory {
         extra_flags.push("--no-fork".to_owned());
@@ -593,7 +593,7 @@ fn run_once(
     bench: &Benchmark,
     args: &BenchArgs,
     extra_flags: &[String],
-    check_wild_log: bool,
+    check_sld_log: bool,
     measure_memory: bool,
 ) -> Result<Option<Run>> {
     if !bench.supports_bin(bin) {
@@ -646,8 +646,8 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
-    if should_verify_wild_incremental_log(bin, bench, check_wild_log) {
-        verify_wild_incremental_log(&output_path, &bench.config.expect_wild_log)?;
+    if should_verify_sld_incremental_log(bin, bench, check_sld_log) {
+        verify_sld_incremental_log(&output_path, &bench.config.expect_sld_log)?;
     }
 
     // However long we took to run, sleep for half of that. If the linker forked on startup, then
@@ -678,20 +678,20 @@ fn output_path_for_bin(tmp: &Path, bin: &Bin) -> std::path::PathBuf {
     path
 }
 
-fn should_verify_wild_incremental_log(bin: &Bin, bench: &Benchmark, check_wild_log: bool) -> bool {
-    check_wild_log
-        && bin.identifier.kind == LinkerKind::Wild
-        && !bench.config.expect_wild_log.is_empty()
+fn should_verify_sld_incremental_log(bin: &Bin, bench: &Benchmark, check_sld_log: bool) -> bool {
+    check_sld_log
+        && bin.identifier.kind == LinkerKind::Sld
+        && !bench.config.expect_sld_log.is_empty()
 }
 
-fn verify_wild_incremental_log(output_path: &Path, expected: &[String]) -> Result {
+fn verify_sld_incremental_log(output_path: &Path, expected: &[String]) -> Result {
     let path = incremental_log_path(output_path);
     let log = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read Wild incremental log `{}`", path.display()))?;
+        .with_context(|| format!("Failed to read Sld incremental log `{}`", path.display()))?;
     for expected in expected {
         if !log.contains(expected) {
             bail!(
-                "Wild incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
+                "Sld incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
                 path.display()
             );
         }
@@ -767,11 +767,11 @@ fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> 
     Ok(benchmarks)
 }
 
-/// Filter benchmarks to just those that have at least one supported Wild version.
-fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -> Vec<Benchmark> {
-    let Some(maximum_wild_version) = bins
+/// Filter benchmarks to just those that have at least one supported Sld version.
+fn filter_benchmarks_by_sld_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -> Vec<Benchmark> {
+    let Some(maximum_sld_version) = bins
         .iter()
-        .filter(|&bin| bin.identifier.kind == LinkerKind::Wild)
+        .filter(|&bin| bin.identifier.kind == LinkerKind::Sld)
         .map(|bin| &bin.identifier.effective_version)
         .max()
     else {
@@ -781,7 +781,7 @@ fn filter_benchmarks_by_wild_version(benchmarks: Vec<Benchmark>, bins: &[Bin]) -
     benchmarks
         .into_iter()
         .filter(|bench| {
-            if !bench.supports_wild_version(maximum_wild_version) {
+            if !bench.supports_sld_version(maximum_sld_version) {
                 println!("Skipping benchmark {bench} due to minimum version requirement");
                 false
             } else {
@@ -800,9 +800,9 @@ mod tests {
     use super::mutate_elf_section_byte;
     use super::mutate_inputs;
     use super::output_path_for_bin;
-    use super::should_verify_wild_incremental_log;
+    use super::should_verify_sld_incremental_log;
     use super::verify_output_changed;
-    use super::verify_wild_incremental_log;
+    use super::verify_sld_incremental_log;
     use crate::BenchArgs;
     use crate::Benchmark;
     use crate::Bin;
@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn wild_incremental_log_expectations_must_match() {
+    fn sld_incremental_log_expectations_must_match() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
         let log_path = incremental_log_path(&output);
@@ -991,7 +991,7 @@ mod tests {
         )
         .unwrap();
 
-        verify_wild_incremental_log(
+        verify_sld_incremental_log(
             &output,
             &[
                 "patched 1 changed input file".to_owned(),
@@ -1000,20 +1000,20 @@ mod tests {
         )
         .unwrap();
 
-        let error = verify_wild_incremental_log(&output, &["reused existing output".to_owned()])
+        let error = verify_sld_incremental_log(&output, &["reused existing output".to_owned()])
             .unwrap_err();
 
         assert!(error.to_string().contains("did not contain expected text"));
     }
 
     #[test]
-    fn wild_incremental_log_expectations_skip_warmup() {
-        let wild = Bin {
+    fn sld_incremental_log_expectations_skip_warmup() {
+        let sld = Bin {
             index: 0,
-            path: PathBuf::from("/bin/wild"),
+            path: PathBuf::from("/bin/sld"),
             identifier: LinkerIdentifier {
-                kind: LinkerKind::Wild,
-                version: "wild 0.0.0".to_owned(),
+                kind: LinkerKind::Sld,
+                version: "sld 0.0.0".to_owned(),
                 variant: None,
                 hash: None,
                 effective_version: vec![0, 0, 0],
@@ -1034,14 +1034,14 @@ mod tests {
             name: "incremental".to_owned(),
             path: PathBuf::from("/tmp/save/run-with"),
             config: BenchConfig {
-                expect_wild_log: vec!["reused existing output".to_owned()],
+                expect_sld_log: vec!["reused existing output".to_owned()],
                 ..BenchConfig::default()
             },
         };
 
-        assert!(!should_verify_wild_incremental_log(&wild, &bench, false));
-        assert!(should_verify_wild_incremental_log(&wild, &bench, true));
-        assert!(!should_verify_wild_incremental_log(&mold, &bench, true));
+        assert!(!should_verify_sld_incremental_log(&sld, &bench, false));
+        assert!(should_verify_sld_incremental_log(&sld, &bench, true));
+        assert!(!should_verify_sld_incremental_log(&mold, &bench, true));
     }
 
     #[test]
@@ -1063,10 +1063,10 @@ mod tests {
         };
         let bin = Bin {
             index: 0,
-            path: PathBuf::from("/bin/wild"),
+            path: PathBuf::from("/bin/sld"),
             identifier: LinkerIdentifier {
-                kind: LinkerKind::Wild,
-                version: "wild 0.0.0".to_owned(),
+                kind: LinkerKind::Sld,
+                version: "sld 0.0.0".to_owned(),
                 variant: None,
                 hash: None,
                 effective_version: vec![0, 0, 0],
@@ -1094,10 +1094,10 @@ mod tests {
     fn benchmark_output_paths_are_isolated_by_linker() {
         let bin = Bin {
             index: 7,
-            path: PathBuf::from("/bin/wild"),
+            path: PathBuf::from("/bin/sld"),
             identifier: LinkerIdentifier {
-                kind: LinkerKind::Wild,
-                version: "wild 0.0.0".to_owned(),
+                kind: LinkerKind::Sld,
+                version: "sld 0.0.0".to_owned(),
                 variant: None,
                 hash: None,
                 effective_version: vec![0, 0, 0],

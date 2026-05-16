@@ -82,10 +82,10 @@ pub struct Config {
     #[arg(long, value_delimiter = ',', value_parser = parse_string_equality)]
     pub equiv: Vec<(String, String)>,
 
-    /// Apply defaults for things that should be ignored currently for Wild. These defaults are
-    /// subject to change as Wild changes.
+    /// Apply defaults for things that should be ignored currently for Sld. These defaults are
+    /// subject to change as Sld changes.
     #[arg(long)]
-    pub wild_defaults: bool,
+    pub sld_defaults: bool,
 
     /// Print information about what sections did and didn't get diffed.
     #[arg(long)]
@@ -144,7 +144,7 @@ impl Config {
         Self::parse()
     }
 
-    fn apply_wild_defaults(&mut self, arch: ArchKind) {
+    fn apply_sld_defaults(&mut self, arch: ArchKind) {
         self.ignore.extend(
             [
                 // We don't currently support allocating space except in sections, so we have
@@ -209,13 +209,13 @@ impl Config {
                 "rel.match_failed.R_X86_64_GOTPC32_TLSDESC",
                 "rel.match_failed.R_X86_64_CODE_4_GOTPC32_TLSDESC",
                 "rel.missing-opt.R_X86_64_TLSDESC_CALL.SkipTlsDescCall.*",
-                // Wild eliminates GOTPCRELX in statically linked executables even for undefined
+                // Sld eliminates GOTPCRELX in statically linked executables even for undefined
                 // symbols, whereas other linkers don't. This is a valid optimisation that other
                 // linkers don't currently do.
                 "rel.extra-opt.R_X86_64_GOTPCRELX.CallIndirectToRelative.static-*",
-                // Wild applies MovIndirectToLea relaxation to _DYNAMIC symbol in static builds
+                // Sld applies MovIndirectToLea relaxation to _DYNAMIC symbol in static builds
                 // because it's marked as NON_INTERPOSABLE. GNU ld keeps the GOT-relative access.
-                // Both are correct, but Wild's approach is more optimized.
+                // Both are correct, but Sld's approach is more optimized.
                 "rel.extra-opt.R_X86_64_REX_GOTPCRELX.MovIndirectToLea.static-*",
                 // We don't yet support emitting warnings.
                 "section.gnu.warning",
@@ -249,19 +249,19 @@ impl Config {
                 // If we don't optimise a TLS access, then we'll have references to __tls_get_addr,
                 // when GNU ld doesn't.
                 "dynsym.__tls_get_addr.*",
-                // GNU ld emits two segments, whereas wild emits only a single segment.
+                // GNU ld emits two segments, whereas sld emits only a single segment.
                 "segment.LOAD.R.*",
                 // We haven't provided an implementation that is compatible with existing linkers.
                 "segment.PHDR.*",
                 "segment.GNU_RELRO.*",
                 "segment.GNU_STACK.*",
-                // Wild currently generates PT_NOTE even for non-alloc note sections, while the
+                // Sld currently generates PT_NOTE even for non-alloc note sections, while the
                 // other linkers don't.
                 "segment.NOTE.*",
                 // TODO: RISC-V
                 "segment.LOAD.RW.alignment",
                 // TODO: Latest lld sometimes doesn’t create a .note.gnu.property section even when
-                // Wild does.
+                // Sld does.
                 "segment.GNU_PROPERTY.alignment",
                 "segment.GNU_PROPERTY.flags",
                 // TODO: We consider SFrame sections experimental and disabled by default.
@@ -272,7 +272,7 @@ impl Config {
                 // whether range-extension thunks are needed varies.
                 "rel.plt.extra-thunk",
                 "rel.plt.absent-thunk",
-                // On some systems Wild outputs these symbols while GNU ld does not.
+                // On some systems Sld outputs these symbols while GNU ld does not.
             ]
             .into_iter()
             .map(ToOwned::to_owned),
@@ -291,7 +291,7 @@ impl Config {
                     // Also on Alpine Linux, aarch64, it seems that GNU ld is emitting an
                     // unnecessary GLOB_DAT relocation in a GOT entry.
                     "rel.missing-got-dynamic.executable",
-                    // GNU ld replaces calls to undefined symbols with nop. Wild instead encodes
+                    // GNU ld replaces calls to undefined symbols with nop. Sld instead encodes
                     // bl 0x0 so that if the call site is reached, it will crash rather than
                     // silently continuing execution.
                     "rel.missing-opt.R_AARCH64_CALL26.ReplaceWithNop.*",
@@ -327,7 +327,7 @@ impl Config {
                     "literal-byte-mismatch*",
                     "error.*",
                     "section-diff-failed*",
-                    // GNU ld replaces calls to undefined symbols with nop. Wild instead encodes
+                    // GNU ld replaces calls to undefined symbols with nop. Sld instead encodes
                     // bl 0x0 so that if the call site is reached, it will crash rather than
                     // silently continuing execution.
                     "rel.missing-opt.R_LARCH_B26.ReplaceWithNop.*",
@@ -355,8 +355,8 @@ impl Config {
     #[must_use]
     pub fn to_arg_string(&self) -> String {
         let mut out = String::new();
-        if self.wild_defaults {
-            out.push_str("--wild-defaults ");
+        if self.sld_defaults {
+            out.push_str("--sld-defaults ");
         }
         if !self.ignore.is_empty() {
             out.push_str("--ignore '");
@@ -578,7 +578,7 @@ impl Report {
     pub fn from_config(mut config: Config) -> Result<Report> {
         // This changes mutable global state, which isn't an ideal thing to be doing from a library.
         // It's expedient though, and we don't really expect linker-diff to get used as a library
-        // anywhere except the linker-diff binary and wild's integration tests, so this probably
+        // anywhere except the linker-diff binary and sld's integration tests, so this probably
         // isn't a big deal.
         match config.colour {
             Colour::Auto => colored::control::unset_override(),
@@ -623,8 +623,8 @@ impl Report {
 
         let arch = ArchKind::from_objects(&objects)?;
 
-        if config.wild_defaults {
-            config.apply_wild_defaults(arch);
+        if config.sld_defaults {
+            config.apply_sld_defaults(arch);
         }
 
         let mut report = Report {
@@ -921,7 +921,7 @@ impl<'data> NameIndex<'data> {
             }
 
             if let Ok(mut name) = sym.name_bytes() {
-                // Wild doesn't emit local symbols that start with ".L". The other linkers mostly do
+                // Sld doesn't emit local symbols that start with ".L". The other linkers mostly do
                 // the same. However, GNU ld and lld, if they encounter a GOT-forming relocation to
                 // such a symbol, even if they then optimise away the GOT-forming relocation, will
                 // emit the symbol. This behaviour seems weird and not worth replicating, so we just

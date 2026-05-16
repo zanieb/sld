@@ -205,72 +205,72 @@ impl Display for BenchmarkDisplay<'_> {
             )?;
         }
         if self.mode == ReportMode::Time {
-            write_wild_speedups(f, self.benchmark, self.mode)?;
+            write_sld_speedups(f, self.benchmark, self.mode)?;
             if let Some(baseline) = self.baseline {
-                write_incremental_wild_speedups(f, self.benchmark, baseline, self.mode)?;
+                write_incremental_sld_speedups(f, self.benchmark, baseline, self.mode)?;
             }
         }
         Ok(())
     }
 }
 
-fn wild_batch(benchmark: &BenchmarkResult) -> Option<&BatchResult> {
+fn sld_batch(benchmark: &BenchmarkResult) -> Option<&BatchResult> {
     benchmark
         .batches
         .iter()
-        .find(|batch| batch.bin.identifier.kind == LinkerKind::Wild)
+        .find(|batch| batch.bin.identifier.kind == LinkerKind::Sld)
 }
 
-fn write_wild_speedups(
+fn write_sld_speedups(
     f: &mut std::fmt::Formatter<'_>,
     benchmark: &BenchmarkResult,
     mode: ReportMode,
 ) -> std::fmt::Result {
-    let Some(wild) = wild_batch(benchmark) else {
+    let Some(sld) = sld_batch(benchmark) else {
         return Ok(());
     };
-    let wild_mean = mean(wild, mode);
-    if wild_mean <= 0.0 {
+    let sld_mean = mean(sld, mode);
+    if sld_mean <= 0.0 {
         return Ok(());
     }
 
     for batch in &benchmark.batches {
-        if batch.bin.identifier.kind == LinkerKind::Wild {
+        if batch.bin.identifier.kind == LinkerKind::Sld {
             continue;
         }
         writeln!(
             f,
-            "  Wild speedup over {bin}: {speedup:.2}x",
+            "  Sld speedup over {bin}: {speedup:.2}x",
             bin = batch.bin,
-            speedup = mean(batch, mode) / wild_mean,
+            speedup = mean(batch, mode) / sld_mean,
         )?;
     }
     Ok(())
 }
 
-fn write_incremental_wild_speedups(
+fn write_incremental_sld_speedups(
     f: &mut std::fmt::Formatter<'_>,
     benchmark: &BenchmarkResult,
     baseline: &BenchmarkResult,
     mode: ReportMode,
 ) -> std::fmt::Result {
-    let Some(incremental_wild) = wild_batch(benchmark) else {
+    let Some(incremental_sld) = sld_batch(benchmark) else {
         return Ok(());
     };
-    let incremental_mean = mean(incremental_wild, mode);
+    let incremental_mean = mean(incremental_sld, mode);
     if incremental_mean <= 0.0 {
         return Ok(());
     }
 
     for batch in &baseline.batches {
-        let baseline_name = if batch.bin.identifier.kind == LinkerKind::Wild {
-            "Wild".to_owned()
+        let baseline_name = if batch.bin.identifier.kind == LinkerKind::Sld {
+            "Sld".to_owned()
         } else {
             batch.bin.to_string()
         };
         writeln!(
             f,
-            "  Wild incremental speedup over {baseline} {baseline_name}: {speedup:.2}x",
+            "  Sld incremental speedup over {baseline} {baseline_name}: {speedup:.2}x",
             baseline = baseline.config.name,
             speedup = mean(batch, mode) / incremental_mean,
         )?;
@@ -474,7 +474,7 @@ fn compute_step(max: u32) -> u32 {
 
 fn colour_for(linker: LinkerKind) -> &'static str {
     match linker {
-        LinkerKind::Wild => "#00FF00",
+        LinkerKind::Sld => "#00FF00",
         LinkerKind::Lld => "#0000FF",
         LinkerKind::Mold => "#FF00FF",
         LinkerKind::Bfd => "#009999",
@@ -526,9 +526,9 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn time_stats_include_wild_speedup_against_other_linkers() {
+    fn time_stats_include_sld_speedup_against_other_linkers() {
         let benchmark = benchmark_result(vec![
-            batch(LinkerKind::Wild, Duration::from_millis(25)),
+            batch(LinkerKind::Sld, Duration::from_millis(25)),
             batch(LinkerKind::Mold, Duration::from_millis(100)),
             batch(LinkerKind::Bfd, Duration::from_millis(250)),
         ]);
@@ -540,14 +540,14 @@ mod tests {
         }
         .to_string();
 
-        assert!(display.contains("Wild speedup over Mold 1.0.0: 4.00x"));
-        assert!(display.contains("Wild speedup over GNU ld 1.0.0: 10.00x"));
+        assert!(display.contains("Sld speedup over Mold 1.0.0: 4.00x"));
+        assert!(display.contains("Sld speedup over GNU ld 1.0.0: 10.00x"));
     }
 
     #[test]
     fn memory_stats_do_not_report_speedup() {
         let benchmark = benchmark_result(vec![
-            batch(LinkerKind::Wild, Duration::from_millis(25)),
+            batch(LinkerKind::Sld, Duration::from_millis(25)),
             batch(LinkerKind::Mold, Duration::from_millis(100)),
         ]);
 
@@ -566,14 +566,14 @@ mod tests {
         let baseline = benchmark_result_with_name(
             "ruff",
             vec![
-                batch(LinkerKind::Wild, Duration::from_millis(100)),
+                batch(LinkerKind::Sld, Duration::from_millis(100)),
                 batch(LinkerKind::Mold, Duration::from_millis(150)),
                 batch(LinkerKind::Bfd, Duration::from_millis(250)),
             ],
         );
         let incremental = benchmark_result_with_name(
             "ruff-incremental-changed",
-            vec![batch(LinkerKind::Wild, Duration::from_millis(25))],
+            vec![batch(LinkerKind::Sld, Duration::from_millis(25))],
         );
 
         let display = BenchmarkDisplay {
@@ -583,15 +583,15 @@ mod tests {
         }
         .to_string();
 
-        assert!(display.contains("Wild incremental speedup over ruff Wild: 4.00x"));
-        assert!(display.contains("Wild incremental speedup over ruff Mold 1.0.0: 6.00x"));
-        assert!(display.contains("Wild incremental speedup over ruff GNU ld 1.0.0: 10.00x"));
+        assert!(display.contains("Sld incremental speedup over ruff Sld: 4.00x"));
+        assert!(display.contains("Sld incremental speedup over ruff Mold 1.0.0: 6.00x"));
+        assert!(display.contains("Sld incremental speedup over ruff GNU ld 1.0.0: 10.00x"));
     }
 
     #[test]
     fn no_fork_time_runs_stay_in_time_report() {
         let mut benchmark =
-            benchmark_result(vec![batch(LinkerKind::Wild, Duration::from_millis(25))]);
+            benchmark_result(vec![batch(LinkerKind::Sld, Duration::from_millis(25))]);
         benchmark.batches[0].runs[0]
             .extra_flags
             .push("--no-fork".to_owned());
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn measured_memory_runs_stay_in_memory_report() {
         let mut benchmark =
-            benchmark_result(vec![batch(LinkerKind::Wild, Duration::from_millis(25))]);
+            benchmark_result(vec![batch(LinkerKind::Sld, Duration::from_millis(25))]);
         benchmark.batches[0].runs[0].measure_memory = true;
 
         let time = ReportMode::Time.filter(&benchmark, &BenchConfig::default());

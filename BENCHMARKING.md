@@ -1,13 +1,13 @@
-# Benchmarking Wild
+# Benchmarking Sld
 
 ## Benchmarking against other linkers
 
-If you decide to benchmark Wild against other linkers, in order to make it a fair comparison, you
-should ensure that the other linkers aren't doing work on something that Wild doesn't support. In
+If you decide to benchmark Sld against other linkers, in order to make it a fair comparison, you
+should ensure that the other linkers aren't doing work on something that Sld doesn't support. In
 particular:
 
-* Wild defaults to `--gc-sections`, so for a fair comparison, that should be passed to all the linkers.
-* Wild defaults to `-z now`, so best to pass that to all linkers.
+* Sld defaults to `--gc-sections`, so for a fair comparison, that should be passed to all the linkers.
+* Sld defaults to `-z now`, so best to pass that to all linkers.
 
 ## How to benchmark
 
@@ -15,11 +15,11 @@ particular:
 
 For benchmarking the linker, it's preferable to run just the linker, not the whole build process.
 
-The way to do that is by capturing the linker invocation so that it can be rerun. Wild has a
+The way to do that is by capturing the linker invocation so that it can be rerun. Sld has a
 built-in way to do that.
 
 You can benchmark linking of either a debug or a release build of a crate, this depends on what
-comparisons you wish to make, or what change in wild you want to quantify.
+comparisons you wish to make, or what change in sld you want to quantify.
 
 Follow-these steps:
 
@@ -27,45 +27,45 @@ Follow-these steps:
   and make sure it builds with `cargo build` (for a rust project)
     * Examples: [`ripgrep`](https://github.com/BurntSushi/ripgrep.git)
 * Clean the build using `cargo clean`
-* To force the build of your chosen crate to link using wild, we have a couple of options:
-    * Prefix the cargo build command with `RUSTFLAGS="-Clinker=clang -Clink-arg=--ld-path=wild"`
+* To force the build of your chosen crate to link using sld, we have a couple of options:
+    * Prefix the cargo build command with `RUSTFLAGS="-Clinker=clang -Clink-arg=--ld-path=sld"`
     * Modify (or add) the `.cargo/config.toml` file in your chosen crate (example for `ripgrep`)
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-Clink-arg=--ld-path=wild"]
+rustflags = ["-Clink-arg=--ld-path=sld"]
 ```
 
-* Make sure that you have a version of wild in your `$PATH` so that it will be used (try `which
-  wild` to check)
-* Run `WILD_SAVE_BASE=/tmp/wild/ripgrep cargo build` in the crate's root directory (include
+* Make sure that you have a version of sld in your `$PATH` so that it will be used (try `which
+  sld` to check)
+* Run `SLD_SAVE_BASE=/tmp/sld/ripgrep cargo build` in the crate's root directory (include
   `RUSTFLAGS` as above if you have chosen that method)
-* You will get a few numbered subdirectories in `/tmp/wild/ripgrep` as part of the build process.
+* You will get a few numbered subdirectories in `/tmp/sld/ripgrep` as part of the build process.
     * Directories will be created for builds of build scripts, proc macros and crate binaries built
     * Usually the last numbered subdirectory will be the build of crate's binary (if a single binary
       is built)
-    * You can check what each file is linking using `tail -n 1 /tmp/wild/ripgrep/*/run-with`
+    * You can check what each file is linking using `tail -n 1 /tmp/sld/ripgrep/*/run-with`
     * In the case of ripgrep it is '6'
-* You can then run `/tmp/wild/ripgrep/6/run-with wild` and that will rerun the link with wild
+* You can then run `/tmp/sld/ripgrep/6/run-with sld` and that will rerun the link with sld
 
-When you run `run-with wild`, the linker may print warnings for unsupported flags. It's a good idea
+When you run `run-with sld`, the linker may print warnings for unsupported flags. It's a good idea
 to edit the `run-with` script to change / delete these flags. This will make comparison with other
 linkers more fair, since some of these unsupported flags may involve other linkers doing significant
 amounts of extra work.
 
 ### Benchmarking incremental mode
 
-The benchmark runner can pass extra flags for specific benchmark entries. To measure Wild's
+The benchmark runner can pass extra flags for specific benchmark entries. To measure Sld's
 incremental no-change path for an existing save-dir, add another benchmark entry that points at the
-same save-dir and passes `--incremental` only to Wild:
+same save-dir and passes `--incremental` only to Sld:
 
 ```toml
 [bench.ripgrep-incremental]
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
-expect_wild_log = ["reused existing output before loading inputs"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["reused existing output before loading inputs"]
 ```
 
 The runner performs a warmup run first, so the timed runs measure reuse of the incremental state.
@@ -76,7 +76,7 @@ entry with `path` and `section` flips the first byte of that ELF section instead
 when the benchmark should prove that changed inputs also change the linked output. A table entry
 with `grow` increases the ELF section size by that many bytes, provided there is padding before the
 next object structure. To let the linked output absorb grown sections instead of relying only on
-alignment padding, pass `--incremental-padding-percent=N` in `wild_extra_flags`. The warmup run is
+alignment padding, pass `--incremental-padding-percent=N` in `sld_extra_flags`. The warmup run is
 not mutated, so it seeds the initial incremental state; each timed run then measures a real
 changed-input relink. Use `expect_output_change = true` with section mutations when you want the
 runner to assert that the benchmarked mutation changes the linked output, not just the input file
@@ -89,7 +89,7 @@ useful for Rust objects with names like `.text._ZN...`.
 [bench.ripgrep-incremental-changed]
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = ["path/to/input.o"]
 ```
 
@@ -97,9 +97,9 @@ mutate_files = ["path/to/input.o"]
 [bench.ripgrep-incremental-changed-data]
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ path = "path/to/input.o", section = ".data" }]
-expect_wild_log = ["patched ", "changed input file before loading inputs"]
+expect_sld_log = ["patched ", "changed input file before loading inputs"]
 expect_output_change = true
 ```
 
@@ -107,67 +107,67 @@ expect_output_change = true
 [bench.ripgrep-incremental-grown-data]
 save = "ripgrep"
 skip_linkers = ["bfd", "lld", "mold"]
-wild_extra_flags = ["--incremental", "--incremental-padding-percent=25"]
+sld_extra_flags = ["--incremental", "--incremental-padding-percent=25"]
 mutate_files = [{ path = "path/to/input.o", section = ".data", grow = 1 }]
-expect_wild_log = ["patched ", "changed input file before loading inputs"]
+expect_sld_log = ["patched ", "changed input file before loading inputs"]
 expect_output_change = true
 ```
 
 ```toml
 [bench.ripgrep-incremental-changed-text]
 save = "ripgrep"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ section = ".text.*" }]
-expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_sld_log = ["patched ", "changed input", "before loading inputs"]
 expect_output_change = true
 ```
 
 The checked-in `benchmarks/incremental-linux.toml` file uses that automatic input discovery for
 `ruff`, `ty`, and `uv`, and leaves `bfd`, `lld`, and `mold` enabled so the same changed-input run can
-show Wild incremental speedup against the default linker and mold. When `report --print-stats` sees
-paired full and incremental benchmarks, it also prints the incremental speedup over the full Wild
+show Sld incremental speedup against the default linker and mold. When `report --print-stats` sees
+paired full and incremental benchmarks, it also prints the incremental speedup over the full Sld
 link for the same project.
 
 The checked-in incremental Linux benchmarks pass `--no-fork` to linkers that support it. This keeps
-Wild and mold timings on the actual linker process and prevents incremental timed runs from racing
+Sld and mold timings on the actual linker process and prevents incremental timed runs from racing
 with a still-running forked child that is writing incremental state.
 
 Those same benchmarks pin explicit changed-input object sections. The automatic section selector is
 useful for ad-hoc experiments, but large Rust debug links can contain early objects with anonymous
 patch metadata that should fall back instead of patching.
 
-`expect_wild_log` is optional, but useful when benchmarking incremental mode: after the warmup
-that seeds incremental state, it fails timed Wild runs whose incremental log doesn't contain the
+`expect_sld_log` is optional, but useful when benchmarking incremental mode: after the warmup
+that seeds incremental state, it fails timed Sld runs whose incremental log doesn't contain the
 expected fast-path message, so you don't accidentally measure a full fallback relink.
 
 ### Run benchmark with hyperfine
 
-Let's benchmark the linking stage between `ld`, `mold` and `wild`, discarding the first two runs of
+Let's benchmark the linking stage between `ld`, `mold` and `sld`, discarding the first two runs of
 each to reduce the effects of cache warmup
 
 ```shell
-hyperfine --warmup 2 '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+hyperfine --warmup 2 '/tmp/sld/ripgrep/6/run-with ld' '/tmp/sld/ripgrep/6/run-with mold' '/tmp/sld/ripgrep/6/run-with sld'
 ```
 
 That should produce output similar to this (with different values):
 
 ```text
-Benchmark 1: /tmp/wild/ripgrep/6/run-with ld
+Benchmark 1: /tmp/sld/ripgrep/6/run-with ld
   Time (mean ± σ):     954.1 ms ±  13.6 ms    [User: 683.4 ms, System: 268.8 ms]
   Range (min … max):   920.6 ms … 970.7 ms    10 runs
  
-Benchmark 2: /tmp/wild/ripgrep/6/run-with mold
+Benchmark 2: /tmp/sld/ripgrep/6/run-with mold
   Time (mean ± σ):     146.1 ms ±   3.6 ms    [User: 52.0 ms, System: 2.4 ms]
   Range (min … max):   139.1 ms … 154.7 ms    19 runs
  
-Benchmark 3: /tmp/wild/ripgrep/6/run-with wild
+Benchmark 3: /tmp/sld/ripgrep/6/run-with sld
   Time (mean ± σ):      87.7 ms ±   2.8 ms    [User: 2.4 ms, System: 2.0 ms]
   Range (min … max):    81.5 ms …  92.5 ms    34 runs
  
 Summary
-  /tmp/wild/ripgrep/6/run-with wild ran
-    1.67 ± 0.07 times faster than /tmp/wild/ripgrep/6/run-with mold
-   10.88 ± 0.38 times faster than /tmp/wild/ripgrep/6/run-with ld
+  /tmp/sld/ripgrep/6/run-with sld ran
+    1.67 ± 0.07 times faster than /tmp/sld/ripgrep/6/run-with mold
+   10.88 ± 0.38 times faster than /tmp/sld/ripgrep/6/run-with ld
 ```
 
 ### Run benchmark with poop
@@ -177,13 +177,13 @@ An alternative tool to hyperfine, that reports some additional metrics is [`poop
 Like hyperfine it takes a number of commands and runs each a number of times and gathers statistics about each tune.
 
 ```shell
-poop '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+poop '/tmp/sld/ripgrep/6/run-with ld' '/tmp/sld/ripgrep/6/run-with mold' '/tmp/sld/ripgrep/6/run-with sld'
 ```
 
 It should produce output similar to this (with different numbers!):
 
 ```text
-Benchmark 1 (5 runs): /tmp/wild/ripgrep/6/run-with ld
+Benchmark 1 (5 runs): /tmp/sld/ripgrep/6/run-with ld
   measurement          mean ± σ            min … max           outliers         delta
   wall_time          1.18s  ±  335ms     926ms … 1.68s           0 ( 0%)        0%
   peak_rss            288MB ±  276KB     287MB …  288MB          1 (20%)        0%
@@ -193,7 +193,7 @@ Benchmark 1 (5 runs): /tmp/wild/ripgrep/6/run-with ld
   cache_misses       41.9M  ± 2.52M     40.3M  … 46.3M           0 ( 0%)        0%
   branch_misses      9.77M  ±  223K     9.62M  … 10.2M           0 ( 0%)        0%
 
-Benchmark 2 (31 runs): /tmp/wild/ripgrep/6/run-with mold
+Benchmark 2 (31 runs): /tmp/sld/ripgrep/6/run-with mold
   measurement          mean ± σ            min … max           outliers         delta
   wall_time           165ms ± 27.2ms     149ms …  280ms          2 ( 6%)        ⚡- 86.0% ±  9.9%
   peak_rss           7.84MB ± 96.3KB    7.60MB … 8.00MB         11 (35%)        ⚡- 97.3% ±  0.0%
@@ -203,7 +203,7 @@ Benchmark 2 (31 runs): /tmp/wild/ripgrep/6/run-with mold
   cache_misses       21.6M  ±  461K     21.3M  … 23.6M           3 (10%)        ⚡- 48.4% ±  2.3%
   branch_misses      7.17M  ± 37.7K     7.07M  … 7.25M           1 ( 3%)        ⚡- 26.6% ±  0.8%
 
-Benchmark 3 (56 runs): /tmp/wild/ripgrep/6/run-with wild
+Benchmark 3 (56 runs): /tmp/sld/ripgrep/6/run-with sld
   measurement          mean ± σ            min … max           outliers         delta
   wall_time          89.1ms ± 3.14ms    83.0ms … 96.6ms          0 ( 0%)        ⚡- 92.4% ±  7.0%
   peak_rss           3.82MB ± 50.7KB    3.80MB … 3.93MB         10 (18%)        ⚡- 98.7% ±  0.0%
@@ -214,23 +214,23 @@ Benchmark 3 (56 runs): /tmp/wild/ripgrep/6/run-with wild
   branch_misses      3.49M  ± 7.86K     3.47M  … 3.51M           0 ( 0%)        ⚡- 64.2% ±  0.6%
 ```
 
-NOTE: Both `mold` and `wild` fork a child process and perform linking in it. Thus, the values for
+NOTE: Both `mold` and `sld` fork a child process and perform linking in it. Thus, the values for
 `peak_rss`, `User` and `System` are for the parent process only, and hence are not representative of
-real use by the linker. To avoid this problem, pass `--no-fork` to mold and wild.
+real use by the linker. To avoid this problem, pass `--no-fork` to mold and sld.
 
 NOTE: `poop` uses the first command as the reference the others are compared against, so if focusing
-on wild, you might want to re-order the commands and invoke `poop` thus:
+on sld, you might want to re-order the commands and invoke `poop` thus:
 
 ```text
-poop '/tmp/wild/ripgrep/6/run-with wild' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with ld'
+poop '/tmp/sld/ripgrep/6/run-with sld' '/tmp/sld/ripgrep/6/run-with mold' '/tmp/sld/ripgrep/6/run-with ld'
 ```
 
 ### Comparisons
 
 Using this method, you can benchmark:
 
-* between Wild and one or more other linkers
-* between different options passed to Wild - You can pass arbitrary additional arguments to run-with.
+* between Sld and one or more other linkers
+* between different options passed to Sld - You can pass arbitrary additional arguments to run-with.
   The first argument needs to be the name of the linker to use. All additional arguments are passed through to the
   linker as-is
 
@@ -274,7 +274,7 @@ sudo mount -t tmpfs none /benchmark
 Then when running the benchmark, set the output file to be on this filesystem. e.g.:
 
 ```sh
-OUT=/benchmark/out hyperfine --warmup 2 '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+OUT=/benchmark/out hyperfine --warmup 2 '/tmp/sld/ripgrep/6/run-with ld' '/tmp/sld/ripgrep/6/run-with mold' '/tmp/sld/ripgrep/6/run-with sld'
 ```
 
 ### Watch out for thermal throttling
@@ -306,41 +306,41 @@ Before building rustc, edit or create `bootstrap.toml` in your `rust` directory 
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-Clink-arg=--ld-path=wild"]
+rustflags = ["-Clink-arg=--ld-path=sld"]
 ```
 
-Now rustc will use wild as the linker on every build. You must have wild in your PATH.
-In the following command, replace `$WILD_REPO_PATH` with the path to the directory containing the wild repo. You'll
-need to have already built wild with `cargo build --release`.
+Now rustc will use sld as the linker on every build. You must have sld in your PATH.
+In the following command, replace `$SLD_REPO_PATH` with the path to the directory containing the sld repo. You'll
+need to have already built sld with `cargo build --release`.
 
 To build rustc just cd into the rust repo root and run:
 
 ```sh
-PATH="$WILD_REPO_PATH/target/release:$PATH" WILD_SAVE_BASE=/tmp/rustc-link ./x build rustc
+PATH="$SLD_REPO_PATH/target/release:$PATH" SLD_SAVE_BASE=/tmp/rustc-link ./x build rustc
 ```
 
 For more information about building rustc see [building instructions on the rustc-dev-guide](https://rustc-dev-guide.rust-lang.org/building/how-to-build-and-run.html).
 You should now have a few subdirectories under `/tmp/rustc-link`. You can identify which one is
 `rustc_driver` by looking at the last line of the `run-with` script in each directory.
 
-If the directory `/tmp/rustc-link` didn't get created, then most likely wild wasn't used to
+If the directory `/tmp/rustc-link` didn't get created, then most likely sld wasn't used to
 link.
 
 ### Other tools
 
 * [poop](https://github.com/andrewrk/poop) - gives a lot of measurements other than just time. Note
-  that the `peak_rss` measurement won't be accurate for wild and mold unless you include the
+  that the `peak_rss` measurement won't be accurate for sld and mold unless you include the
   `--no-fork` argument to the linker.
 
 ## Profiling
 
 ### --time
 
-To figure out where wild is spending time, the first option is to run with `--time`. It's
+To figure out where sld is spending time, the first option is to run with `--time`. It's
 recommended to combine this with `--no-fork`. For example:
 
 ```
-~/tmp/rustc-link/0/run-with target/release/wild --strip-debug --time --no-fork
+~/tmp/rustc-link/0/run-with target/release/sld --strip-debug --time --no-fork
 ┌───    3.84 Open input files
 ├───    7.45 Split archives
 ├───    9.59 Parse input files
@@ -396,10 +396,10 @@ Start by building with the `perfetto` feature enabled:
 cargo build --release --features perfetto
 ```
 
-Run the linker with `WILD_PERFETTO_OUT` set to some file. e.g.:
+Run the linker with `SLD_PERFETTO_OUT` set to some file. e.g.:
 
 ```sh
-WILD_PERFETTO_OUT=$HOME/tmp/tmp.pftrace ./run-with wild
+SLD_PERFETTO_OUT=$HOME/tmp/tmp.pftrace ./run-with sld
 ```
 
 Open the [perfetto UI](https://ui.perfetto.dev/). Click "Open trace file" and select `tmp.pftrace`.
@@ -418,7 +418,7 @@ cargo build --profile opt-debug
 ```
 
 ```sh
-~/tmp/rustc-link/0/run-with samply record target/opt-debug/wild --strip-debug
+~/tmp/rustc-link/0/run-with samply record target/opt-debug/sld --strip-debug
 ```
 
 The result will look something [like this](https://share.firefox.dev/4eORM7r). This is using the
@@ -443,7 +443,7 @@ cargo build --profile opt-debug --features dhat
 Then run the linker on some input. e.g:
 
 ```sh
-~/tmp/rustc-link/0/run-with target/opt-debug/wild --no-fork
+~/tmp/rustc-link/0/run-with target/opt-debug/sld --no-fork
 ```
 
 This should print some stats on exit. e.g.:

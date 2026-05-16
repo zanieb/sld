@@ -30,15 +30,15 @@
 
       # Route all uses through here so we are
       # testing it the way most users will use the derivation
-      # Which is `import wild`
+      # Which is `import sld`
       overlays.default = import self;
 
-      # Output Wild as a stand-alone package.
+      # Output Sld as a stand-alone package.
       packages = forAllSystems (system: {
-        default = common.${system}.pkgs.wild;
+        default = common.${system}.pkgs.sld-unwrapped;
       });
 
-      # Tests to ensure Wild continues working on Nixos
+      # Tests to ensure Sld continues working on Nixos
       # We run unit tests, and some smoke tests that are in Nixpkgs.
       checks = forAllSystems (
         system:
@@ -53,13 +53,13 @@
             ;
 
           # Use the crane-cached build artifacts to speed up building the unit tests.
-          wild = pkgs.wild-unwrapped.overrideAttrs (old: {
+          sld = pkgs.sld-unwrapped.overrideAttrs (old: {
             stdenv = p: p.stdenvNoCC;
 
             doCheck = true;
             doInstallCheck = false;
             # Skip the build phase and don't install anything
-            # because it ends up building libwild twice. Once for the buildPhase,
+            # because it ends up building libsld twice. Once for the buildPhase,
             # once for the checkPhase.
             dontBuild = true;
             installPhase = "touch $out";
@@ -67,7 +67,7 @@
         }
       );
 
-      # devShell for developing Wild
+      # devShell for developing Sld
       devShells = forAllSystems (system: {
         default = common.${system}.pkgs.callPackage ./nix/shell.nix { };
       });

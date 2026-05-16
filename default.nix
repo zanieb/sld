@@ -10,5 +10,5 @@ let
   craneLib = import craneSrc { pkgs = final; };
 in
 {
-  wild-unwrapped = final.callPackage ./nix { inherit craneLib; };
+  sld-unwrapped = final.callPackage ./nix { inherit craneLib; };
 }

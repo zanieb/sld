@@ -35,10 +35,10 @@ def parse_args() -> argparse.Namespace:
         help="root directory for per-platform reports",
     )
     parser.add_argument(
-        "--wild",
+        "--sld",
         type=Path,
-        default=Path("target/release/wild"),
-        help="native macOS wild binary",
+        default=Path("target/release/sld"),
+        help="native macOS sld binary",
     )
     parser.add_argument(
         "--rustup-toolchain",
@@ -86,15 +86,15 @@ def parse_args() -> argparse.Namespace:
         help="platform lane to run; repeatable; defaults to both",
     )
     parser.add_argument(
-        "--skip-linux-wild-build",
+        "--skip-linux-sld-build",
         action="store_true",
-        help="reuse the Linux wild binary already built in the Linux work dir",
+        help="reuse the Linux sld binary already built in the Linux work dir",
     )
     parser.add_argument(
-        "--linux-wild-profile",
+        "--linux-sld-profile",
         choices=["debug", "release"],
         default="debug",
-        help="profile used to build wild inside the Linux container (default: debug)",
+        help="profile used to build sld inside the Linux container (default: debug)",
     )
     parser.add_argument(
         "--print-crates",
@@ -147,8 +147,8 @@ def run_macos(args: argparse.Namespace, root: Path) -> int:
         str(root / "scripts" / "validate-top-crates.py"),
         "--work-dir",
         str(work_dir),
-        "--wild",
-        str(args.wild.resolve()),
+        "--sld",
+        str(args.sld.resolve()),
         *validation_args(args),
     ]
     return run(command, root)
@@ -157,16 +157,16 @@ def run_macos(args: argparse.Namespace, root: Path) -> int:
 def linux_shell_command(args: argparse.Namespace, root: Path) -> str:
     linux_base = container_path(root, args.work_dir)
     linux_work = f"{linux_base}/linux"
-    linux_wild_target = f"{linux_base}/linux-wild-target"
-    profile_dir = "release" if args.linux_wild_profile == "release" else "debug"
-    linux_wild = f"{linux_wild_target}/{profile_dir}/wild"
+    linux_sld_target = f"{linux_base}/linux-sld-target"
+    profile_dir = "release" if args.linux_sld_profile == "release" else "debug"
+    linux_sld = f"{linux_sld_target}/{profile_dir}/sld"
     pieces = [
         "set -euo pipefail",
         "export PATH=/usr/local/rustup/toolchains/1.95.0-aarch64-unknown-linux-gnu/bin:/usr/local/cargo/bin:$PATH",
     ]
-    if not args.skip_linux_wild_build:
-        build = ["cargo", "build", "--bin", "wild", "--target-dir", linux_wild_target]
-        if args.linux_wild_profile == "release":
+    if not args.skip_linux_sld_build:
+        build = ["cargo", "build", "--bin", "sld", "--target-dir", linux_sld_target]
+        if args.linux_sld_profile == "release":
             build.insert(2, "--release")
         pieces.append(shell_join(build))
     validate = [
@@ -174,8 +174,8 @@ def linux_shell_command(args: argparse.Namespace, root: Path) -> str:
         "/work/scripts/validate-top-crates.py",
         "--work-dir",
         linux_work,
-        "--wild",
-        linux_wild,
+        "--sld",
+        linux_sld,
         *validation_args(args),
     ]
     pieces.append(shell_join(validate))

@@ -8,6 +8,5 @@ aranges = "aranges"
 [files]
 extend-exclude = [
   "external_test_suites",
-  "wild/tests/bins",
+  "sld/tests/bins",
 ]
-

@@ -874,19 +874,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "libtest-mimic"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14e6ba06f0ade6e504aff834d7c34298e5155c6baca353cc6a4aaff2f9fd7f33"
-dependencies = [
- "anstream 1.0.0",
- "anstyle",
- "clap",
- "escape8259",
-]
-
-[[package]]
-name = "libwild"
+name = "libsld"
 version = "0.8.0"
 dependencies = [
  "anyhow",
@@ -939,6 +927,18 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zstd",
+]
+
+[[package]]
+name = "libtest-mimic"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14e6ba06f0ade6e504aff834d7c34298e5155c6baca353cc6a4aaff2f9fd7f33"
+dependencies = [
+ "anstream 1.0.0",
+ "anstyle",
+ "clap",
+ "escape8259",
 ]
 
 [[package]]
@@ -1778,6 +1778,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
+name = "sld-linker"
+version = "0.8.0"
+dependencies = [
+ "ar",
+ "dhat",
+ "foldhash 0.2.0",
+ "gimli 0.33.0",
+ "hex",
+ "itertools",
+ "libloading",
+ "libsld",
+ "libtest-mimic",
+ "linker-diff",
+ "linker-layout",
+ "mimalloc",
+ "object 0.39.1",
+ "os_info",
+ "regex",
+ "serde",
+ "serde-keyvalue",
+ "strum",
+ "tempfile",
+ "toml",
+ "wait-timeout",
+ "which",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2251,34 +2279,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "wild-linker"
-version = "0.8.0"
-dependencies = [
- "ar",
- "dhat",
- "foldhash 0.2.0",
- "gimli 0.33.0",
- "hex",
- "itertools",
- "libloading",
- "libtest-mimic",
- "libwild",
- "linker-diff",
- "linker-layout",
- "mimalloc",
- "object 0.39.1",
- "os_info",
- "regex",
- "serde",
- "serde-keyvalue",
- "strum",
- "tempfile",
- "toml",
- "wait-timeout",
- "which",
 ]
 
 [[package]]

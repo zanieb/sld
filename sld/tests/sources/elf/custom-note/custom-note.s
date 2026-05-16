@@ -1,0 +1,45 @@
+/*
+//#LinkArgs:-shared -z now --gc-sections
+//#RunEnabled:false
+//#EnableLinker:mold
+//#Contains:FOOBAR
+//#Contains:HELLO_WORLD
+//#DiffIgnore:section.got
+//#DiffIgnore:section.eh_frame
+//#DiffIgnore:section.eh_frame_hdr
+//#DiffIgnore:eh_frame.*
+//#DiffIgnore:segment.GNU_EH_FRAME.*
+//#DiffIgnore:segment.RISCV_ATTRIBUTES.*
+// Sld emits `.riscv.attributes`, but GNU ld does not
+//#DiffIgnore:riscv_attributes.*
+*/
+
+.section .note.foo,"a",@note
+.align 4
+
+/* name length, desc length, type */
+.long 7
+.long 8
+.long 1
+
+.asciz "FOOBAR"
+.align 4
+
+.quad 0x1122334455667788
+.align 4
+
+/* Non-alloc note section */
+
+.section .note.hello,"",@note
+.align 4
+
+/* name length, desc length, type */
+.long 12
+.long 8
+.long 1
+
+.asciz "HELLO_WORLD"
+.align 4
+
+.quad 0x1122334455667788
+.align 4

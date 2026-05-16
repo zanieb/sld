@@ -1,4 +1,4 @@
-# Releasing wild
+# Releasing sld
 
 * Manually trigger the release workflow to verify that it still works.
 * Run `git cliff {previous version}...`

@@ -1,11 +1,11 @@
-# Wild linker
+# Sld linker
 
-Wild is a linker with the goal of being very fast for iterative development.
+Sld is a linker with the goal of being very fast for iterative development.
 
 The plan is to eventually make it fully incremental. Initial incremental support can reuse an
 existing output for unchanged relinks, update rewritten inputs whose contents are unchanged, and
 patch some same-layout changed object files in place. It still conservatively falls back to a full
-relink when arguments change or when an input change is outside the currently patchable subset. Wild
+relink when arguments change or when an input change is outside the currently patchable subset. Sld
 is already pretty fast even without fully general fine-grained incremental updates.
 
 ## Installation
@@ -13,27 +13,27 @@ is already pretty fast even without fully general fine-grained incremental updat
 ### From GitHub releases
 
 Download a tarball from the [releases page](https://github.com/wild-linker/wild/releases). Unpack
-it and copy the `wild` binary somewhere on your path.
+it and copy the `sld` binary somewhere on your path.
 
 ### Cargo binstall
 
-If you have [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), you can install wild as
+If you have [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), you can install sld as
 follows:
 
 ```sh
-cargo binstall wild-linker
+cargo binstall sld-linker
 ```
 
 ### Brew
 
 ```sh
-brew install wild-linker/wild/wild
+brew install sld-linker/sld/sld
 ```
 
 ### Build latest release from crates.io
 
 ```sh
-cargo install --locked wild-linker
+cargo install --locked sld-linker
 ```
 
 ### Build from git head
@@ -41,53 +41,53 @@ cargo install --locked wild-linker
 To build and install the latest, unreleased code:
 
 ```sh
-cargo install --locked --bin wild --git https://github.com/wild-linker/wild.git wild-linker
+cargo install --locked --bin sld --git https://github.com/wild-linker/wild.git sld-linker
 ```
 
 ### Nix
 
-To use a stable Wild from Nixpkgs:
+To use a stable Sld from Nixpkgs:
 
 ```nix
 let
- wildStdenv = pkgs.useWildLinker pkgs.stdenv;
+ sldStdenv = pkgs.useWildLinker pkgs.stdenv;
 in
-pkgs.callPackage ./package { stdenv = wildStdenv; }  
+pkgs.callPackage ./package { stdenv = sldStdenv; }
 ```
 
-to use the latest unstable git revision of wild, see [the nix documentation](./nix/nix.md)
+to use the latest unstable git revision of sld, see [the nix documentation](./nix/nix.md)
 
 ## Using as your default linker
 
-If you'd like to use Wild as your default linker for building Rust code, you can put the following
+If you'd like to use Sld as your default linker for building Rust code, you can put the following
 in `~/.cargo/config.toml`.
 
 On Linux:
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-Clink-arg=--ld-path=wild"]
+rustflags = ["-Clink-arg=--ld-path=sld"]
 ```
 
-Alternatively, you can create symlink `ld.wild` pointing to `wild` and use:
+Alternatively, you can create symlink `ld.sld` pointing to `sld` and use:
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-Clink-arg=-fuse-ld=wild"]
+rustflags = ["-Clink-arg=-fuse-ld=sld"]
 ```
 The above steps also work for clang when building C/C++ code, just add the following to your LDFLAGS
-after adding the `ld.wild` symlink:
+after adding the `ld.sld` symlink:
 ```
-export LDFLAGS="${LDFLAGS} -fuse-ld=wild"
+export LDFLAGS="${LDFLAGS} -fuse-ld=sld"
 ```
 
-Starting with GCC **16.1**, use `-fuse-ld=wild`.
+Starting with GCC **16.1**, use `-fuse-ld=sld`.
 
 For older GCC releases, you can make it force use it with the [-Bprefix](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html#index-B) option.
-Create a symlink `ld` pointing to `wild` and pass the directory containing it to gcc. For example you can do the following:
+Create a symlink `ld` pointing to `sld` and pass the directory containing it to gcc. For example you can do the following:
 
 ```sh
-ln -s /usr/bin/wild /tmp/ld
+ln -s /usr/bin/sld /tmp/ld
 ```
 
 And when compiling C/C++ code pass the directory containing `ld` to your `CFLAGS`, `CXXFLAGS`, and `LDFLAGS`:
@@ -98,7 +98,7 @@ export CXXFLAGS="${CXXFLAGS} -B/tmp"
 export LDFLAGS="${LDFLAGS} -B/tmp"
 ```
 
-Afterwards you can check if wild was used for linking with [readelf](#how-can-i-verify-that-wild-was-used-to-link-a-binary)
+Afterwards you can check if sld was used for linking with [readelf](#how-can-i-verify-that-sld-was-used-to-link-a-binary)
 
 On Illumos:
 ```
@@ -107,14 +107,14 @@ On Illumos:
 linker = "/usr/bin/clang"
 
 rustflags = [
-    # Will silently delegate to GNU ld or Sun ld unless the absolute path to Wild is provided.
-    "-Clink-arg=-fuse-ld=/absolute/path/to/wild"
+    # Will silently delegate to GNU ld or Sun ld unless the absolute path to Sld is provided.
+    "-Clink-arg=-fuse-ld=/absolute/path/to/sld"
 ]
 ```
 
-## Using wild in CI
+## Using sld in CI
 
-If you'd like to use Wild as your linker for Rust code in CI, see
+If you'd like to use Sld as your linker for Rust code in CI, see
 [wild-action](https://github.com/wild-linker/action).
 
 ## Q&A
@@ -122,8 +122,8 @@ If you'd like to use Wild as your linker for Rust code in CI, see
 ### Why another linker?
 
 Mold is already very fast, however it doesn't do incremental linking and the author has stated that
-they don't intend to. Wild has initial incremental support, and fine-grained incremental updates are
-the end-goal. By writing Wild in Rust, it's hoped that the complexity of incremental linking will be
+they don't intend to. Sld has initial incremental support, and fine-grained incremental updates are
+the end-goal. By writing Sld in Rust, it's hoped that the complexity of incremental linking will be
 achievable.
 
 ### What's working?
@@ -141,8 +141,8 @@ The following is working with the caveat that there may be bugs:
 * Output to statically linked, position-independent binaries (static-PIE)
 * Output to dynamically linked binaries
 * Output to shared objects (.so files)
-* Rust proc-macros, when linked with Wild work
-* Most of the top downloaded crates on crates.io have been tested with Wild and pass their tests
+* Rust proc-macros, when linked with Sld work
+* Most of the top downloaded crates on crates.io have been tested with Sld and pass their tests
 * Debug info
 * GNU jobserver support
 * Partial linker script support. See the [linker script support matrix](LINKER_SCRIPT_SUPPORT.md) for details.
@@ -157,7 +157,7 @@ Here are some of the larger things that aren't yet done, roughly sorted by curre
 * Windows support
 * Linker plugin LTO (initial support is behind `--features=plugins`).
 
-### How can I verify that Wild was used to link a binary?
+### How can I verify that Sld was used to link a binary?
 
 Install `readelf` (available from binutils package), then run:
 
@@ -168,7 +168,7 @@ readelf --string-dump .comment my-executable
 Look for a line like:
 
 ```
-Linker: Wild version 0.1.0
+Linker: Sld version 0.1.0
 ```
 
 You can probably also get away with `strings` (also available from binutils package):
@@ -179,13 +179,12 @@ strings my-executable | grep 'Linker:'
 
 ### Where did the name come from?
 
-It's somewhat of a tradition for linkers to end with the letters "ld". e.g. "GNU ld, "gold", "lld",
-"mold". Since the end-goal is for the linker to be incremental, an "I" is added. Let's say the "W"
-stands for "Wild", since recursive acronyms are popular in open-source projects.
+It's somewhat of a tradition for linkers to end with the letters "ld". e.g. "GNU ld", "gold", "lld",
+and "mold". The new name keeps that convention while staying short and direct.
 
 ## Benchmarks
 
-The goal of Wild is to eventually be very fast via fine-grained incremental linking. However, we
+The goal of Sld is to eventually be very fast via fine-grained incremental linking. However, we
 also want to be as fast as we can be for non-incremental linking and for the initial link when
 incremental linking is enabled.
 
@@ -215,10 +214,10 @@ benchmark shows the time to link it.
 
 ![Benchmark of linking librustc-driver](benchmarks/images/ryzen-9955hx/librustc-driver-time.svg)
 
-For something much smaller, this is the time to link Wild itself. This also shows a few different
-Wild versions, so you can see how the link time has been tracking over releases.
+For something much smaller, this is the time to link Sld itself. This also shows a few different
+Sld versions, so you can see how the link time has been tracking over releases.
 
-![Benchmark of linking wild](benchmarks/images/ryzen-9955hx/wild-time.svg)
+![Benchmark of linking sld](benchmarks/images/ryzen-9955hx/sld-time.svg)
 
 ### Raspberry Pi 5
 
@@ -228,35 +227,35 @@ Here's linking rust-analyzer on a Raspberry Pi 5.
 
 ## Linking Rust code
 
-The following is a `cargo test` command-line that can be used to build and test a crate using Wild.
+The following is a `cargo test` command-line that can be used to build and test a crate using Sld.
 This has been run successfully on a few popular crates (e.g. ripgrep, serde, tokio, rand, bitflags).
-It assumes that the "wild" binary is on your path. It also depends on the Clang compiler being
+It assumes that the "sld" binary is on your path. It also depends on the Clang compiler being
 installed, since GCC doesn't allow using an arbitrary linker.
 
 ```sh
-RUSTFLAGS="-Clinker=clang -Clink-args=--ld-path=wild" cargo test
+RUSTFLAGS="-Clinker=clang -Clink-args=--ld-path=sld" cargo test
 ```
 
-Alternatively, with `ld.wild` symlink pointing at `wild`:
+Alternatively, with `ld.sld` symlink pointing at `sld`:
 ```sh
-RUSTFLAGS="-Clinker=clang -Clink-args=-fuse-ld=wild" cargo test
+RUSTFLAGS="-Clinker=clang -Clink-args=-fuse-ld=sld" cargo test
 ```
 
 ## Contributing
 
-For more information on contributing to `wild` see [CONTRIBUTING.md](CONTRIBUTING.md).
+For more information on contributing to `sld` see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-For a high-level overview of Wild's design, see [DESIGN.md](DESIGN.md).
+For a high-level overview of Sld's design, see [DESIGN.md](DESIGN.md).
 
 ## Chat server
 
-We have a Zulip server for Wild-related chat. You can join
+We have a Zulip server for Sld-related chat. You can join
 [here](https://wild.zulipchat.com/join/bbopdeg6howwjpaiyowngyde/).
 
 ## Further reading
 
 Many of the posts on [David's blog](https://davidlattimore.github.io/) are about various aspects of
-the Wild linker.
+the Sld linker.
 
 ## Sponsorship
 
@@ -266,7 +265,7 @@ time.
 
 # Code of Conduct
 
-The Wild project adheres to the [Rust code of
+The Sld project adheres to the [Rust code of
 conduct](https://rust-lang.org/policies/code-of-conduct/). If you have any moderation concerns or
 queries, please email wild-mod@googlegroups.com.
 
@@ -276,5 +275,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT l
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-Wild by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+Sld by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.

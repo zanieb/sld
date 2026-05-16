@@ -6,11 +6,11 @@ extra_flags = ["--no-fork"]
 [bench.ruff-incremental-changed]
 save = "ruff"
 extra_flags = ["--no-fork"]
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [
     { path = "target/debug/deps/ruff-97b83edfab006427.0epmqdiwnctp21cl253fm8yeg.1rkncx1.rcgu.o", section = '.text._ZN66_$LT$std..io..error..ErrorKind$u20$as$u20$core..cmp..PartialEq$GT$2eq17h00b51f958e969d1aE' },
 ]
-expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_sld_log = ["patched ", "changed input", "before loading inputs"]
 expect_output_change = true
 
 [bench.ty]
@@ -19,11 +19,11 @@ extra_flags = ["--no-fork"]
 [bench.ty-incremental-changed]
 save = "ty"
 extra_flags = ["--no-fork"]
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [
     { path = "target/debug/deps/ty-6b097ce2c151f925.301d7lq2frwscfe04aip3otkt.08tspgb.rcgu.o", section = '.text._ZN4core5alloc6layout6Layout4size17h005485b6e7bc1477E' },
 ]
-expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_sld_log = ["patched ", "changed input", "before loading inputs"]
 expect_output_change = true
 
 [bench.uv]
@@ -32,9 +32,9 @@ extra_flags = ["--no-fork"]
 [bench.uv-incremental-changed]
 save = "uv"
 extra_flags = ["--no-fork"]
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [
     { path = "target/debug/deps/uv-a84460553452fe05.4c8m9hv1ts5eyts3dv9y5nioy.18iaon1.rcgu.o", section = '.text._ZN9hashbrown3map11make_hasher17h07aec2e3d5e39bceE' },
 ]
-expect_wild_log = ["patched ", "changed input", "before loading inputs"]
+expect_sld_log = ["patched ", "changed input", "before loading inputs"]
 expect_output_change = true

@@ -83,7 +83,7 @@ allow_unsafe = true
 [pkg.rayon]
 allow_unsafe = true
 
-[pkg.wild]
+[pkg.sld]
 allow_unsafe = true
 allow_apis = [
     "fs",
@@ -134,7 +134,7 @@ allow_unsafe = true
 [pkg.tracing-subscriber]
 allow_unsafe = true
 
-[pkg.libwild]
+[pkg.libsld]
 allow_unsafe = true
 test.allow_unsafe = true
 allow_apis = [
@@ -402,9 +402,9 @@ from.test.allow_apis = [
 
 [api.fs]
 no_auto_detect = [
-    "wild",
+    "sld",
 ]
 include = [
     "rustix::fs",
-    "libwild::fs",
+    "libsld::fs",
 ]
