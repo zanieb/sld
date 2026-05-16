@@ -14,7 +14,7 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
 
     # Include sld
     sld = {
-      url = "github:wild-linker/wild";
+      url = "path:/path/to/sld";
       # If using the sld Flake (not required)
       # inputs.nixpkgs.follows = "nixpkgs";
       #
@@ -64,7 +64,8 @@ until NixOS 25.11 is branched, unstable Nixpkgs is required.
 ```
 Without flakes (npins shown, but any solution can be used):
 
-Add the dependencies to lockfile with npins: `$ npins add github wild-linker wild -b main`
+Add the dependencies to your lockfile with npins or another pinning tool before using the example
+below.
 
 ```nix
 let

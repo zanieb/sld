@@ -12,8 +12,8 @@ is already pretty fast even without fully general fine-grained incremental updat
 
 ### From GitHub releases
 
-Download a tarball from the [releases page](https://github.com/wild-linker/wild/releases). Unpack
-it and copy the `sld` binary somewhere on your path.
+Download a tarball from this repository's releases page. Unpack it and copy the `sld` binary
+somewhere on your path.
 
 ### Cargo binstall
 
@@ -34,14 +34,6 @@ brew install sld-linker/sld/sld
 
 ```sh
 cargo install --locked sld-linker
-```
-
-### Build from git head
-
-To build and install the latest, unreleased code:
-
-```sh
-cargo install --locked --bin sld --git https://github.com/wild-linker/wild.git sld-linker
 ```
 
 ### Nix
@@ -102,11 +94,6 @@ rustflags = [
     "-Clink-arg=-fuse-ld=/absolute/path/to/sld"
 ]
 ```
-
-## Using sld in CI
-
-If you'd like to use sld as your linker for Rust code in CI, see
-[wild-action](https://github.com/wild-linker/action).
 
 ## Q&A
 
@@ -238,11 +225,6 @@ For more information on contributing to `sld` see [CONTRIBUTING.md](CONTRIBUTING
 
 For a high-level overview of sld's design, see [DESIGN.md](DESIGN.md).
 
-## Chat server
-
-We have a Zulip server for sld-related chat. You can join
-[here](https://wild.zulipchat.com/join/bbopdeg6howwjpaiyowngyde/).
-
 ## Further reading
 
 Many of the posts on [David's blog](https://davidlattimore.github.io/) are about various aspects of
@@ -257,8 +239,7 @@ time.
 # Code of Conduct
 
 The sld project adheres to the [Rust code of
-conduct](https://rust-lang.org/policies/code-of-conduct/). If you have any moderation concerns or
-queries, please email wild-mod@googlegroups.com.
+conduct](https://rust-lang.org/policies/code-of-conduct/).
 
 ## License
 

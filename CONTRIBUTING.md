@@ -36,18 +36,6 @@ consideration when doing your next PR. That's a better use of both your time and
 Please refer to the [Rust
 guidelines](https://forge.rust-lang.org/how-to-start-contributing.html#etiquette) on this topic.
 
-## Options for communicating
-
-Feel free to start a [discussion](https://github.com/wild-linker/wild/discussions), open an [issue](https://github.com/wild-linker/wild/issues), or start a thread on our [Zulip](https://wild.zulipchat.com/).
-
-You're also welcome to reach out directly to the [maintainers](GOVERNANCE.md#maintainers).
-
-## Meetings
-
-We try to have about one video call per month. To add this to your calendar, join the
-[wild-dev-meetings](https://groups.google.com/g/wild-dev-meetings) google group. If this doesn't
-work for some reason, come and talk to us on Zulip and we'll try to find another way to add you.
-
 ## Ways you can contribute
 
 * Use `sld` and let us know your experiences, or file issues for problems found.
@@ -351,8 +339,7 @@ linkers need to do.
 * If you'd like to work on something that someone said they're working on, but they haven't provided
   an update in a while, feel free to politely ask if they're still working on it and mention that if
   they're not, you'd like to have a go.
-* We may on occasion tag issues as [good first
-  issue](https://github.com/wild-linker/wild/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+* We may on occasion tag issues as good first issue.
   One person's good-first-issue might be too hard or too easy for another person, so this is a
   somewhat hard judgement to make.
 * You're welcome to help out with other unassigned issues too, even if they don't have tags. If

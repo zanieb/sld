@@ -86,7 +86,7 @@ jobs:
 
       - name: Create tarballs
         run: |
-          n="wild-linker-${VERSION_TAG}-${{ matrix.target }}"
+          n="sld-linker-${VERSION_TAG}-${{ matrix.target }}"
           mkdir "$n"
           cp "target/${{ matrix.target }}/dist/sld" "$n"
           cp README.md LICENSE* CHANGELOG.md "$n"
@@ -100,4 +100,4 @@ jobs:
           body_path: REL.md
           draft: true
           files: |
-            wild-linker-*.tar.gz
+            sld-linker-*.tar.gz
