@@ -9,4 +9,4 @@ of the API.
 Alternative APIs may be added in future based on actual use-cases. Until such use-cases arise
 though, it's hard to determine what those APIs should look like.
 
-For more details about the sld linker, see the repository README.
+For more details about the sld linker, see the [project overview](../context/project-overview.md).

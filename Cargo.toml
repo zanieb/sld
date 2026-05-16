@@ -13,7 +13,7 @@ resolver = "2"
 [workspace.package]
 license = "MIT OR Apache-2.0"
 version = "0.8.0"
-readme = "README.md"
+readme = "context/project-overview.md"
 rust-version = "1.94"
 edition = "2024"
 

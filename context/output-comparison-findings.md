@@ -84,8 +84,8 @@ Confirmed Mach-O shortcoming from a normal clang-driver path:
 
 Visible Mach-O future-work areas from source inspection:
 
-- `README.md` still lists Mach-O support under "What isn't yet supported?" despite the existing
-  partial implementation.
+- Repository-level overview material should describe Mach-O support as partial rather than absent;
+  the implementation and test surface already exist in-tree.
 - `libsld/src/macho_aarch64.rs` still has many `todo!()` architecture hooks.
 - `libsld/src/macho.rs` has TODOs around optional segments, section kind derivation, sorting, and
   moved data types.
