@@ -364,14 +364,16 @@ pub(crate) fn verify_allocations_message() -> String {
     }
 }
 
-pub(crate) fn split_output_by_group<'layout, 'data, 'out, P: Platform>(
-    layout: &'layout Layout<'data, P>,
-    writable_buckets: &'out mut OutputSectionPartMap<&mut [u8]>,
-) -> Vec<(
+type SplitOutputByGroupResult<'layout, 'data, 'out, P> = (
     &'layout GroupLayout<'data, P>,
     OutputSectionPartMap<&'out mut [u8]>,
     OutputSectionPartMap<usize>,
-)> {
+);
+
+pub(crate) fn split_output_by_group<'layout, 'data, 'out, P: Platform>(
+    layout: &'layout Layout<'data, P>,
+    writable_buckets: &'out mut OutputSectionPartMap<&mut [u8]>,
+) -> Vec<SplitOutputByGroupResult<'layout, 'data, 'out, P>> {
     timing_phase!("Split output buffers by group");
     let mut part_file_offsets = layout
         .section_part_layouts

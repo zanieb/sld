@@ -214,6 +214,8 @@ struct BuildIdHashState {
     tree_hash: Option<String>,
 }
 
+type BuildIdHashStateAndTree = (Option<BuildIdHashState>, Option<Vec<[u8; blake3::OUT_LEN]>>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileState {
     path: String,
@@ -492,8 +494,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
     let current_sld_version = sld_version(args);
-    if sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version).is_some()
-    {
+    if sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version).is_some() {
         return Ok(false);
     }
     if !previous.output.identity_matches_path(args.output())? {
@@ -661,12 +662,12 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
 
-    if !rewritten_inputs.is_empty() || checked_ambiguous_inputs {
-        if let Some(mut metadata) = PersistedState::read_metadata(&state_dir)? {
-            refresh_rewritten_input_identities(&mut metadata, &rewritten_inputs);
-            metadata.link_start = current_link_start;
-            metadata.write_metadata_update(&state_dir)?;
-        }
+    if (!rewritten_inputs.is_empty() || checked_ambiguous_inputs)
+        && let Some(mut metadata) = PersistedState::read_metadata(&state_dir)?
+    {
+        refresh_rewritten_input_identities(&mut metadata, &rewritten_inputs);
+        metadata.link_start = current_link_start;
+        metadata.write_metadata_update(&state_dir)?;
     }
     if !rewritten_inputs.is_empty() {
         append_log(
@@ -1096,7 +1097,7 @@ fn patch_changed_inputs(
                     &matched_sections,
                     &previous.dynamic_relocations,
                     &previous.sections,
-                )?);
+                ));
             }
             let eh_frame_patches = if let Some(previous_bytes) = previous_snapshot_bytes.as_deref()
             {
@@ -1208,7 +1209,9 @@ fn patch_changed_inputs(
                 } else {
                     false
                 };
-                let allows_fde_addition = if !input_fde_add_candidates.is_empty() {
+                let allows_fde_addition = if input_fde_add_candidates.is_empty() {
+                    false
+                } else {
                     if let Some(previous_bytes) = previous_snapshot_bytes.as_deref() {
                         object_diff_allows_fde_addition(
                             previous_bytes,
@@ -1220,8 +1223,6 @@ fn patch_changed_inputs(
                     } else {
                         false
                     }
-                } else {
-                    false
                 };
                 let metadata_only_fingerprint_matches = !records_complete
                     && previous.sections.is_empty()
@@ -1432,7 +1433,7 @@ fn patch_changed_inputs(
         fde_add_candidates.extend(input_fde_add_candidates);
     }
 
-    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
+    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
@@ -1592,7 +1593,7 @@ fn patch_changed_inputs(
         &mut previous.input_files,
         changed_inputs.iter().map(|(input_index, _)| *input_index),
     );
-    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs)? {
+    if let Some(reason) = input_content_mismatch_reason(&expected_changed_inputs) {
         return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
     }
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
@@ -1823,7 +1824,7 @@ fn patch_output_range_rejection_reason(patches: &[SectionPatch]) -> Option<Strin
 fn apply_addend_delta(data: &mut [u8], addend_delta: i64) -> std::result::Result<(), String> {
     match data.len() {
         4 => {
-            let value = i32::from_le_bytes(data.try_into().unwrap()) as i64;
+            let value = i64::from(i32::from_le_bytes(data.try_into().unwrap()));
             let adjusted = value
                 .checked_add(addend_delta)
                 .and_then(|value| i32::try_from(value).ok())
@@ -3009,8 +3010,7 @@ impl PersistedState {
             "build-id-hash\t{}",
             self.build_id_hashes
                 .as_ref()
-                .map(render_build_id_hash_state)
-                .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+                .map_or_else(|| ABSENT_FIELD.to_owned(), render_build_id_hash_state)
         )
         .unwrap();
         let mut input_indices = input_indices.to_vec();
@@ -3070,8 +3070,7 @@ impl PersistedState {
             "build-id-hash\t{}",
             self.build_id_hashes
                 .as_ref()
-                .map(render_build_id_hash_state)
-                .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+                .map_or_else(|| ABSENT_FIELD.to_owned(), render_build_id_hash_state)
         )
         .unwrap();
         writeln!(&mut out, "inputs\t{}", self.input_files.len()).unwrap();
@@ -3201,22 +3200,22 @@ impl PersistedState {
         for relocation in &self.relocations {
             let section_input_id =
                 section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-            let (target_section_input_id, target_section_index, target_section_offset) = relocation
-                .target
-                .as_ref()
-                .map(|target| {
+            let (target_section_input_id, target_section_index, target_section_offset) =
+                relocation.target.as_ref().map_or(
                     (
-                        section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
-                            .to_string(),
-                        target.section_index.to_string(),
-                        target.section_offset.to_string(),
-                    )
-                })
-                .unwrap_or((
-                    ABSENT_FIELD.to_owned(),
-                    ABSENT_FIELD.to_owned(),
-                    ABSENT_FIELD.to_owned(),
-                ));
+                        ABSENT_FIELD.to_owned(),
+                        ABSENT_FIELD.to_owned(),
+                        ABSENT_FIELD.to_owned(),
+                    ),
+                    |target| {
+                        (
+                            section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
+                                .to_string(),
+                            target.section_index.to_string(),
+                            target.section_offset.to_string(),
+                        )
+                    },
+                );
             writeln!(
                 &mut out,
                 "reloc2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -3230,8 +3229,7 @@ impl PersistedState {
                 relocation.addend,
                 relocation
                     .written_value
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| ABSENT_FIELD.to_owned()),
+                    .map_or_else(|| ABSENT_FIELD.to_owned(), |value| value.to_string()),
                 relocation.target_value,
                 relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
                 target_section_input_id,
@@ -3587,8 +3585,9 @@ impl DynamicRelocationRecord {
         output_info: Option<(u64, u64)>,
     ) -> Self {
         let (output_r_offset, output_r_info) = output_info
-            .map(|(r_offset, r_info)| (Some(r_offset), Some(r_info)))
-            .unwrap_or((None, None));
+            .map_or((None, None), |(r_offset, r_info)| {
+                (Some(r_offset), Some(r_info))
+            });
         Self {
             input_file,
             input,
@@ -3992,9 +3991,9 @@ where
             dynamic_relocation_patches
                 .iter()
                 .filter_map(|patch| patch.input_range.clone())
-                .chain(relocation_addend_ranges.into_iter())
-                .chain(relocation_target_ranges.into_iter())
-                .chain(fde_relocation_ranges.into_iter()),
+                .chain(relocation_addend_ranges)
+                .chain(relocation_target_ranges)
+                .chain(fde_relocation_ranges),
         )?
         .map(|fingerprint| FilePatchState {
             fingerprint,
@@ -4929,18 +4928,18 @@ fn added_dynamic_relocation_patches_for_input(
     matched_sections: &[MatchedPatchSection],
     previous_dynamic_relocations: &[DynamicRelocationRecord],
     previous_sections: &[SectionRecord],
-) -> Result<Vec<DynamicRelocationPatch>> {
+) -> Vec<DynamicRelocationPatch> {
     if matched_sections.iter().any(|section| {
         section.previous.input != input_file_path || section.current.input != input_file_path
     }) {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let Some(current_section_headers) = elf_section_headers(current_bytes) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let Some(previous_section_headers) = elf_section_headers(previous_bytes) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let free_slots = free_dynamic_relocation_output_slots(
         previous_sections,
@@ -4949,7 +4948,7 @@ fn added_dynamic_relocation_patches_for_input(
             .filter(|record| record.size == crate::elf::RELA_ENTRY_SIZE),
     );
     if free_slots.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let previous_records = previous_dynamic_relocations
@@ -4961,7 +4960,7 @@ fn added_dynamic_relocation_patches_for_input(
         })
         .collect::<Vec<_>>();
     if previous_records.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let mut patches = Vec::new();
@@ -5001,7 +5000,7 @@ fn added_dynamic_relocation_patches_for_input(
                 continue;
             };
             let Some(output_offset) = free_slots.get(next_free_slot).copied() else {
-                return Ok(patches);
+                return patches;
             };
             next_free_slot += 1;
 
@@ -5040,7 +5039,7 @@ fn added_dynamic_relocation_patches_for_input(
         }
     }
 
-    Ok(patches)
+    patches
 }
 
 fn free_dynamic_relocation_output_slots<'a>(
@@ -5354,7 +5353,7 @@ fn dynamic_relocation_patches_for_input_bytes(
             data[8..16].copy_from_slice(&output_r_info.to_le_bytes());
             Vec::new()
         } else {
-            vec![0..16]
+            std::iter::once(0..16).collect()
         };
         data[16..24].copy_from_slice(addend);
         patches.push(DynamicRelocationPatch {
@@ -5833,7 +5832,8 @@ fn fde_patch_input_ranges_for_input_bytes(
         else {
             continue;
         };
-        let mut record_ranges = vec![file_offset + fde_range.start..file_offset + fde_range.end];
+        let mut record_ranges = Vec::with_capacity(1);
+        record_ranges.push(file_offset + fde_range.start..file_offset + fde_range.end);
         let mut supported = true;
         for entry in entries
             .into_iter()
@@ -5979,8 +5979,9 @@ fn added_fde_candidates_for_input_bytes(
                 current_record.section_index,
             )
         })
-        .map(|(_, input_offset)| input_offset)
-        .unwrap_or(current_record.input_offset);
+        .map_or(current_record.input_offset, |(_, input_offset)| {
+            input_offset
+        });
         current_record.input_offset = current_input_offset;
         matched_current_fdes.insert((current_record.section_index, current_input_offset));
         if let Some(current_fde_range) = fde_input_range(
@@ -6167,7 +6168,7 @@ fn fde_pc_begin_target(
             let Some(section_index) = symbol.section_index() else {
                 return Ok(None);
             };
-            let Some(offset) = (symbol.address() as i128)
+            let Some(offset) = i128::from(symbol.address())
                 .checked_add(i128::from(relocation.addend()))
                 .and_then(|value| u64::try_from(value).ok())
             else {
@@ -6541,11 +6542,13 @@ fn fde_relocation_patches_for_input_bytes(
             &current_record,
         )?;
 
-        let mut input_ranges = vec![
+        let mut input_ranges = Vec::with_capacity(1);
+        input_ranges.push(
             current_file_offset + current_fde_range.start
                 ..current_file_offset + current_fde_range.end,
-        ];
-        let mut preserve_ranges = vec![4..8];
+        );
+        let mut preserve_ranges = Vec::with_capacity(1);
+        preserve_ranges.push(4..8);
         let mut adjustments = Vec::new();
         let mut eh_frame_hdr_change = None;
         for (current, previous) in current_entries.iter().zip(&previous_entries) {
@@ -6696,7 +6699,9 @@ fn eh_frame_hdr_patches_for_fde_changes(
     let Ok(eh_frame_hdr_size) = usize::try_from(eh_frame_hdr_size) else {
         return Ok(Err("output .eh_frame_hdr size is too large".to_owned()));
     };
-    if eh_frame_hdr_size < header_size || (eh_frame_hdr_size - header_size) % entry_size != 0 {
+    if eh_frame_hdr_size < header_size
+        || !(eh_frame_hdr_size - header_size).is_multiple_of(entry_size)
+    {
         return Ok(Err("output .eh_frame_hdr has an invalid size".to_owned()));
     }
     let Some(eh_frame_hdr_end) = eh_frame_hdr_start.checked_add(eh_frame_hdr_size) else {
@@ -7269,11 +7274,11 @@ fn elf_section_headers(bytes: &[u8]) -> Option<Vec<ElfSectionHeader>> {
                     return None;
                 }
                 ElfSectionHeader {
-                    sh_type: read_u32_le(header.get(4..8)?)? as u64,
-                    sh_offset: read_u32_le(header.get(16..20)?)? as u64,
-                    sh_size: read_u32_le(header.get(20..24)?)? as u64,
-                    sh_info: read_u32_le(header.get(28..32)?)? as u64,
-                    sh_entsize: read_u32_le(header.get(36..40)?)? as u64,
+                    sh_type: u64::from(read_u32_le(header.get(4..8)?)?),
+                    sh_offset: u64::from(read_u32_le(header.get(16..20)?)?),
+                    sh_size: u64::from(read_u32_le(header.get(20..24)?)?),
+                    sh_info: u64::from(read_u32_le(header.get(28..32)?)?),
+                    sh_entsize: u64::from(read_u32_le(header.get(36..40)?)?),
                 }
             }
             2 => {
@@ -7281,10 +7286,10 @@ fn elf_section_headers(bytes: &[u8]) -> Option<Vec<ElfSectionHeader>> {
                     return None;
                 }
                 ElfSectionHeader {
-                    sh_type: read_u32_le(header.get(4..8)?)? as u64,
+                    sh_type: u64::from(read_u32_le(header.get(4..8)?)?),
                     sh_offset: read_u64_le(header.get(24..32)?)?,
                     sh_size: read_u64_le(header.get(32..40)?)?,
-                    sh_info: read_u32_le(header.get(44..48)?)? as u64,
+                    sh_info: u64::from(read_u32_le(header.get(44..48)?)?),
                     sh_entsize: read_u64_le(header.get(56..64)?)?,
                 }
             }
@@ -7541,7 +7546,7 @@ fn write_fast_build_id_from_state(
     let mut hash_ranges = changed_ranges.to_owned();
     hash_ranges.push(range.clone());
     let changed_chunks = touched_build_id_chunks(&hash_ranges, output.len())?;
-    if !update_build_id_hash_tree(state, tree, output, &range, &changed_chunks)? {
+    if !update_build_id_hash_tree(state, tree, output, &range, &changed_chunks) {
         return Err(crate::error!(
             "Incremental build ID hash state is incompatible with the output"
         ));
@@ -7576,10 +7581,8 @@ fn write_fast_build_id_note(
     note[16..].copy_from_slice(build_id.as_bytes());
 }
 
-fn build_id_hash_state_from_output(
-    bytes: &[u8],
-) -> Result<(Option<BuildIdHashState>, Option<Vec<[u8; blake3::OUT_LEN]>>)> {
-    let Some(range) = build_id_note_range(&bytes)? else {
+fn build_id_hash_state_from_output(bytes: &[u8]) -> Result<BuildIdHashStateAndTree> {
+    let Some(range) = build_id_note_range(bytes)? else {
         return Ok((None, None));
     };
     validate_fast_build_id_range(&range)?;
@@ -7641,18 +7644,18 @@ fn update_build_id_hash_tree(
     output: &[u8],
     zero_range: &std::ops::Range<usize>,
     changed_chunks: &[usize],
-) -> Result<bool> {
+) -> bool {
     if state.output_len != output.len() as u64 {
-        return Ok(false);
+        return false;
     }
     if Some(state.nodes) != build_id_hash_node_count(output.len()) {
-        return Ok(false);
+        return false;
     }
     if tree.len() != state.nodes {
-        return Ok(false);
+        return false;
     }
     if output.len() <= BUILD_ID_HASH_GROUP_LEN {
-        return Ok(false);
+        return false;
     }
     let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
     update_build_id_subtree_hash(tree, 0, output, 0, left_len, zero_range, changed_chunks);
@@ -7667,7 +7670,7 @@ fn update_build_id_hash_tree(
         changed_chunks,
     );
     state.tree_hash = Some(build_id_hash_tree_hash(tree));
-    Ok(true)
+    true
 }
 
 fn update_build_id_subtree_hash(
@@ -8303,11 +8306,10 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
                 section.input_size,
                 section.output_offset,
                 section.output_size,
-                section
-                    .section_name
-                    .as_ref()
-                    .map(|name| hex::encode(name.as_bytes()))
-                    .unwrap_or_else(|| ABSENT_FIELD.to_owned()),
+                section.section_name.as_ref().map_or_else(
+                    || ABSENT_FIELD.to_owned(),
+                    |name| hex::encode(name.as_bytes())
+                ),
                 section.data_hash.as_deref().unwrap_or(ABSENT_FIELD)
             )
         })
@@ -8329,8 +8331,7 @@ fn render_input_line_rest(input: &FileState) -> String {
         input
             .patch
             .as_ref()
-            .map(render_patch_sections)
-            .unwrap_or_else(|| ABSENT_FIELD.to_owned())
+            .map_or_else(|| ABSENT_FIELD.to_owned(), render_patch_sections)
     )
 }
 
@@ -8887,33 +8888,31 @@ fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileCo
     Ok(Some((bytes, content)))
 }
 
-fn input_content_mismatch_reason(
-    expected_inputs: &[ExpectedInputContent],
-) -> Result<Option<String>> {
+fn input_content_mismatch_reason(expected_inputs: &[ExpectedInputContent]) -> Option<String> {
     for expected in expected_inputs {
         let current = match read_file_with_stable_identity(&expected.path) {
             Ok(Some((bytes, _))) => FileContentState::from_bytes(&bytes),
             Ok(None) => {
-                return Ok(Some(format!(
+                return Some(format!(
                     "input file changed while incremental fast path was running: {}",
                     expected.path.display()
-                )));
+                ));
             }
             Err(error) => {
-                return Ok(Some(format!(
+                return Some(format!(
                     "input file could not be rechecked while incremental fast path was running: {} ({error:?})",
                     expected.path.display()
-                )));
+                ));
             }
         };
         if current.len != expected.len || current.hash != expected.hash {
-            return Ok(Some(format!(
+            return Some(format!(
                 "input file changed while incremental fast path was running: {}",
                 expected.path.display()
-            )));
+            ));
         }
     }
-    Ok(None)
+    None
 }
 
 fn input_identity_mismatch_reason(input_files: &[FileState]) -> Result<Option<String>> {
@@ -9246,12 +9245,7 @@ fn user_state_dir_from_env(mut env: impl FnMut(&str) -> Option<OsString>) -> Opt
         if let Some(path) = env("XDG_STATE_HOME") {
             return Some(PathBuf::from(path).join("sld"));
         }
-        env("HOME").map(|home| {
-            PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("sld")
-        })
+        env("HOME").map(|home| PathBuf::from(home).join(".local").join("state").join("sld"))
     }
 }
 
@@ -10691,8 +10685,7 @@ mod tests {
             &[MatchedPatchSection::same(patch_section.clone())],
             std::slice::from_ref(&relocation),
             &sections,
-        )
-        .unwrap();
+        );
 
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].record.relocation_offset, 6);
@@ -13787,14 +13780,10 @@ mod tests {
         std::fs::write(&path, b"abcd").unwrap();
         let expected = ExpectedInputContent::from_bytes(&path, b"abcd");
 
-        assert!(
-            input_content_mismatch_reason(std::slice::from_ref(&expected))
-                .unwrap()
-                .is_none()
-        );
+        assert!(input_content_mismatch_reason(std::slice::from_ref(&expected)).is_none());
 
         std::fs::write(&path, b"wxyz").unwrap();
-        let reason = input_content_mismatch_reason(&[expected]).unwrap().unwrap();
+        let reason = input_content_mismatch_reason(&[expected]).unwrap();
 
         assert!(reason.contains("input file changed while incremental fast path was running"));
         assert!(reason.contains("input.o"));
@@ -14256,14 +14245,13 @@ mod tests {
         let changed_range = 2 * BUILD_ID_HASH_GROUP_LEN + 100..2 * BUILD_ID_HASH_GROUP_LEN + 110;
         output[changed_range.clone()].copy_from_slice(b"0123456789");
         let changed_chunks = touched_build_id_chunks(&[changed_range], output.len()).unwrap();
-        update_build_id_hash_tree(
+        assert!(update_build_id_hash_tree(
             &mut state,
             &mut tree,
             &output,
             &build_id_range,
             &changed_chunks,
-        )
-        .unwrap();
+        ));
         let mut expected = output;
         expected[build_id_range].fill(0);
 

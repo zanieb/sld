@@ -16,8 +16,8 @@
 //!
 //! * Non-primary part references anything: The source part and target range are checked after
 //!   layout. If they're too far apart, a thunk block is allocated in the source part.
-//! * Primary part references anything: ValueFlags::HAS_RANGE_LIMITED_REL set for local symbol in the
-//!   object that made the reference.
+//! * Primary part references anything: ValueFlags::HAS_RANGE_LIMITED_REL set for local symbol in
+//!   the object that made the reference.
 
 use crate::input_data::FileId;
 use crate::layout;

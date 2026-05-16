@@ -108,7 +108,7 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
         let args = self.0;
         let common = args.common.incremental_link_options();
         let mut dylib_symbol_ordinals = args.dylib_symbol_ordinals.iter().collect::<Vec<_>>();
-        dylib_symbol_ordinals.sort_by(|(left, _), (right, _)| left.cmp(right));
+        dylib_symbol_ordinals.sort_by_key(|(left, _)| *left);
         f.debug_struct("MachOArgs")
             .field("common", &common)
             .field("output", &args.output)
@@ -686,7 +686,7 @@ fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
                 args.install_name = Some(value.as_bytes().to_vec());
             }
             _ if value.starts_with("-l") && value.len() > 2 => {
-                args.add_linked_library(&value[2..])?
+                args.add_linked_library(&value[2..])?;
             }
             "-dead_strip" => {
                 args.dead_strip = true;
@@ -844,9 +844,8 @@ fn direct_dylib_metadata_from_macho_bytes(bytes: &[u8]) -> Result<DirectDylibMet
 
 #[cfg(test)]
 mod tests {
-    use crate::platform::Args as _;
-
     use super::*;
+    use crate::platform::Args as _;
 
     #[test]
     fn dynamiclib_disables_executable_output() {

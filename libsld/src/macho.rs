@@ -107,8 +107,7 @@ pub(crate) fn macho_unwind_info_allocation_size(entry_count: usize) -> u64 {
         return 0;
     }
 
-    let page_count = (entry_count + MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT - 1)
-        / MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT;
+    let page_count = entry_count.div_ceil(MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT);
     let header_size = 7 * size_of::<u32>();
     let common_encodings_array_size = 3 * size_of::<u32>();
     let max_personality_array_size = 3 * size_of::<u32>();
@@ -371,10 +370,7 @@ impl ObjectLayoutStateExt {
             .copied()
             .enumerate()
             .filter_map(|(index, start)| {
-                let end = boundaries
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(section_size);
+                let end = boundaries.get(index + 1).copied().unwrap_or(section_size);
                 (end > start
                     && live_subsections
                         .is_some_and(|live_subsections| live_subsections.contains(&start)))
@@ -2301,12 +2297,10 @@ fn macho_subsection_gc_enabled<'data>(
 
     let section = state.object.section(section_index)?;
     let section_name = state.object.section_name(section)?;
-    Ok(
-        !section.should_retain()
-            && (section.is_executable()
-                || section_name == b"__gcc_except_tab"
-                || section_name == b"__const"),
-    )
+    Ok(!section.should_retain()
+        && (section.is_executable()
+            || section_name == b"__gcc_except_tab"
+            || section_name == b"__const"))
 }
 
 fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = MachO>>(
@@ -2957,7 +2951,7 @@ fn compact_dead_macho_subsections<'data>(
         symbols_by_section[section_index.0].push((offset, keep));
     }
 
-    for section_number in 0..object.sections.len() {
+    for (section_number, atoms) in symbols_by_section.iter_mut().enumerate() {
         if !matches!(
             object.sections.get(section_number),
             Some(crate::resolution::SectionSlot::Loaded(_))
@@ -2980,7 +2974,6 @@ fn compact_dead_macho_subsections<'data>(
             continue;
         };
 
-        let atoms = &mut symbols_by_section[section_number];
         if atoms.is_empty() {
             continue;
         }
