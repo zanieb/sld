@@ -13,7 +13,7 @@
   stdenv,
 }:
 assert lib.assertMsg (lib.versionAtLeast rustc.version "1.94.0")
-  "Wild requires at least Rust 1.94.0, this instance of nixpkgs has Rust ${rustc.version}";
+  "Sld requires at least Rust 1.94.0, this instance of nixpkgs has Rust ${rustc.version}";
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
@@ -41,7 +41,7 @@ let
   );
 
   commonArgs = {
-    pname = "wild";
+    pname = "sld";
     inherit (cargoToml.workspace.package) version;
 
     strictDeps = true;
@@ -57,7 +57,7 @@ craneLib.buildPackage (
   commonArgs
   // {
     cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-    cargoBuildCommand = "cargo build --profile release -p wild-linker";
+    cargoBuildCommand = "cargo build --profile release -p sld-linker";
 
     # Do the check in the separate derivation so it can be done
     # in parallel in the dev profile
@@ -79,7 +79,7 @@ craneLib.buildPackage (
       stdenv.cc.cc.lib
     ];
 
-    # Do the install check instead just as a smoke-tests that Wild
+    # Do the install check instead just as a smoke-tests that Sld
     # built correctly.
     doInstallCheck = true;
     nativeInstallCheckInputs = [ versionCheckHook ];
@@ -93,7 +93,7 @@ craneLib.buildPackage (
         lib.licenses.asl20 # or
         lib.licenses.mit
       ];
-      mainProgram = "wild";
+      mainProgram = "sld";
       platforms = lib.platforms.linux;
     };
   }

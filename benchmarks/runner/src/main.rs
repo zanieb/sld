@@ -1,15 +1,15 @@
-//! An over-engineered, opinionated tool for benchmarking linkers, in particular Wild.
+//! An over-engineered, opinionated tool for benchmarking linkers, in particular Sld.
 //!
-//! Things that make this specific to linkers and/or wild.
+//! Things that make this specific to linkers and/or sld.
 //!
-//! * It assumes benchmarks are in the form of Wild-generated save-dirs. i.e. a directory (the name
+//! * It assumes benchmarks are in the form of Sld-generated save-dirs. i.e. a directory (the name
 //!   of which is the name of the benchmark) where that directory contains a rust-with script.
 //! * It accommodates that some of the linkers fork on startup, then do shutdown work after the
 //!   linker terminates. To prevent this from affecting subsequent runs, it inserts a delay based on
 //!   how long the linker took to run.
 //! * It handles querying the linkers for their version to include in the report.
 //! * It allows per-benchmark configuration files that can specify things like the minimum supported
-//!   version of wild that can run that benchmark or skipping particular linkers for particular
+//!   version of sld that can run that benchmark or skipping particular linkers for particular
 //!   benchmarks.
 //! * Passing --no-fork to linkers that support it when measuring memory consumption.
 //!
@@ -201,7 +201,7 @@ struct LinkerIdentifier {
     kind: LinkerKind,
     version: String,
     variant: Option<String>,
-    /// The commit hash of the linker. Set for Wild when the path to the linker doesn't include the
+    /// The commit hash of the linker. Set for Sld when the path to the linker doesn't include the
     /// version number. i.e. when we've concluded that this isn't a release version.
     hash: Option<String>,
     /// If we've got has, then this is one patch level higher than version.
@@ -211,7 +211,7 @@ struct LinkerIdentifier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LinkerKind {
-    Wild,
+    Sld,
     Lld,
     Mold,
     Bfd,
@@ -298,7 +298,7 @@ mod duration_serde {
 impl LinkerKind {
     fn as_str(self) -> &'static str {
         match self {
-            LinkerKind::Wild => "Wild",
+            LinkerKind::Sld => "Sld",
             LinkerKind::Lld => "LLD",
             LinkerKind::Mold => "Mold",
             LinkerKind::Bfd => "GNU ld",
@@ -307,7 +307,7 @@ impl LinkerKind {
 
     fn supports_arg(&self, arg: &str) -> bool {
         match arg {
-            "--no-fork" => matches!(self, LinkerKind::Wild | LinkerKind::Mold),
+            "--no-fork" => matches!(self, LinkerKind::Sld | LinkerKind::Mold),
             _ => true,
         }
     }
@@ -360,25 +360,25 @@ impl Benchmark {
         })
     }
 
-    fn supports_wild_version(&self, wild_version: &[u32]) -> bool {
+    fn supports_sld_version(&self, sld_version: &[u32]) -> bool {
         let Some(min_required) = self
             .config
-            .min_wild_version
+            .min_sld_version
             .as_ref()
             .and_then(|v| crate::parse_version_number(v).ok())
         else {
             return true;
         };
 
-        wild_version >= &min_required
+        sld_version >= &min_required
     }
 
     fn supports_bin(&self, bin: &Bin) -> bool {
         if self.config.skip_linkers.contains(&bin.identifier.kind) {
             return false;
         }
-        if bin.identifier.kind == LinkerKind::Wild {
-            return self.supports_wild_version(&bin.identifier.effective_version);
+        if bin.identifier.kind == LinkerKind::Sld {
+            return self.supports_sld_version(&bin.identifier.effective_version);
         }
         true
     }
@@ -392,17 +392,17 @@ impl LinkerIdentifier {
         let mut variant = None;
 
         if let Some(mut rest) = version_line
-            .strip_prefix("Wild version ")
-            .or_else(|| version_line.strip_prefix("Wild "))
+            .strip_prefix("Sld version ")
+            .or_else(|| version_line.strip_prefix("Sld "))
         {
             version = take_word(&mut rest)?.to_owned();
             if !bin_path.to_string_lossy().contains(&version) {
-                // For wild, we only consider the version to be true if the path to the linker
+                // For sld, we only consider the version to be true if the path to the linker
                 // contains the version number, otherwise we use the git hash.
                 hash = Some(take_word(&mut rest)?.replace(['(', ')'], ""));
             }
 
-            kind = LinkerKind::Wild;
+            kind = LinkerKind::Sld;
         } else if let Some(mut rest) = version_line.strip_prefix("LLD ") {
             kind = LinkerKind::Lld;
             version = take_word(&mut rest)?.to_owned();
@@ -558,14 +558,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_wild_version_output() {
+    fn parses_current_sld_version_output() {
         let identifier = LinkerIdentifier::parse(
-            "Wild 0.8.0 non-git-build (compatible with GNU linkers)",
-            Path::new("/tmp/wild"),
+            "Sld 0.8.0 non-git-build (compatible with GNU linkers)",
+            Path::new("/tmp/sld"),
         )
         .unwrap();
 
-        assert_eq!(identifier.kind, LinkerKind::Wild);
+        assert_eq!(identifier.kind, LinkerKind::Sld);
         assert_eq!(identifier.version, "0.8.0");
         assert_eq!(identifier.hash.as_deref(), Some("non-git-build"));
     }
@@ -600,10 +600,10 @@ mod tests {
                 batches: vec![BatchResult {
                     bin: Bin {
                         index: 0,
-                        path: PathBuf::from("/tmp/wild"),
+                        path: PathBuf::from("/tmp/sld"),
                         identifier: LinkerIdentifier {
-                            kind: LinkerKind::Wild,
-                            version: "Wild 0.0.0 non-git-build".to_owned(),
+                            kind: LinkerKind::Sld,
+                            version: "Sld 0.0.0 non-git-build".to_owned(),
                             variant: None,
                             hash: Some("non-git-build".to_owned()),
                             effective_version: vec![0, 0, 1],
@@ -631,7 +631,7 @@ mod tests {
         );
         assert_eq!(
             decoded.benchmarks[0].batches[0].bin.path,
-            PathBuf::from("/tmp/wild")
+            PathBuf::from("/tmp/sld")
         );
         assert_eq!(
             decoded.benchmarks[0].batches[0].runs[0].elapsed,

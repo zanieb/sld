@@ -1,7 +1,7 @@
 # Run on a recent version of alpine Linux
 #
-# docker build --progress=plain -t wild-dev-alpine . -f docker/alpine.Dockerfile
-# docker run -it wild-dev-alpine
+# docker build --progress=plain -t sld-dev-alpine . -f docker/alpine.Dockerfile
+# docker run -it sld-dev-alpine
 
 FROM rust:1.94-alpine AS chef
 RUN wget -qO- https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.70/cargo-chef-x86_64-unknown-linux-musl.tar.gz | tar -xzf- && \
@@ -11,13 +11,13 @@ RUN rustup toolchain install nightly && \
 
 RUN apk add build-base lld clang clang-extra-tools bash
 
-WORKDIR /wild
+WORKDIR /sld
 
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-COPY --from=planner /wild/recipe.json recipe.json
+COPY --from=planner /sld/recipe.json recipe.json
 RUN cargo chef cook --all-targets --recipe-path recipe.json
 COPY . .

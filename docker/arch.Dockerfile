@@ -1,9 +1,9 @@
 # Run on Arch Linux. Includes some useful tools for debugging linker problems. In particular,
 # includes rr - the replay debugger.
 #
-# docker build --progress=plain -t wild-dev-arch . -f docker/arch.Dockerfile
+# docker build --progress=plain -t sld-dev-arch . -f docker/arch.Dockerfile
 #
-# docker run -it wild-dev-arch
+# docker run -it sld-dev-arch
 #
 # To actually use rr, you'll need to run with
 # `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`
@@ -55,13 +55,13 @@ RUN rustup toolchain install nightly \
         --target x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl,riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl \
         --component rustc-codegen-cranelift-preview
 
-WORKDIR /wild
+WORKDIR /sld
 
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-COPY --from=planner /wild/recipe.json recipe.json
+COPY --from=planner /sld/recipe.json recipe.json
 RUN cargo chef cook --all-targets --recipe-path recipe.json
 COPY . .

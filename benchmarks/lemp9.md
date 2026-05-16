@@ -21,8 +21,8 @@ differences on these benchmarks can probably be ignored. i.e. assume that all be
 ### rust-analyzer - time
 ![Time to link rust-analyzer](images/lemp9/rust-analyzer-time.svg)
 
-### wild - time
-![Time to link wild](images/lemp9/wild-time.svg)
+### sld - time
+![Time to link sld](images/lemp9/sld-time.svg)
 
 ## Memory
 
@@ -41,6 +41,6 @@ differences on these benchmarks can probably be ignored. i.e. assume that all be
 ### rust-analyzer - memory
 ![Memory consumption while linking rust-analyzer](images/lemp9/rust-analyzer-memory.svg)
 
-### wild - memory
-![Memory consumption while linking wild](images/lemp9/wild-memory.svg)
+### sld - memory
+![Memory consumption while linking sld](images/lemp9/sld-memory.svg)
 

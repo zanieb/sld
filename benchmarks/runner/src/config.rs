@@ -22,19 +22,19 @@ pub(crate) struct BenchConfig {
     pub(crate) save: Option<String>,
     #[serde(default)]
     pub(crate) skip: bool,
-    pub(crate) min_wild_version: Option<String>,
+    pub(crate) min_sld_version: Option<String>,
     #[serde(default)]
     pub(crate) skip_linkers: Vec<LinkerKind>,
     #[serde(default)]
     pub(crate) extra_flags: Vec<String>,
     #[serde(default)]
-    pub(crate) wild_extra_flags: Vec<String>,
+    pub(crate) sld_extra_flags: Vec<String>,
     /// Paths relative to the save-dir to mutate before each timed run.
     #[serde(default)]
     pub(crate) mutate_files: Vec<Mutation>,
-    /// Strings that must appear in Wild's incremental log after each timed Wild run.
+    /// Strings that must appear in Sld's incremental log after each timed Sld run.
     #[serde(default)]
-    pub(crate) expect_wild_log: Vec<String>,
+    pub(crate) expect_sld_log: Vec<String>,
     /// Whether every timed run must produce output bytes that differ from the warmup output.
     #[serde(default)]
     pub(crate) expect_output_change: bool,
@@ -79,7 +79,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = ["changed.o"]
 "#,
         )
@@ -100,7 +100,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ path = "changed.o", section = ".data" }]
 "#,
         )
@@ -125,7 +125,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ path = "changed.o", section = ".data", grow = 1 }]
 "#,
         )
@@ -150,7 +150,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ section = ".data" }]
 "#,
         )
@@ -174,7 +174,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ section = ".data", grow = 1 }]
 "#,
         )
@@ -198,15 +198,15 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
-expect_wild_log = ["patched ", "before loading inputs"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["patched ", "before loading inputs"]
 "#,
         )
         .unwrap();
 
         let bench = config.benches.get("changed-incremental").unwrap();
         assert_eq!(
-            bench.expect_wild_log,
+            bench.expect_sld_log,
             ["patched ".to_owned(), "before loading inputs".to_owned()]
         );
     }
@@ -219,7 +219,7 @@ name = "test"
 
 [bench.changed-incremental]
 save = "large"
-wild_extra_flags = ["--incremental"]
+sld_extra_flags = ["--incremental"]
 mutate_files = [{ path = "changed.o", section = ".data" }]
 expect_output_change = true
 "#,

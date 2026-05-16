@@ -12,7 +12,7 @@ tradeoff.
 
 For each workload, keep separate RSS measurements for:
 
-- Full non-incremental Wild.
+- Full non-incremental Sld.
 - Full Mold, when comparing against an established fast linker.
 - Initial incremental seed.
 - Incremental changed-input patch.
@@ -29,7 +29,7 @@ Always record:
 
 The benchmark runner already documents this, but it is easy to forget:
 
-- Wild and Mold may fork.
+- Sld and Mold may fork.
 - Parent-process RSS is not representative of the actual linker work.
 - Use `--no-fork` when measuring linker memory.
 
@@ -46,7 +46,7 @@ For example, the Codex full-link memory comparison produced:
 | Linker | Peak memory |
 | --- | ---: |
 | Mold | 5167.96 MiB |
-| Full Wild | 4475.03 MiB |
+| Full Sld | 4475.03 MiB |
 
 Source artifact:
 

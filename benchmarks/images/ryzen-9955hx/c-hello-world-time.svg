@@ -45,22 +45,22 @@ font-size="16" fill="#FFFFFF" transform="rotate(270, 5, 288)">ms</text>
 <text x="402" y="580" fill="#FFFFFF" text-anchor="middle">+55%</text>
 <rect fill="#00FF00" opacity="0.8" x="475" y="206" width="97" height="254" />
 <line stroke="#FFFFFF" x1="523" y1="204" x2="523" y2="208" />
-<text x="523" y="484" fill="#FFFFFF" text-anchor="middle">Wild</text>
+<text x="523" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
 <text x="523" y="502" fill="#FFFFFF" text-anchor="middle">0.5.0</text>
 <text x="523" y="580" fill="#FFFFFF" text-anchor="middle">+46%</text>
 <rect fill="#00FF00" opacity="0.8" x="596" y="191" width="97" height="269" />
 <line stroke="#FFFFFF" x1="644" y1="190" x2="644" y2="193" />
-<text x="644" y="484" fill="#FFFFFF" text-anchor="middle">Wild</text>
+<text x="644" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
 <text x="644" y="502" fill="#FFFFFF" text-anchor="middle">0.6.0</text>
 <text x="644" y="580" fill="#FFFFFF" text-anchor="middle">+54%</text>
 <rect fill="#00FF00" opacity="0.8" x="717" y="204" width="97" height="256" />
 <line stroke="#FFFFFF" x1="765" y1="203" x2="765" y2="205" />
-<text x="765" y="484" fill="#FFFFFF" text-anchor="middle">Wild</text>
+<text x="765" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
 <text x="765" y="502" fill="#FFFFFF" text-anchor="middle">0.7.0</text>
 <text x="765" y="580" fill="#FFFFFF" text-anchor="middle">+47%</text>
 <rect fill="#00FF00" opacity="0.8" x="838" y="286" width="97" height="174" />
 <line stroke="#FFFFFF" x1="886" y1="285" x2="886" y2="287" />
-<text x="886" y="484" fill="#FFFFFF" text-anchor="middle">Wild</text>
+<text x="886" y="484" fill="#FFFFFF" text-anchor="middle">Sld</text>
 <text x="886" y="502" fill="#FFFFFF" text-anchor="middle">0.8.0</text>
 <text x="886" y="580" fill="#FFFFFF" text-anchor="middle">+0%</text>
 </svg>

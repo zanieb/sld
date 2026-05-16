@@ -1,6 +1,6 @@
 # Testing In Apple Containers
 
-Apple Container is a useful way to validate Wild's Linux behavior from a macOS workstation without
+Apple Container is a useful way to validate Sld's Linux behavior from a macOS workstation without
 pretending that macOS-native execution is the same thing.
 
 Use it when the question is materially Linux-specific:
@@ -21,7 +21,7 @@ Before starting a longer validation run, make sure Apple Container itself works:
 container run --rm docker.io/library/alpine:latest echo hello-from-container
 ```
 
-If that fails, fix the container runtime before debugging Wild.
+If that fails, fix the container runtime before debugging Sld.
 
 Useful inspection commands:
 
@@ -30,22 +30,22 @@ container image list
 container ls
 ```
 
-The exact image can vary by task, but recent Wild work used Bookworm-based Linux images with arm64
+The exact image can vary by task, but recent Sld work used Bookworm-based Linux images with arm64
 tooling available locally.
 
 ## What To Mount
 
-For substantial Wild work, keep host and container paths explicit. The common pattern is:
+For substantial Sld work, keep host and container paths explicit. The common pattern is:
 
-- The Wild source checkout.
-- A Linux build output directory for `wild`.
+- The Sld source checkout.
+- A Linux build output directory for `sld`.
 - Saved-link directories for downstream projects.
 - A result directory under `/private/tmp` for logs, reports, and metrics.
 
 In recent runs, those commonly appeared inside the container as:
 
 ```text
-/target-wild
+/target-sld
 /saves
 /results
 ```
@@ -53,7 +53,7 @@ In recent runs, those commonly appeared inside the container as:
 The important rule is not the exact spelling. The important rule is to keep the command shape stable
 across seed, patch, and rerun phases.
 
-## Build And Test Wild On Linux
+## Build And Test Sld On Linux
 
 Apple Container is a good fit for Linux-focused correctness checks when the host machine is macOS.
 
@@ -66,8 +66,8 @@ Typical uses include:
 The repo-side commands stay ordinary:
 
 ```sh
-cargo test -p libwild --lib
-cargo test -p wild-linker --test integration_tests
+cargo test -p libsld --lib
+cargo test -p sld-linker --test integration_tests
 ```
 
 The value of the container is that those commands run in a Linux userspace and kernel-facing model,
@@ -81,7 +81,7 @@ whole builds.
 The key correctness conditions do not change inside Apple Container:
 
 1. Use the same saved-link input for comparable runs.
-2. Use `--no-fork` for Wild and Mold when measuring the actual linker process.
+2. Use `--no-fork` for Sld and Mold when measuring the actual linker process.
 3. Assert that incremental logs prove the expected fast path ran.
 4. Mutate a known patchable object section for changed-input experiments.
 
@@ -140,7 +140,7 @@ on parent-process numbers from a forked linker.
 
 ## Memory Limits Matter
 
-Apple Container memory defaults can be too small for large Wild seed-link experiments.
+Apple Container memory defaults can be too small for large Sld seed-link experiments.
 
 One recent Codex seed probe was accidentally run in a 1 GiB container and died with `SIGKILL`. That
 looked like a linker regression until the container budget was inspected.
@@ -163,7 +163,7 @@ memory limit has been ruled out.
 ## Command Shape Must Stay Stable
 
 Incremental state includes link-option identity. If the command shape changes between the seed run
-and the patch run, Wild can correctly reject reuse with:
+and the patch run, Sld can correctly reject reuse with:
 
 ```text
 full relink: linker arguments changed
@@ -184,7 +184,7 @@ change only the intended input bytes.
 
 ## Mutate Patchable Bytes, Not Just Any Bytes
 
-A changed-input experiment must mutate bytes Wild can legally patch.
+A changed-input experiment must mutate bytes Sld can legally patch.
 
 If the mutation lands outside the patchable subset, the log may say something like:
 

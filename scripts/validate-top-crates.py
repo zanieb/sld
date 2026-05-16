@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Build top crates.io crates with wild as the Rust linker.
+"""Build top crates.io crates with sld as the Rust linker.
 
 The default run fetches the current top 50 crates by total downloads from
 crates.io, downloads each crate source tarball, and runs:
 
     cargo build
 
-with RUSTFLAGS configured to use the local wild binary. If a crate fails with
-wild, the same command is retried without wild in a separate target directory so
-the report can distinguish wild-specific failures from crates that do not build
+with RUSTFLAGS configured to use the local sld binary. If a crate fails with
+sld, the same command is retried without sld in a separate target directory so
+the report can distinguish sld-specific failures from crates that do not build
 on the local host/toolchain.
 """
 
@@ -33,7 +33,7 @@ from typing import Any
 
 
 CRATES_API = "https://crates.io/api/v1"
-USER_AGENT = "wild-top-crates-validation (https://github.com/wild-linker/wild)"
+USER_AGENT = "sld-top-crates-validation (https://github.com/wild-linker/wild)"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +55,7 @@ class CommandResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate wild against top crates.io crates.",
+        description="Validate sld against top crates.io crates.",
     )
     parser.add_argument(
         "--limit",
@@ -78,10 +78,10 @@ def parse_args() -> argparse.Namespace:
         help="directory for downloads, extracted crates, logs, and reports",
     )
     parser.add_argument(
-        "--wild",
+        "--sld",
         type=Path,
-        default=Path("target/release/wild"),
-        help="wild binary to use as rustc's linker",
+        default=Path("target/release/sld"),
+        help="sld binary to use as rustc's linker",
     )
     parser.add_argument(
         "--cargo",
@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         "--allow-baseline-failures",
         action="store_true",
         help=(
-            "exit successfully when wild fails only on crates that also fail "
+            "exit successfully when sld fails only on crates that also fail "
             "with the system linker"
         ),
     )
@@ -314,8 +314,8 @@ def prepare_crate(crate: CrateSpec, args: argparse.Namespace) -> Path:
 def isolate_from_parent_workspaces(crate_dir: Path) -> None:
     """Make the extracted crate a workspace root.
 
-    The default work directory lives under wild's target directory. Without an
-    explicit workspace root, Cargo walks up to wild's Cargo.toml and rejects the
+    The default work directory lives under sld's target directory. Without an
+    explicit workspace root, Cargo walks up to sld's Cargo.toml and rejects the
     extracted crate as an unlisted workspace member.
     """
     manifest = crate_dir / "Cargo.toml"
@@ -348,17 +348,17 @@ def cargo_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def wild_rustflags(args: argparse.Namespace) -> list[str]:
-    wild = args.wild.resolve()
+def sld_rustflags(args: argparse.Namespace) -> list[str]:
+    sld = args.sld.resolve()
     if platform.system() == "Darwin":
-        return ["-C", f"linker={wild}", "-C", "link-arg=-flavor", "-C", "link-arg=darwin"]
+        return ["-C", f"linker={sld}", "-C", "link-arg=-flavor", "-C", "link-arg=darwin"]
 
-    linker_dir = args.work_dir / "wild-linker-driver"
+    linker_dir = args.work_dir / "sld-linker-driver"
     linker_dir.mkdir(parents=True, exist_ok=True)
     ld = linker_dir / "ld"
     if ld.exists() or ld.is_symlink():
         ld.unlink()
-    ld.symlink_to(wild)
+    ld.symlink_to(sld)
     return ["-C", "linker=cc", "-C", f"link-arg=-B{linker_dir}/"]
 
 
@@ -410,7 +410,7 @@ def run_command(
     )
 
 
-def env_for_run(args: argparse.Namespace, target_dir_name: str, use_wild: bool) -> dict[str, str]:
+def env_for_run(args: argparse.Namespace, target_dir_name: str, use_sld: bool) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("CARGO_TERM_COLOR", "always")
     env.setdefault("CARGO_NET_RETRY", "3")
@@ -418,8 +418,8 @@ def env_for_run(args: argparse.Namespace, target_dir_name: str, use_wild: bool) 
         env["RUSTUP_TOOLCHAIN"] = args.rustup_toolchain
     env["CARGO_HOME"] = str((args.work_dir / "cargo-home").resolve())
     env["CARGO_TARGET_DIR"] = str((args.work_dir / target_dir_name).resolve())
-    if use_wild:
-        append_rustflags(env, wild_rustflags(args))
+    if use_sld:
+        append_rustflags(env, sld_rustflags(args))
     return env
 
 
@@ -441,24 +441,24 @@ def validate_crate(crate: CrateSpec, index: int, total: int, args: argparse.Name
     command = cargo_command(args)
     safe_name = crate.name.replace("/", "_")
     prefix = f"{index:02d}-{safe_name}-{crate.version}"
-    print(f"[{index}/{total}] {crate.name} {crate.version}: wild", flush=True)
-    wild = run_command(
+    print(f"[{index}/{total}] {crate.name} {crate.version}: sld", flush=True)
+    sld = run_command(
         command,
         crate_dir,
-        env_for_run(args, "cargo-target-wild", use_wild=True),
-        args.work_dir / "logs" / f"{prefix}.wild.log",
+        env_for_run(args, "cargo-target-sld", use_sld=True),
+        args.work_dir / "logs" / f"{prefix}.sld.log",
         args.timeout,
     )
     baseline = None
     status = "passed"
-    if wild.returncode != 0:
-        status = "wild_failed"
+    if sld.returncode != 0:
+        status = "sld_failed"
         if not args.no_baseline_on_failure:
             print(f"[{index}/{total}] {crate.name} {crate.version}: baseline", flush=True)
             baseline = run_command(
                 command,
                 crate_dir,
-                env_for_run(args, "cargo-target-baseline", use_wild=False),
+                env_for_run(args, "cargo-target-baseline", use_sld=False),
                 args.work_dir / "logs" / f"{prefix}.baseline.log",
                 args.timeout,
             )
@@ -470,7 +470,7 @@ def validate_crate(crate: CrateSpec, index: int, total: int, args: argparse.Name
         "version": crate.version,
         "downloads": crate.downloads,
         "status": status,
-        "wild": result_to_json(wild),
+        "sld": result_to_json(sld),
         "baseline": result_to_json(baseline),
     }
 
@@ -493,35 +493,35 @@ def write_summary(results: list[dict[str, Any]], args: argparse.Namespace) -> No
         counts[result["status"]] = counts.get(result["status"], 0) + 1
 
     lines = [
-        "# wild top crates validation",
+        "# sld top crates validation",
         "",
         f"- generated: {now_iso()}",
-        f"- wild: `{args.wild.resolve()}`",
+        f"- sld: `{args.sld.resolve()}`",
         f"- command: `{' '.join(cargo_command(args))}`",
         f"- work dir: `{args.work_dir.resolve()}`",
         f"- counts: {', '.join(f'{key}={value}' for key, value in sorted(counts.items()))}",
         "",
-        "| # | crate | version | status | wild seconds | baseline seconds | logs |",
+        "| # | crate | version | status | sld seconds | baseline seconds | logs |",
         "|---:|---|---|---|---:|---:|---|",
     ]
     for index, result in enumerate(results, 1):
-        wild = result.get("wild") or {}
+        sld = result.get("sld") or {}
         baseline = result.get("baseline") or {}
-        wild_secs = wild.get("duration_secs", "")
+        sld_secs = sld.get("duration_secs", "")
         baseline_secs = baseline.get("duration_secs", "")
         logs = []
-        if wild.get("log"):
-            logs.append(f"[wild]({summary_link(args.work_dir, Path(wild['log']))})")
+        if sld.get("log"):
+            logs.append(f"[sld]({summary_link(args.work_dir, Path(sld['log']))})")
         if baseline.get("log"):
             logs.append(f"[baseline]({summary_link(args.work_dir, Path(baseline['log']))})")
         lines.append(
-            "| {index} | `{crate}` | `{version}` | `{status}` | {wild_secs} | "
+            "| {index} | `{crate}` | `{version}` | `{status}` | {sld_secs} | "
             "{baseline_secs} | {logs} |".format(
                 index=index,
                 crate=result["crate"],
                 version=result["version"],
                 status=result["status"],
-                wild_secs=wild_secs,
+                sld_secs=sld_secs,
                 baseline_secs=baseline_secs,
                 logs=", ".join(logs),
             )
@@ -551,9 +551,9 @@ def main() -> int:
     args = parse_args()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.work_dir = args.work_dir.resolve()
-    args.wild = args.wild.resolve()
-    if not args.wild.exists():
-        raise RuntimeError(f"wild binary does not exist: {args.wild}")
+    args.sld = args.sld.resolve()
+    if not args.sld.exists():
+        raise RuntimeError(f"sld binary does not exist: {args.sld}")
 
     crates = explicit_crates(args.crates) if args.crates else fetch_top_crates(args.limit)
     write_manifest(crates, args)
@@ -575,7 +575,7 @@ def main() -> int:
                 "downloads": crate.downloads,
                 "status": "setup_failed",
                 "error": str(error),
-                "wild": None,
+                "sld": None,
                 "baseline": None,
             }
             print(f"[{index}/{len(crates)}] {crate.name} {crate.version}: setup failed: {error}")
