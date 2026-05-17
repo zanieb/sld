@@ -3456,6 +3456,7 @@ fn write_internal_symbols<'data>(
                 (0, macho_internal_symbol_type(def_info, N_ABS))
             }
             crate::parsing::SymbolPlacement::SectionStart(section_id)
+            | crate::parsing::SymbolPlacement::SectionGroupStart(section_id)
             | crate::parsing::SymbolPlacement::SectionEnd(section_id)
             | crate::parsing::SymbolPlacement::SectionGroupEnd(section_id) => (
                 macho_section_index_for_internal_symbol(layout, section_id, symbol_id)?,
