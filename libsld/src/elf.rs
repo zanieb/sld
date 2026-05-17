@@ -2779,8 +2779,6 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
         offset = next_offset;
     }
 
-    common.format_specific.exception_frame_count += exception_frames.len();
-
     // Allocate space for any remaining bytes in .eh_frame that aren't large enough to constitute an
     // actual entry. crtend.o has a single u32 equal to 0 as an end marker.
     object.format_specific.eh_frame_size += (data.len() - offset) as u64;
@@ -2828,6 +2826,9 @@ fn process_section_exception_frames<'data, 'scope, A: Arch<Platform = Elf>, R: R
         common.format_specific.exception_frame_relocations +=
             frame_data.relocations.num_relocations();
     }
+
+    common.format_specific.exception_frame_count +=
+        usize::try_from(num_frames).context("Exception frame count overflowed usize")?;
 
     Ok(EhFrameSizes {
         num_frames,
