@@ -768,19 +768,30 @@ fn relocation_target_patches_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        if relocation.size != 8 {
-            return Ok(Err(format!(
-                "unsupported relocation target patch size in {}",
-                display_hex_path(&input.path)
-            )));
-        }
-
         let delta = i128::from(current.section_offset) - i128::from(target.section_offset);
         let Some(written_value) = add_signed_delta_u64(written_value, delta) else {
             return Ok(Err(format!(
                 "relocation target patch overflowed in {}",
                 display_hex_path(&input.path)
             )));
+        };
+        let data = match relocation.size {
+            4 => {
+                let Ok(written_value) = u32::try_from(written_value) else {
+                    return Ok(Err(format!(
+                        "relocation target patch overflowed in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                written_value.to_le_bytes().to_vec()
+            }
+            8 => written_value.to_le_bytes().to_vec(),
+            _ => {
+                return Ok(Err(format!(
+                    "unsupported relocation target patch size in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
         };
         let previous_target_value = relocation.target_value;
         let Some(target_value) = add_signed_delta_u64(previous_target_value, delta) else {
@@ -792,7 +803,7 @@ fn relocation_target_patches_for_input(
         output_patches.push(SectionPatch {
             output_offset: relocation.output_offset,
             size: relocation.size,
-            data: written_value.to_le_bytes().to_vec(),
+            data,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
@@ -9394,6 +9405,50 @@ mod tests {
         assert_eq!(patches[0].data, 0x208_u64.to_le_bytes());
         assert_eq!(&output[first_value_range], &0x100_u64.to_le_bytes());
         assert_eq!(&output[second_value_range], &0x200_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn relocation_target_patch_supports_32_bit_output_payloads() {
+        let (previous, first_value_range, _) = duplicate_symbol_name_elf();
+        let mut current = previous.clone();
+        current[first_value_range.clone()].copy_from_slice(&0x108_u64.to_le_bytes());
+        let mut state = state("args", b"output", &[("input.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x2000,
+            Some("duplicate"),
+            Some(("input.o", 1, 0x100)),
+            0,
+            300,
+            4,
+            1,
+            0,
+        );
+        let mut relocations = vec![relocation];
+
+        let patches =
+            relocation_target_patches_for_input(&mut relocations, &input, &current)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(patches.input_ranges, vec![first_value_range]);
+        assert_eq!(patches.output_patches.len(), 1);
+        assert_eq!(patches.output_patches[0].output_offset, 300);
+        assert_eq!(patches.output_patches[0].size, 4);
+        assert_eq!(
+            patches.output_patches[0].data,
+            0x1008_u32.to_le_bytes().to_vec()
+        );
+        assert_eq!(relocations[0].written_value, Some(0x1008));
+        assert_eq!(relocations[0].target_value, 0x2008);
+        assert_eq!(
+            relocations[0].target.as_ref().map(|target| target.section_offset),
+            Some(0x108)
+        );
     }
 
     fn duplicate_symbol_name_elf() -> (Vec<u8>, std::ops::Range<usize>, std::ops::Range<usize>) {
