@@ -438,7 +438,8 @@ fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
                     // criteria for ignoring tests, but the biggest one is that the architecture
                     // isn't enabled. So we just filter for that and only when running under
                     // nextest. For the normal test runner, it doesn't matter much.
-                    if is_nextest && arch != host_arch && !test_config.qemu_arch.contains(&arch) {
+                    if is_nextest && !architecture_enabled(platform, arch, host_arch, &test_config)
+                    {
                         continue;
                     }
 
@@ -6438,7 +6439,11 @@ fn available_linkers_for_mac() -> Result<Vec<Linker>> {
         }
     }
 
-    if let Ok(path) = find_bin(&["ld.lld"]) {
+    // Mach-O lld reference links still depend on a local Darwin SDK/frameworks.
+    if cfg!(target_os = "macos")
+        && macos_sdk_path().is_some()
+        && let Ok(path) = find_bin(&["ld.lld"])
+    {
         linkers.push(Linker::ThirdParty(ThirdPartyLinker {
             name: "lld",
             gcc_name: "lld",
@@ -6581,7 +6586,7 @@ fn run_integration_test(
 
     let host_arch = get_host_architecture();
 
-    if arch != host_arch && !test_config.qemu_arch.contains(&arch) {
+    if !architecture_enabled(config.platform, arch, host_arch, test_config) {
         return Ok(libtest_mimic::Completion::ignored_with(
             "Architecture disabled",
         ));
@@ -6683,6 +6688,15 @@ fn verify_platform_requirements(
     }
 
     Ok(())
+}
+
+fn architecture_enabled(
+    platform: PlatformKind,
+    arch: Architecture,
+    host_arch: Architecture,
+    test_config: &TestConfig,
+) -> bool {
+    arch == host_arch || (platform.is_host() && test_config.qemu_arch.contains(&arch))
 }
 
 fn verify_linker_plugin_requirements(
