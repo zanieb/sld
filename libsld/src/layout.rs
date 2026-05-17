@@ -4471,8 +4471,10 @@ impl<'data> SymbolCopyInfo<'data> {
             && let Some(deltas) = section_relax_deltas.get(section.0)
             && let Ok(offset) = object.symbol_offset_in_section(sym, section)
             && deltas.deletes_input_offset(offset)
+            && deltas.delta_bytes_at(offset) == 0
         {
-            // Symbol is in bytes that were compacted out of the output section.
+            // Symbols at the start of a deleted span still point at the compacted output location.
+            // Only symbols in the interior of deleted bytes lose their output address entirely.
             return None;
         }
 
