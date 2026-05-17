@@ -2,6 +2,7 @@
 //#CompArgs:-Wa,-mx86-used-note=no
 //#DiffEnabled:false
 //#LinkArgs:-nostdlib
+//#RequiresCompilerFlags:-Wa,-mx86-used-note=no
 //#RunEnabled:false
 //#SkipLinker:ld
 //#ExpectSectionBytes:.note.gnu.property=0x040000001000000005000000474e5500020000c004000000b300000000000000
