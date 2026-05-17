@@ -1,5 +1,6 @@
 //#Arch:x86_64
 //#RunEnabled:false
+//#DiffIgnore:section.eh_frame.type
 //#ExpectSectionTypeSld:.eh_frame=SHT_PROGBITS
 
 .text
