@@ -2015,6 +2015,7 @@ impl<'data, P: Platform> Prelude<'data, P> {
                     ValueFlags::NON_INTERPOSABLE | ValueFlags::ABSOLUTE
                 }
                 SymbolPlacement::SectionStart(_)
+                | SymbolPlacement::SectionGroupStart(_)
                 | SymbolPlacement::SectionEnd(_)
                 | SymbolPlacement::SectionGroupEnd(_)
                 | SymbolPlacement::Redirect(_)
@@ -2046,6 +2047,7 @@ impl<P: Platform> InternalSymDefInfo<'_, P> {
             | SymbolPlacement::DefsymAbsolute(_)
             | SymbolPlacement::Redirect(_) => None,
             SymbolPlacement::SectionStart(i) => Some(i),
+            SymbolPlacement::SectionGroupStart(i) => Some(i),
             SymbolPlacement::SectionEnd(i) => Some(i),
             SymbolPlacement::SectionGroupEnd(i) => Some(i),
             // The other linkers attach to the closest section, but the address is nonetheless

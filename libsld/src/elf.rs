@@ -899,21 +899,21 @@ impl platform::Platform for Elf {
         }
 
         symbols
-            .section_start(output_section_id::PREINIT_ARRAY, "__preinit_array_start")
+            .section_group_start(output_section_id::PREINIT_ARRAY, "__preinit_array_start")
             .hide();
         symbols
             .section_group_end(output_section_id::PREINIT_ARRAY, "__preinit_array_end")
             .hide();
 
         symbols
-            .section_start(output_section_id::INIT_ARRAY, "__init_array_start")
+            .section_group_start(output_section_id::INIT_ARRAY, "__init_array_start")
             .hide();
         symbols
             .section_group_end(output_section_id::INIT_ARRAY, "__init_array_end")
             .hide();
 
         symbols
-            .section_start(output_section_id::FINI_ARRAY, "__fini_array_start")
+            .section_group_start(output_section_id::FINI_ARRAY, "__fini_array_start")
             .hide();
         symbols
             .section_group_end(output_section_id::FINI_ARRAY, "__fini_array_end")

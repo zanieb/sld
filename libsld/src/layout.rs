@@ -3549,6 +3549,26 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
             resources.section_layouts.get(section_id).mem_offset
         }
 
+        SymbolPlacement::SectionGroupStart(section_id) => {
+            let primary = resources.section_layouts.get(section_id);
+            let mut start = (primary.mem_size > 0).then_some(primary.mem_offset);
+
+            for (id, info) in resources.output_sections.ids_with_info() {
+                if let SectionKind::Secondary(primary_id) = info.kind
+                    && primary_id == section_id
+                {
+                    let sec = resources.section_layouts.get(id);
+                    if sec.mem_size > 0 {
+                        start = Some(
+                            start.map_or(sec.mem_offset, |current| current.min(sec.mem_offset)),
+                        );
+                    }
+                }
+            }
+
+            start.unwrap_or(primary.mem_offset)
+        }
+
         SymbolPlacement::SectionEnd(section_id) => {
             let sec = resources.section_layouts.get(section_id);
             sec.mem_offset + sec.mem_size

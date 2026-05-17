@@ -79,6 +79,10 @@ pub(crate) enum SymbolPlacement<'data> {
     /// Defines a symbol that points to the start of a section.
     SectionStart(OutputSectionId),
 
+    /// Where secondary sections are merged into a primary section, this causes our symbol to point
+    /// to the start of the first non-empty section merged into the specified primary.
+    SectionGroupStart(OutputSectionId),
+
     /// Defines a symbol that points at the non-inclusive end of the section. i.e. 1 byte past the
     /// last byte of the section.
     SectionEnd(OutputSectionId),
@@ -339,6 +343,17 @@ impl<'data, P: Platform> InternalSymbolsBuilder<'data, P> {
     ) -> &mut InternalSymDefInfo<'data, P> {
         self.add_symbol(InternalSymDefInfo::new(
             SymbolPlacement::SectionEnd(section_id),
+            name.as_bytes(),
+        ))
+    }
+
+    pub(crate) fn section_group_start(
+        &mut self,
+        section_id: OutputSectionId,
+        name: &'static str,
+    ) -> &mut InternalSymDefInfo<'data, P> {
+        self.add_symbol(InternalSymDefInfo::new(
+            SymbolPlacement::SectionGroupStart(section_id),
             name.as_bytes(),
         ))
     }
