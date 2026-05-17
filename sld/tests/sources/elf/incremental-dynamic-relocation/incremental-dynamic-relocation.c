@@ -10,11 +10,6 @@
 //#TestIncrementalChangedSection:.rela.data.rel.incremental_dynamic
 //#TestIncrementalChangedSectionOffset:16
 //#TestIncrementalStateContains:dynrel\t
-//#SkipArch:riscv64
-//#Config:incremental-dynamic-relocation-riscv64-fallback:incremental-dynamic-relocation
-//#Arch:riscv64
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 
 extern int dynamic_relocation_target;
 
