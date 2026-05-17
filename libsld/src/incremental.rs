@@ -12234,6 +12234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     fn archive_member_changes_do_not_match_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
