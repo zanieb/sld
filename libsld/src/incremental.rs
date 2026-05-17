@@ -14,6 +14,7 @@ use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::hash::Hash as _;
