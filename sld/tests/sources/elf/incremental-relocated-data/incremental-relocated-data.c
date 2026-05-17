@@ -9,20 +9,10 @@
 //#TestIncrementalChangedSection:.data.rel.local.incremental_relocated
 //#TestIncrementalStateContains:reloc2\t
 //#TestIncrementalStateContains:72656c6f63617465645f746172676574
-//#SkipArch:riscv64
-//#Config:incremental-relocated-data-riscv64-fallback:incremental-relocated-data
-//#Arch:riscv64
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 //#Config:relocation-metadata:incremental-relocated-data
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedSection:.rela.data.rel.local.incremental_relocated
 //#TestIncrementalChangedSectionOffset:16
-//#SkipArch:riscv64
-//#Config:relocation-metadata-riscv64-fallback:relocation-metadata
-//#Arch:riscv64
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 
 extern int relocated_target;
 
