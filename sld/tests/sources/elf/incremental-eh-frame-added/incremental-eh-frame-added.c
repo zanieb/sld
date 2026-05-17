@@ -38,10 +38,12 @@ incremental_eh_frame_added_primary(void) {
 }
 
 #ifdef INCREMENTAL_EH_FRAME_ADDED
-__attribute__((section(".text.incremental_eh_frame_added"), noinline, used))
-int incremental_eh_frame_added_extra(void) {
+// clang-format off
+__attribute__((section(".text.incremental_eh_frame_added"), noinline, used)) int
+incremental_eh_frame_added_extra(void) {
   return 1;
 }
+// clang-format on
 #endif
 
 int unchanged(void);

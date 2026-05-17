@@ -32,11 +32,13 @@ incremental_eh_frame_removed_primary(void) {
 }
 
 #ifndef INCREMENTAL_EH_FRAME_REMOVED
+// clang-format off
 __attribute__((section(".text.incremental_eh_frame_removed_extra"), noinline,
-               used))
-int incremental_eh_frame_removed_extra(void) {
+               used)) int
+incremental_eh_frame_removed_extra(void) {
   return incremental_eh_frame_removed_value + 1;
 }
+// clang-format on
 #endif
 
 int unchanged(void);
