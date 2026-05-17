@@ -3866,7 +3866,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         scope: &Scope<'scope>,
     ) -> Result {
         let mut frame_section_indices = SmallVec::<[SectionIndex; 2]>::new();
-        let mut note_gnu_property_section = None;
+        let mut note_gnu_property_sections = Vec::new();
         let mut riscv_attributes_section = None;
 
         let no_gc = !resources.symbol_db.args.should_gc_sections();
@@ -3909,7 +3909,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                     frame_section_indices.push(*index);
                 }
                 SectionSlot::NoteGnuProperty(index) => {
-                    note_gnu_property_section = Some(*index);
+                    note_gnu_property_sections.push(*index);
                 }
                 SectionSlot::RiscvVAttributes(index) => {
                     riscv_attributes_section = Some(*index);
@@ -3929,7 +3929,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             )?;
         }
 
-        if let Some(section_index) = note_gnu_property_section {
+        for section_index in note_gnu_property_sections {
             self.object
                 .process_gnu_note_section(&mut self.format_specific, section_index)?;
         }
