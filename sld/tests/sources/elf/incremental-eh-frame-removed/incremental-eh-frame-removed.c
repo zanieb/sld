@@ -9,6 +9,7 @@
 //#TestIncrementalChangedInput:incremental-eh-frame-removed.c.o
 //#TestIncrementalChangedCompArgs:-DINCREMENTAL_EH_FRAME_REMOVED=1
 //#TestIncrementalChangedSection:.data.incremental_eh_frame_removed
+//#TestIncrementalChangedSection:generated:.eh_frame
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_eh_frame_removed_value=0x2b000000
