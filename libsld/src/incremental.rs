@@ -5621,11 +5621,9 @@ fn object_diff_allows_fde_removal(
         })
         .collect::<Vec<_>>();
     if removed_fdes.is_empty()
-        || eh_frame_patches.iter().any(|patch| {
-            patch.patch.is_some()
-                || matches!(patch.eh_frame_hdr_change, Some(EhFrameHdrChange::Adjust(_)))
-                || matches!(patch.eh_frame_hdr_change, Some(EhFrameHdrChange::Add(_)))
-        })
+        || eh_frame_patches
+            .iter()
+            .any(|patch| matches!(patch.eh_frame_hdr_change, Some(EhFrameHdrChange::Add(_))))
         || removed_fdes
             .iter()
             .any(|fde| fde.input_file != input_file_path || fde.input != input_file_path)
@@ -10798,6 +10796,38 @@ mod tests {
             ".rel.text.removed_fde_target"
         ));
         assert!(section_name_is_metadata_for_fde_removal(".rela.eh_frame"));
+    }
+
+    #[test]
+    fn object_diff_allows_fde_removal_with_surviving_fde_updates() {
+        let bytes = eh_frame_relocation_elf(8, -4);
+        let input_ref = encode_path(Path::new("input.o"));
+        let removed_fde = fde_record("input.o", 2, 2, 0, 300, 16);
+        let patches = vec![
+            FdeRelocationPatch {
+                input_ranges: Vec::new(),
+                patch: None,
+                eh_frame_hdr_change: Some(EhFrameHdrChange::Remove(removed_fde)),
+                record_update: None,
+            },
+            FdeRelocationPatch {
+                input_ranges: Vec::new(),
+                patch: Some(SectionPatch {
+                    output_offset: 320,
+                    size: 16,
+                    data: vec![0; 16],
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                }),
+                eh_frame_hdr_change: Some(EhFrameHdrChange::Adjust(EhFrameHdrDelta {
+                    fde_output_offset: 320,
+                    frame_ptr_delta: 4,
+                })),
+                record_update: None,
+            },
+        ];
+
+        assert!(object_diff_allows_fde_removal(&bytes, &bytes, &input_ref, &[], &patches).unwrap());
     }
 
     #[test]
