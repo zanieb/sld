@@ -934,11 +934,7 @@ fn output_symbol_value_patches(
         )?;
         let symbol = match symbol {
             Ok(Some(symbol)) => symbol,
-            Ok(None) => {
-                return Ok(Err(
-                    "missing output symbol for incremental value patch".to_owned()
-                ));
-            }
+            Ok(None) => continue,
             Err(error) => return Ok(Err(error)),
         };
         let Some(value_range) = symbol.value_range else {
@@ -9409,6 +9405,24 @@ mod tests {
         assert_eq!(patches[0].data, 0x208_u64.to_le_bytes());
         assert_eq!(&output[first_value_range], &0x100_u64.to_le_bytes());
         assert_eq!(&output[second_value_range], &0x200_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn output_symbol_value_patches_skip_missing_output_symbols() {
+        let (output, _, _) = duplicate_symbol_name_elf();
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[RelocationTargetSymbolPatch {
+                target_name: hex::encode(b"missing"),
+                previous_target_value: 0x200,
+                target_value: 0x208,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(patches.is_empty());
     }
 
     #[test]
