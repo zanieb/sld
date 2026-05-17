@@ -2502,20 +2502,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
                 if gnu_property.pr_data().len() != 4 {
                     continue;
                 }
-                let ptype = gnu_property.pr_type();
-                let data = gnu_property.data_u32(e)?;
-
-                if let Some(property) = state
-                    .gnu_property_notes
-                    .iter_mut()
-                    .find(|property| property.ptype == ptype)
-                {
-                    property.data |= data;
-                } else {
-                    state
-                        .gnu_property_notes
-                        .push(crate::elf::GnuProperty { ptype, data });
-                }
+                state.gnu_property_notes.push(crate::elf::GnuProperty {
+                    ptype: gnu_property.pr_type(),
+                    data: gnu_property.data_u32(e)?,
+                });
             }
         }
 
