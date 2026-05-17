@@ -10,6 +10,7 @@
 //#TestIncrementalChangedSection:.data.incremental_eh_frame_added
 //#TestIncrementalChangedSection:.text.incremental_eh_frame_added
 //#TestIncrementalChangedSection:generated:.eh_frame
+//#TestIncrementalChangedSection:generated:.eh_frame_hdr
 //#TestIncrementalChangedSymbolBytes:incremental_eh_frame_added_value=0x2b000000
 //#TestIncrementalStateContains:fde\t
 //#Config:incremental-eh-frame-added:incremental-eh-frame-added-base
