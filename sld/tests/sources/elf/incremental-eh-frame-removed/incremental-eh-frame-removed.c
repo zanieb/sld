@@ -11,7 +11,6 @@
 //#TestIncrementalChangedSection:.data.incremental_eh_frame_removed
 //#TestIncrementalChangedSection:generated:.eh_frame
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedAllowedFallbackReason:relocation target moved
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_eh_frame_removed_value=0x2b000000
 //#TestIncrementalStateContains:fde\t
