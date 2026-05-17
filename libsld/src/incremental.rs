@@ -14298,6 +14298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     fn build_id_hash_tree_must_match_state_hash() {
         let dir = tempfile::tempdir().unwrap();
         let output_len = 5 * BUILD_ID_HASH_GROUP_LEN + 100;
