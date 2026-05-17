@@ -10,7 +10,7 @@
 .text
 .globl _start
 _start:
-  ret
+  .byte 0
 
 .section ".note.gnu.property", "a", @note
 .p2align 3
