@@ -18,6 +18,12 @@
 //#TestIncrementalCompareFull:false
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
+//#SkipArch:aarch64
+//#Config:incremental-eh-frame-added-aarch64:incremental-eh-frame-added
+//#Arch:aarch64
+//#TestIncrementalChangedSection:.data.incremental_eh_frame_added
+//#TestIncrementalChangedSection:.text.incremental_eh_frame_added
+//#TestIncrementalChangedSection:generated:.eh_frame_hdr
 //#Config:incremental-eh-frame-added-no-padding:incremental-eh-frame-added-base
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:could not resolve patchable sections
