@@ -9827,6 +9827,7 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/state").join("sld"));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn global_log_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -9859,6 +9860,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_snapshots_are_isolated_copies() {
         let dir = tempfile::tempdir().unwrap();
@@ -9890,6 +9892,7 @@ mod tests {
         assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_snapshots_deduplicate_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -9903,6 +9906,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_identity_refresh_can_target_changed_indices() {
         let dir = tempfile::tempdir().unwrap();
@@ -9937,6 +9941,7 @@ mod tests {
         assert_eq!(input_files[1].content.len, 6);
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_snapshot_matches_rewritten_file_with_same_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -9960,6 +9965,7 @@ mod tests {
         assert!(input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_snapshot_rejects_rewritten_file_with_changed_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -9982,6 +9988,7 @@ mod tests {
         assert!(!input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_patch_sections_identifies_changed_section() {
         let Ok(current_exe) = std::env::current_exe() else {
@@ -10040,6 +10047,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn match_patch_sections_identifies_changed_section() {
         let Ok(current_exe) = std::env::current_exe() else {
@@ -10097,6 +10105,7 @@ mod tests {
         assert_eq!(matched.changed_sections[0].input_size, size);
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn match_patch_sections_records_current_section_size_after_growth() {
         let bytes = growable_data_elf();
@@ -13093,6 +13102,7 @@ mod tests {
         assert_eq!(parsed.patch.unwrap().sections, Vec::new());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_input_patch_rejects_missing_metadata_before_reading_changed_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -13211,6 +13221,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.0, &second.0));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn read_metadata_skips_missing_sections_sidecar() {
         let dir = tempfile::tempdir().unwrap();
@@ -13229,6 +13240,7 @@ mod tests {
         assert!(PersistedState::read(dir.path()).is_err());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn read_metadata_preserves_patch_sections_without_parsing_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -13264,6 +13276,7 @@ mod tests {
         assert_eq!(full_patch.raw_sections, None);
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn metadata_update_overlay_updates_only_changed_inputs() {
         let dir = tempfile::tempdir().unwrap();
@@ -13352,6 +13365,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn reloaded_metadata_refreshes_rewritten_input_identities() {
         let dir = tempfile::tempdir().unwrap();
@@ -13381,6 +13395,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn read_records_for_input_files_filters_sections_sidecar() {
         let dir = tempfile::tempdir().unwrap();
@@ -13462,6 +13477,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn read_records_for_input_files_validates_sections_sidecar_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -13492,6 +13508,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn hashed_sections_sidecar_must_match_contents() {
         let dir = tempfile::tempdir().unwrap();
@@ -13550,6 +13567,7 @@ mod tests {
         }));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn metadata_update_writes_sections_for_inline_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -13569,6 +13587,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn section_sidecars_are_not_replaced_before_index_update() {
         let dir = tempfile::tempdir().unwrap();
@@ -13731,6 +13750,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn file_identity_matches_current_file_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -13769,6 +13789,7 @@ mod tests {
         assert!(!same_tick.identity_is_ambiguous_since(None));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn stable_identity_read_records_matching_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -13781,6 +13802,7 @@ mod tests {
         assert_eq!(content, FileContentState::from_path(&path).unwrap());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_identity_mismatch_reason_rechecks_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -13805,6 +13827,7 @@ mod tests {
         assert!(reason.contains("input.o"));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn input_content_mismatch_reason_rechecks_changed_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -13821,6 +13844,7 @@ mod tests {
         assert!(reason.contains("input.o"));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn preloading_check_records_link_start_before_depfile_exists() {
         let dir = tempfile::tempdir().unwrap();
@@ -13836,6 +13860,7 @@ mod tests {
         assert!(link_start_marker_identity(&state_dir).is_some());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn classifies_reusable_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -13859,6 +13884,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn classifies_reusable_state_from_output_identity_without_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -13884,6 +13910,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn interrupted_update_marker_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -13942,6 +13969,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_sld_version_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -13968,6 +13996,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn missing_sld_version_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -13995,6 +14024,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_input_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -14021,6 +14051,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_input_list_keeps_unchanged_section_reuse_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -14048,6 +14079,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn removed_input_list_keeps_unchanged_section_reuse_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -14074,6 +14106,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn reordered_input_list_keeps_unchanged_section_reuse_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -14100,6 +14133,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn missing_input_order_hash_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -14127,6 +14161,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn missing_output_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -14151,6 +14186,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_output_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
