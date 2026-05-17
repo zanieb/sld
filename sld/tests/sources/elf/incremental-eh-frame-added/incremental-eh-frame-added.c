@@ -32,14 +32,15 @@ __attribute__((section(".data.incremental_eh_frame_added"),
                used)) volatile int incremental_eh_frame_added_value =
     INCREMENTAL_EH_FRAME_ADDED_VALUE;
 
-__attribute__((section(".text.incremental_eh_frame_added"), noinline, used)) int
+__attribute__((section(".text.incremental_eh_frame_added"), noinline,
+               used)) int
 incremental_eh_frame_added_primary(void) {
   return INCREMENTAL_EH_FRAME_ADDED_VALUE;
 }
 
 #ifdef INCREMENTAL_EH_FRAME_ADDED
-__attribute__((section(".text.incremental_eh_frame_added"), noinline, used)) int
-incremental_eh_frame_added_extra(void) {
+__attribute__((section(".text.incremental_eh_frame_added"), noinline,
+               used)) int incremental_eh_frame_added_extra(void) {
   return 1;
 }
 #endif
