@@ -7,6 +7,11 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedInput:incremental-anonymous.c.o
 //#TestIncrementalChangedSection:.rodata..L__unnamed_1
+//#SkipArch:riscv64
+//#Config:incremental-anonymous-riscv64-fallback:incremental-anonymous
+//#Arch:riscv64
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:relocation target patch overflowed
 
 __attribute__((section(".rodata..L__unnamed_1"),
                used)) volatile const int anonymous_value = 42;
