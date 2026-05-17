@@ -16,6 +16,11 @@
 //#TestIncrementalChangedRestore:true
 //#TestIncrementalChangedSymbolBytes:incremental_dynamic_removed_payload=0x2b000000
 //#TestIncrementalStateContains:dynrel\t
+//#SkipArch:riscv64
+//#Config:incremental-dynamic-relocation-removed-riscv64-fallback:incremental-dynamic-relocation-removed
+//#Arch:riscv64
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 
 extern int dynamic_relocation_removed_target;
 
