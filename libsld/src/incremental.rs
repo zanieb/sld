@@ -759,10 +759,6 @@ fn relocation_target_patches_for_input(
             continue;
         }
         if current.section_index.0 as u32 != target.section_index {
-            if current.section_offset == target.section_offset {
-                target.section_index = current.section_index.0 as u32;
-                continue;
-            }
             return Ok(Err(format!(
                 "relocation target moved in {}",
                 display_hex_path(&input.path)
@@ -9633,8 +9629,8 @@ mod tests {
     }
 
     #[test]
-    fn relocation_target_patch_ignores_pure_input_section_renumbering() {
-        let (previous, first_value_range, _) = duplicate_symbol_name_elf();
+    fn relocation_target_patch_rejects_same_offset_section_moves() {
+        let (previous, _, _) = duplicate_symbol_name_elf();
         let mut current = previous.clone();
         current[0x7e..0x80].copy_from_slice(&2_u16.to_le_bytes());
         let mut state = state("args", b"output", &[("input.o", &previous)]);
@@ -9655,26 +9651,13 @@ mod tests {
         );
         let mut relocations = vec![relocation];
 
-        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
-            .unwrap()
-            .unwrap();
+        let patches =
+            relocation_target_patches_for_input(&mut relocations, &input, &current).unwrap();
 
-        assert_eq!(patches.input_ranges, vec![first_value_range]);
-        assert!(patches.output_patches.is_empty());
-        assert_eq!(
-            relocations[0]
-                .target
-                .as_ref()
-                .map(|target| target.section_index),
-            Some(2)
-        );
-        assert_eq!(
-            relocations[0]
-                .target
-                .as_ref()
-                .map(|target| target.section_offset),
-            Some(0x100)
-        );
+        assert!(matches!(
+            patches,
+            Err(reason) if reason == "relocation target moved in input.o"
+        ));
     }
 
     fn duplicate_symbol_name_elf() -> (Vec<u8>, std::ops::Range<usize>, std::ops::Range<usize>) {
