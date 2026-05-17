@@ -9,7 +9,8 @@
 
 static int value = 0;
 
-void __attribute__((constructor)) premain() { value = 42; }
+void __attribute__((constructor(1000))) premain_priority() { value += 40; }
+void __attribute__((constructor)) premain() { value += 2; }
 
 void _start(void) {
   runtime_init();
