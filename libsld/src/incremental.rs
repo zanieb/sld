@@ -8,6 +8,9 @@ use crate::platform;
 use crate::timing_phase;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
+use linker_utils::elf::RelocationKindInfo;
+use linker_utils::elf::RelocationSize;
+use linker_utils::riscv64;
 use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
@@ -779,22 +782,34 @@ fn relocation_target_patches_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        let data = match relocation.size {
-            4 => {
-                let Ok(written_value) = u32::try_from(written_value) else {
-                    return Ok(Err(format!(
-                        "relocation target patch overflowed in {}",
-                        display_hex_path(&input.path)
-                    )));
-                };
-                written_value.to_le_bytes().to_vec()
-            }
-            8 => written_value.to_le_bytes().to_vec(),
-            _ => {
+        let deferred_relocation =
+            deferred_riscv_relocation_patch(&file, relocation.kind, written_value);
+        let data = if deferred_relocation.is_some() {
+            let Ok(size) = usize::try_from(relocation.size) else {
                 return Ok(Err(format!(
                     "unsupported relocation target patch size in {}",
                     display_hex_path(&input.path)
                 )));
+            };
+            vec![0; size]
+        } else {
+            match relocation.size {
+                4 => {
+                    let Ok(written_value) = u32::try_from(written_value) else {
+                        return Ok(Err(format!(
+                            "relocation target patch overflowed in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
+                    written_value.to_le_bytes().to_vec()
+                }
+                8 => written_value.to_le_bytes().to_vec(),
+                _ => {
+                    return Ok(Err(format!(
+                        "unsupported relocation target patch size in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
             }
         };
         let previous_target_value = relocation.target_value;
@@ -808,6 +823,7 @@ fn relocation_target_patches_for_input(
             output_offset: relocation.output_offset,
             size: relocation.size,
             data,
+            deferred_relocation,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
@@ -826,6 +842,21 @@ fn relocation_target_patches_for_input(
         output_patches,
         output_symbols,
     }))
+}
+
+fn deferred_riscv_relocation_patch(
+    file: &object::File<'_>,
+    relocation_kind: u32,
+    written_value: u64,
+) -> Option<DeferredRelocationPatch> {
+    if file.architecture() != object::Architecture::Riscv64 {
+        return None;
+    }
+    let rel_info = riscv64::relocation_type_from_raw(relocation_kind)?;
+    matches!(rel_info.size, RelocationSize::BitMasking(_)).then_some(DeferredRelocationPatch {
+        rel_info,
+        written_value,
+    })
 }
 
 fn dedup_ranges(ranges: &mut Vec<std::ops::Range<usize>>) {
@@ -962,6 +993,7 @@ fn output_symbol_value_patches(
             output_offset: value_range.start as u64,
             size: value_range.len() as u64,
             data,
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
@@ -1545,6 +1577,15 @@ fn patch_changed_inputs(
                 "changed patch data does not fit in the previous output range".to_owned(),
             ));
         }
+        if let Some(deferred_relocation) = patch.deferred_relocation {
+            if let Err(reason) = materialize_deferred_relocation_patch(
+                &mut patch.data,
+                output_range,
+                deferred_relocation,
+            ) {
+                return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
+            }
+        }
         for preserve_range in &patch.preserve_ranges {
             let Some(data_range) = patch.data.get_mut(preserve_range.clone()) else {
                 return Ok(ChangedInputPatchResult::StartedUnsupported(
@@ -1704,8 +1745,15 @@ struct SectionPatch {
     output_offset: u64,
     size: u64,
     data: Vec<u8>,
+    deferred_relocation: Option<DeferredRelocationPatch>,
     preserve_ranges: Vec<std::ops::Range<usize>>,
     adjustments: Vec<PatchAdjustment>,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredRelocationPatch {
+    rel_info: RelocationKindInfo,
+    written_value: u64,
 }
 
 struct PatchAdjustment {
@@ -1854,6 +1902,21 @@ fn apply_addend_delta(data: &mut [u8], addend_delta: i64) -> std::result::Result
         }
         _ => Err("unsupported .eh_frame relocation field size for incremental patch".to_owned()),
     }
+}
+
+fn materialize_deferred_relocation_patch(
+    data: &mut [u8],
+    previous_output: &[u8],
+    deferred_relocation: DeferredRelocationPatch,
+) -> std::result::Result<(), String> {
+    if data.len() != previous_output.len() {
+        return Err("deferred relocation patch output size changed".to_owned());
+    }
+    data.copy_from_slice(previous_output);
+    deferred_relocation
+        .rel_info
+        .write_to_buffer(deferred_relocation.written_value, data)
+        .map_err(|error| format!("failed to encode deferred relocation patch: {error:#}"))
 }
 
 fn flush_output_ranges(
@@ -4890,6 +4953,7 @@ fn resolved_patch_sections_for_input_with_dynamic_relocations<'a>(
                     output_offset: patch_section.output_offset,
                     size: patch_section.output_size,
                     data: data.to_owned(),
+                    deferred_relocation: None,
                     preserve_ranges,
                     adjustments: Vec::new(),
                 },
@@ -5043,6 +5107,7 @@ fn added_dynamic_relocation_patches_for_input(
                     output_offset,
                     size: crate::elf::RELA_ENTRY_SIZE,
                     data,
+                    deferred_relocation: None,
                     preserve_ranges: Vec::new(),
                     adjustments: Vec::new(),
                 },
@@ -5208,6 +5273,7 @@ fn relocation_addend_patches_for_input(
                 output_offset: relocation.output_offset,
                 size: relocation.size,
                 data: written_value.to_le_bytes().to_vec(),
+                deferred_relocation: None,
                 preserve_ranges: Vec::new(),
                 adjustments: Vec::new(),
             });
@@ -5345,6 +5411,7 @@ fn dynamic_relocation_patches_for_input_bytes(
                     output_offset: record.output_offset,
                     size: record.size,
                     data: vec![0; record.size as usize],
+                    deferred_relocation: None,
                     preserve_ranges: Vec::new(),
                     adjustments: Vec::new(),
                 },
@@ -5375,6 +5442,7 @@ fn dynamic_relocation_patches_for_input_bytes(
                 output_offset: record.output_offset,
                 size: record.size,
                 data,
+                deferred_relocation: None,
                 preserve_ranges,
                 adjustments: Vec::new(),
             },
@@ -6337,6 +6405,7 @@ fn fde_add_patches_for_output(
                 output_offset,
                 size: data.len() as u64,
                 data,
+                deferred_relocation: None,
                 preserve_ranges: Vec::new(),
                 adjustments: Vec::new(),
             },
@@ -6374,6 +6443,7 @@ fn fde_add_patches_for_output(
             output_offset: eh_frame_offset + terminator_offset_in_section as u64,
             size: combined_data.len() as u64,
             data: combined_data,
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         };
@@ -6383,6 +6453,7 @@ fn fde_add_patches_for_output(
             output_offset: extra.record.output_offset,
             size: 0,
             data: Vec::new(),
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         };
@@ -6646,6 +6717,7 @@ fn fde_relocation_patches_for_input_bytes(
                 output_offset: record.output_offset,
                 size: record.size,
                 data: current_fde_data.to_vec(),
+                deferred_relocation: None,
                 preserve_ranges,
                 adjustments,
             }),
@@ -6845,6 +6917,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
             output_offset: (eh_frame_hdr_start + 8) as u64,
             size: 4,
             data: entry_count.to_le_bytes().to_vec(),
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         }];
@@ -6858,6 +6931,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
             output_offset: (eh_frame_hdr_start + header_size) as u64,
             size: data.len() as u64,
             data,
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
@@ -6871,6 +6945,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
                 output_offset: (eh_frame_hdr_start + header_size + index * entry_size) as u64,
                 size: 4,
                 data: entries[index].frame_ptr.to_le_bytes().to_vec(),
+                deferred_relocation: None,
                 preserve_ranges: Vec::new(),
                 adjustments: Vec::new(),
             })
@@ -6898,6 +6973,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
             output_offset: (eh_frame_hdr_start + header_size + index * entry_size) as u64,
             size: 4,
             data: entries[index].frame_ptr.to_le_bytes().to_vec(),
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         })
@@ -6909,6 +6985,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
         output_offset: (eh_frame_hdr_start + 8) as u64,
         size: 4,
         data: entry_count.to_le_bytes().to_vec(),
+        deferred_relocation: None,
         preserve_ranges: Vec::new(),
         adjustments: Vec::new(),
     });
@@ -6923,6 +7000,7 @@ fn eh_frame_hdr_patches_for_fde_changes(
         output_offset: (eh_frame_hdr_start + header_size + first_removed * entry_size) as u64,
         size: data.len() as u64,
         data,
+        deferred_relocation: None,
         preserve_ranges: Vec::new(),
         adjustments: Vec::new(),
     });
@@ -9472,6 +9550,62 @@ mod tests {
     }
 
     #[test]
+    fn relocation_target_patch_defers_riscv_instruction_payloads() {
+        let (mut previous, first_value_range, _) = duplicate_symbol_name_elf();
+        previous[18..20].copy_from_slice(&object::elf::EM_RISCV.to_le_bytes());
+        let mut current = previous.clone();
+        current[first_value_range.clone()].copy_from_slice(&0x108_u64.to_le_bytes());
+        let mut state = state("args", b"output", &[("input.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x2000,
+            Some("duplicate"),
+            Some(("input.o", 1, 0x100)),
+            0,
+            300,
+            4,
+            object::elf::R_RISCV_JAL,
+            0,
+        );
+        let mut relocations = vec![relocation];
+
+        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.output_patches.len(), 1);
+        assert!(patches.output_patches[0].deferred_relocation.is_some());
+        assert_eq!(patches.output_patches[0].data, vec![0; 4]);
+        assert_eq!(relocations[0].written_value, Some(0x1008));
+    }
+
+    #[test]
+    fn deferred_riscv_instruction_patches_preserve_non_relocation_bits() {
+        let rel_info = riscv64::relocation_type_from_raw(object::elf::R_RISCV_JAL).unwrap();
+        let previous_output = 0x0000_006f_u32.to_le_bytes();
+        let mut data = vec![0; previous_output.len()];
+        let mut expected = previous_output.to_vec();
+        rel_info.write_to_buffer(8, &mut expected).unwrap();
+
+        materialize_deferred_relocation_patch(
+            &mut data,
+            &previous_output,
+            DeferredRelocationPatch {
+                rel_info,
+                written_value: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(data, expected);
+        assert_eq!(data[0] & 0x7f, 0x6f);
+    }
+
+    #[test]
     fn relocation_target_patch_ignores_pure_input_section_renumbering() {
         let (previous, first_value_range, _) = duplicate_symbol_name_elf();
         let mut current = previous.clone();
@@ -10945,6 +11079,7 @@ mod tests {
                     output_offset: 320,
                     size: 16,
                     data: vec![0; 16],
+                    deferred_relocation: None,
                     preserve_ranges: Vec::new(),
                     adjustments: Vec::new(),
                 }),
@@ -14819,6 +14954,7 @@ mod tests {
             output_offset,
             size,
             data: Vec::new(),
+            deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         };
