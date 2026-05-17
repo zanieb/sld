@@ -373,6 +373,11 @@ fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
         if platform == PlatformKind::Elf && cfg!(target_os = "macos") {
             continue;
         }
+        // Linux CI does not provide the Darwin SDK/framework/compiler support needed by the
+        // Mach-O integration corpus. Keep that coverage on the dedicated macOS jobs.
+        if platform == PlatformKind::MachO && !cfg!(target_os = "macos") {
+            continue;
+        }
 
         let linkers = platform.available_linkers()?;
 
