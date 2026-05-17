@@ -1577,14 +1577,14 @@ fn patch_changed_inputs(
                 "changed patch data does not fit in the previous output range".to_owned(),
             ));
         }
-        if let Some(deferred_relocation) = patch.deferred_relocation {
-            if let Err(reason) = materialize_deferred_relocation_patch(
+        if let Some(deferred_relocation) = patch.deferred_relocation
+            && let Err(reason) = materialize_deferred_relocation_patch(
                 &mut patch.data,
                 output_range,
                 deferred_relocation,
-            ) {
-                return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
-            }
+            )
+        {
+            return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
         }
         for preserve_range in &patch.preserve_ranges {
             let Some(data_range) = patch.data.get_mut(preserve_range.clone()) else {
@@ -9486,7 +9486,7 @@ mod tests {
     }
 
     #[test]
-    fn output_symbol_value_patches_skip_missing_output_symbols() {
+    fn output_symbol_value_patches_reject_missing_output_symbols() {
         let (output, _, _) = duplicate_symbol_name_elf();
 
         let patches = output_symbol_value_patches(
@@ -9497,10 +9497,12 @@ mod tests {
                 target_value: 0x208,
             }],
         )
-        .unwrap()
         .unwrap();
 
-        assert!(patches.is_empty());
+        assert!(matches!(
+            patches,
+            Err(reason) if reason == "missing output symbol for incremental value patch"
+        ));
     }
 
     #[test]
@@ -9603,6 +9605,27 @@ mod tests {
 
         assert_eq!(data, expected);
         assert_eq!(data[0] & 0x7f, 0x6f);
+    }
+
+    #[test]
+    fn deferred_riscv_call_patches_cover_both_instruction_words() {
+        let rel_info = riscv64::relocation_type_from_raw(object::elf::R_RISCV_CALL_PLT).unwrap();
+        let previous_output = [0x97, 0x00, 0x00, 0x00, 0xe7, 0x80, 0x00, 0x00];
+        let mut data = vec![0; previous_output.len()];
+        let mut expected = previous_output.to_vec();
+        rel_info.write_to_buffer(8, &mut expected).unwrap();
+
+        materialize_deferred_relocation_patch(
+            &mut data,
+            &previous_output,
+            DeferredRelocationPatch {
+                rel_info,
+                written_value: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(data, expected);
     }
 
     #[test]

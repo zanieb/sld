@@ -1370,6 +1370,7 @@ impl RelocationInstruction {
     pub fn write_windows_size(self) -> usize {
         match self {
             Self::AArch64(..) => 4,
+            Self::RiscV(RiscVInstruction::UiType) => 8,
             Self::RiscV(..) => 4,
             Self::LoongArch64(..) => 4,
         }
@@ -1623,6 +1624,14 @@ mod tests {
         assert_eq!(
             &aarch64_rel_type_to_string(64),
             "Unknown aarch64 relocation type 0x40"
+        );
+    }
+
+    #[test]
+    fn riscv_ui_type_relocations_cover_both_instruction_words() {
+        assert_eq!(
+            RelocationInstruction::RiscV(RiscVInstruction::UiType).write_windows_size(),
+            8
         );
     }
 
