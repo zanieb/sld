@@ -14,6 +14,10 @@
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_eh_frame_removed_value=0x2b000000
 //#TestIncrementalStateContains:fde\t
+//#SkipArch:aarch64
+//#Config:incremental-eh-frame-removed-aarch64:incremental-eh-frame-removed
+//#Arch:aarch64
+//#TestIncrementalChangedSection:.data.incremental_eh_frame_removed
 
 #ifdef INCREMENTAL_EH_FRAME_REMOVED
 #define INCREMENTAL_EH_FRAME_REMOVED_VALUE 43
