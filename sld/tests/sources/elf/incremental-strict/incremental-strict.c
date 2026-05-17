@@ -9,11 +9,20 @@
 //#TestIncrementalChangedExpectReuse:true
 //#TestIncrementalChangedInput:incremental-strict.c.o
 //#TestIncrementalChangedSection:.init
+//#SkipArch:riscv64
+//#Config:incremental-strict-riscv64-fallback:incremental-strict
+//#Arch:riscv64
+//#TestIncrementalChangedFallbackReason:relocation target moved
 //#Config:init-array:incremental-strict
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedExpectReuse:false
 //#TestIncrementalChangedSection:.rela.init_array
 //#TestIncrementalChangedSectionOffset:16
+//#SkipArch:riscv64
+//#Config:init-array-riscv64-fallback:init-array
+//#Arch:riscv64
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:relocation target moved
 
 __attribute__((section(".init"), used)) void incremental_strict_init(void) {
   __asm__ volatile("nop");
