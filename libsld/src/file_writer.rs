@@ -216,7 +216,9 @@ impl Output {
                 wait_for_sized_output(sized_output_recv)?
             }
             FileCreator::Regular { file_size } => {
-                delete_old_output(&self.path);
+                if self.config.file_write_mode == FileWriteMode::UnlinkAndReplace {
+                    delete_old_output(&self.path);
+                }
                 let file_size = file_size.context("set_size was never called")?;
                 self.create_file_non_lazily(file_size)?
             }
