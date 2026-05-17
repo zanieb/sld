@@ -8,16 +8,16 @@
 //#TestIncrementalChangedSection:.data.incremental_section_a
 //#TestIncrementalChangedSection:.data.incremental_section_b
 
-__attribute__((section(".data.incremental_section_a"), used)) volatile unsigned char
-    incremental_section_a = 42;
-__attribute__((section(".data.incremental_section_b"), used)) volatile unsigned char
-    incremental_section_b = 7;
+__attribute__((section(".data.incremental_section_a"),
+               used)) volatile unsigned char incremental_section_a = 42;
+__attribute__((section(".data.incremental_section_b"),
+               used)) volatile unsigned char incremental_section_b = 7;
 
 int unchanged(void);
 
 int value(void) { return incremental_section_a + incremental_section_b; }
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

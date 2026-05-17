@@ -19,11 +19,10 @@
 #define INCREMENTAL_NO_GC_VALUE 42
 #endif
 
-__attribute__((section(".data.incremental_no_gc_unused"), used)) volatile int
-    incremental_no_gc_unused = INCREMENTAL_NO_GC_VALUE;
+__attribute__((section(".data.incremental_no_gc_unused"),
+               used)) volatile int incremental_no_gc_unused =
+    INCREMENTAL_NO_GC_VALUE;
 
 int unchanged(void);
 
-void _start(void) {
-    (void)unchanged();
-}
+void _start(void) { (void)unchanged(); }

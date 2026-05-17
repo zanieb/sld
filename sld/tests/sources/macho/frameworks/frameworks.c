@@ -4,9 +4,9 @@
 //#Contains:/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 //#RunEnabled:true
 
-#include "../common/runtime.h"
-
 #include <CoreFoundation/CoreFoundation.h>
+
+#include "../common/runtime.h"
 
 void main(void) {
   CFStringRef value = CFSTR("sld");

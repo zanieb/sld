@@ -7,10 +7,11 @@
 __thread int counter = 42;
 
 void main(void) {
-    __asm__ __volatile__("mov x16, #1\n"
-                         "mov x0, %0\n"
-                         "svc #0x80\n"
-                         :
-                         : "r"(counter));
-    __builtin_unreachable();
+  __asm__ __volatile__(
+      "mov x16, #1\n"
+      "mov x0, %0\n"
+      "svc #0x80\n"
+      :
+      : "r"(counter));
+  __builtin_unreachable();
 }

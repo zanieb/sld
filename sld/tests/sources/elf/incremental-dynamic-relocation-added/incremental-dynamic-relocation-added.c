@@ -27,9 +27,9 @@
 extern int dynamic_relocation_added_target;
 
 struct IncrementalDynamicAddedPayload {
-    volatile int value;
-    void *existing_pointer;
-    void *pointer;
+  volatile int value;
+  void* existing_pointer;
+  void* pointer;
 };
 
 #ifdef INCREMENTAL_DYNAMIC_RELOCATION_ADDED
@@ -40,20 +40,21 @@ struct IncrementalDynamicAddedPayload {
 #define INCREMENTAL_DYNAMIC_ADDED_POINTER 0
 #endif
 
-__attribute__((section(".data.rel.incremental_dynamic_added"), used)) struct
-    IncrementalDynamicAddedPayload incremental_dynamic_added_payload = {
-        INCREMENTAL_DYNAMIC_ADDED_VALUE, &dynamic_relocation_added_target,
-        INCREMENTAL_DYNAMIC_ADDED_POINTER};
+__attribute__((section(".data.rel.incremental_dynamic_added"),
+               used)) struct IncrementalDynamicAddedPayload
+    incremental_dynamic_added_payload = {INCREMENTAL_DYNAMIC_ADDED_VALUE,
+                                         &dynamic_relocation_added_target,
+                                         INCREMENTAL_DYNAMIC_ADDED_POINTER};
 
 int value(void) {
-    return incremental_dynamic_added_payload.value +
-           (incremental_dynamic_added_payload.existing_pointer != 0) +
-           (incremental_dynamic_added_payload.pointer != 0);
+  return incremental_dynamic_added_payload.value +
+         (incremental_dynamic_added_payload.existing_pointer != 0) +
+         (incremental_dynamic_added_payload.pointer != 0);
 }
 
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

@@ -20,8 +20,8 @@
 extern int dynamic_relocation_removed_target;
 
 struct IncrementalDynamicRemovedPayload {
-    volatile int value;
-    void *pointer;
+  volatile int value;
+  void* pointer;
 };
 
 #ifdef INCREMENTAL_DYNAMIC_RELOCATION_REMOVED
@@ -32,18 +32,19 @@ struct IncrementalDynamicRemovedPayload {
 #define INCREMENTAL_DYNAMIC_REMOVED_POINTER (&dynamic_relocation_removed_target)
 #endif
 
-__attribute__((section(".data.rel.incremental_dynamic_removed"), used)) struct
-    IncrementalDynamicRemovedPayload incremental_dynamic_removed_payload = {
-        INCREMENTAL_DYNAMIC_REMOVED_VALUE, INCREMENTAL_DYNAMIC_REMOVED_POINTER};
+__attribute__((section(".data.rel.incremental_dynamic_removed"),
+               used)) struct IncrementalDynamicRemovedPayload
+    incremental_dynamic_removed_payload = {INCREMENTAL_DYNAMIC_REMOVED_VALUE,
+                                           INCREMENTAL_DYNAMIC_REMOVED_POINTER};
 
 int value(void) {
-    return incremental_dynamic_removed_payload.value +
-           (incremental_dynamic_removed_payload.pointer != 0);
+  return incremental_dynamic_removed_payload.value +
+         (incremental_dynamic_removed_payload.pointer != 0);
 }
 
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

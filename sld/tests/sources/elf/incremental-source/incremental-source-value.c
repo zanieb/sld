@@ -1,7 +1,7 @@
-__attribute__((section(".data.incremental_source"), used)) volatile int
-    incremental_source_value =
+__attribute__((section(".data.incremental_source"),
+               used)) volatile int incremental_source_value =
 #ifdef INCREMENTAL_SOURCE_CHANGED
-        43;
+    43;
 #else
-        42;
+    42;
 #endif

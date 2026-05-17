@@ -14,22 +14,23 @@
 extern int dynamic_relocation_target;
 
 struct IncrementalDynamicPayload {
-    volatile int value;
-    void *pointer;
+  volatile int value;
+  void* pointer;
 };
 
-__attribute__((section(".data.rel.incremental_dynamic"), used)) struct
-    IncrementalDynamicPayload incremental_dynamic_payload = {
-        42, &dynamic_relocation_target};
+__attribute__((
+    section(".data.rel.incremental_dynamic"),
+    used)) struct IncrementalDynamicPayload incremental_dynamic_payload = {
+    42, &dynamic_relocation_target};
 
 int value(void) {
-    return incremental_dynamic_payload.value +
-           (incremental_dynamic_payload.pointer != 0);
+  return incremental_dynamic_payload.value +
+         (incremental_dynamic_payload.pointer != 0);
 }
 
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

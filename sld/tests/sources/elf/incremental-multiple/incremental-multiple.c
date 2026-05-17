@@ -12,6 +12,6 @@ int value_a(void);
 int value_b(void);
 
 void _start(void) {
-    (void)value_a();
-    (void)value_b();
+  (void)value_a();
+  (void)value_b();
 }

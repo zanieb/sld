@@ -17,20 +17,23 @@
 extern int relocated_target;
 
 struct IncrementalRelocatedPayload {
-    volatile int value;
-    void *pointer;
+  volatile int value;
+  void* pointer;
 };
 
-__attribute__((section(".data.rel.local.incremental_relocated"), used)) struct
-    IncrementalRelocatedPayload incremental_relocated_payload = {42, &relocated_target};
+__attribute__((
+    section(".data.rel.local.incremental_relocated"),
+    used)) struct IncrementalRelocatedPayload incremental_relocated_payload = {
+    42, &relocated_target};
 
 int value(void) {
-    return incremental_relocated_payload.value + (incremental_relocated_payload.pointer != 0);
+  return incremental_relocated_payload.value +
+         (incremental_relocated_payload.pointer != 0);
 }
 
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

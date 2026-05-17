@@ -16,6 +16,6 @@
 
 extern const char incremental_merge_string_value[];
 
-const char *value(void) { return incremental_merge_string_value; }
+const char* value(void) { return incremental_merge_string_value; }
 
 void _start(void) { (void)value(); }
