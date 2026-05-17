@@ -7,11 +7,6 @@
 //#TestIncrementalChangedInput:incremental-section-list.c.o
 //#TestIncrementalChangedSection:.data.incremental_section_a
 //#TestIncrementalChangedSection:.data.incremental_section_b
-//#SkipArch:riscv64
-//#Config:incremental-section-list-riscv64-fallback:incremental-section-list
-//#Arch:riscv64
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 
 __attribute__((section(".data.incremental_section_a"),
                used)) volatile unsigned char incremental_section_a = 42;

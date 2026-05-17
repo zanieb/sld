@@ -20,11 +20,6 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRestore:true
-//#SkipArch:riscv64
-//#Config:incremental-dynamic-relocation-added-riscv64-fallback:incremental-dynamic-relocation-added
-//#Arch:riscv64
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 //#Config:incremental-dynamic-relocation-added-no-padding:incremental-dynamic-relocation-added-base
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:changed bytes outside patchable sections
