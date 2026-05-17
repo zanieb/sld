@@ -8,6 +8,11 @@
 //#TestIncrementalChangedInput:incremental.c.o
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedSymbolBytes:incremental_value=0x2b000000
+//#SkipArch:riscv64
+//#Config:incremental-riscv64-fallback:incremental
+//#Arch:riscv64
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:missing output symbol for incremental value patch
 
 volatile int incremental_value = 42;
 
