@@ -5190,6 +5190,8 @@ fn relocation_addend_patches_for_input(
         let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &input_ref)? else {
             continue;
         };
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse changed relocation addend input")?;
         let previous_input_bytes = if let Some(previous_bytes) = previous_bytes {
             patch_input_bytes(previous_bytes, input.path.as_str(), &input_ref)?
         } else {
@@ -5273,11 +5275,30 @@ fn relocation_addend_patches_for_input(
                     display_hex_path(&input.path)
                 )));
             };
+            let deferred_relocation =
+                deferred_riscv_relocation_patch(&file, relocation.kind, written_value);
+            let data = if deferred_relocation.is_some() {
+                let Ok(size) = usize::try_from(relocation.size) else {
+                    return Ok(Err(format!(
+                        "unsupported relocation addend patch size in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                vec![0; size]
+            } else {
+                if relocation.size != 8 {
+                    return Ok(Err(format!(
+                        "unsupported relocation addend patch size in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                written_value.to_le_bytes().to_vec()
+            };
             output_patches.push(SectionPatch {
                 output_offset: relocation.output_offset,
                 size: relocation.size,
-                data: written_value.to_le_bytes().to_vec(),
-                deferred_relocation: None,
+                data,
+                deferred_relocation,
                 preserve_ranges: Vec::new(),
                 adjustments: Vec::new(),
             });
@@ -11234,6 +11255,49 @@ mod tests {
         assert!(patches.output_patches.is_empty());
         assert_eq!(relocations[0].addend, 5);
         assert_eq!(relocations[0].written_value, Some(0x1000));
+    }
+
+    #[test]
+    fn relocation_addend_patch_defers_riscv_instruction_payloads() {
+        let mut bytes = relocated_data_elf();
+        bytes[18..20].copy_from_slice(&object::elf::EM_RISCV.to_le_bytes());
+        let mut addend_changed = bytes.clone();
+        addend_changed[0x90..0x98].copy_from_slice(&5_i64.to_le_bytes());
+        let mut state = state("args", b"output", &[("input.o", &bytes)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x1000,
+            None,
+            None,
+            4,
+            300,
+            8,
+            object::elf::R_RISCV_CALL_PLT,
+            2,
+        );
+        let mut relocations = vec![relocation];
+
+        let patches = relocation_addend_patches_for_input(
+            &mut relocations,
+            &input,
+            &addend_changed,
+            None,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.output_patches.len(), 1);
+        assert_eq!(patches.output_patches[0].output_offset, 300);
+        assert_eq!(patches.output_patches[0].size, 8);
+        assert!(patches.output_patches[0].deferred_relocation.is_some());
+        assert_eq!(patches.output_patches[0].data, vec![0; 8]);
+        assert_eq!(relocations[0].addend, 5);
+        assert_eq!(relocations[0].written_value, Some(0x1003));
     }
 
     #[test]
