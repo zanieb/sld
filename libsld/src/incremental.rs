@@ -8,8 +8,10 @@ use crate::platform;
 use crate::timing_phase;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
+use linker_utils::aarch64;
 use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::RelocationSize;
+use linker_utils::loongarch64;
 use linker_utils::riscv64;
 use memmap2::MmapOptions;
 use object::Object as _;
@@ -765,21 +767,26 @@ fn relocation_target_patches_for_input(
             )));
         }
 
-        let Some(written_value) = relocation.written_value else {
+        let Some(previous_written_value) = relocation.written_value else {
             return Ok(Err(format!(
                 "missing written relocation value for target in {}",
                 display_hex_path(&input.path)
             )));
         };
         let delta = i128::from(current.section_offset) - i128::from(target.section_offset);
-        let Some(written_value) = add_signed_delta_u64(written_value, delta) else {
+        let Some(written_value) = add_signed_delta_u64(previous_written_value, delta) else {
             return Ok(Err(format!(
                 "relocation target patch overflowed in {}",
                 display_hex_path(&input.path)
             )));
         };
         let deferred_relocation =
-            deferred_riscv_relocation_patch(&file, relocation.kind, written_value);
+            deferred_instruction_relocation_patch(
+                &file,
+                relocation.kind,
+                previous_written_value,
+                written_value,
+            );
         let data = if deferred_relocation.is_some() {
             let Ok(size) = usize::try_from(relocation.size) else {
                 return Ok(Err(format!(
@@ -840,17 +847,23 @@ fn relocation_target_patches_for_input(
     }))
 }
 
-fn deferred_riscv_relocation_patch(
+fn deferred_instruction_relocation_patch(
     file: &object::File<'_>,
     relocation_kind: u32,
+    previous_written_value: u64,
     written_value: u64,
 ) -> Option<DeferredRelocationPatch> {
-    if file.architecture() != object::Architecture::Riscv64 {
-        return None;
-    }
-    let rel_info = riscv64::relocation_type_from_raw(relocation_kind)?;
+    let rel_info = match file.architecture() {
+        object::Architecture::Aarch64 => aarch64::relocation_type_from_raw(relocation_kind)?,
+        object::Architecture::LoongArch64 => {
+            loongarch64::relocation_type_from_raw(relocation_kind)?
+        }
+        object::Architecture::Riscv64 => riscv64::relocation_type_from_raw(relocation_kind)?,
+        _ => return None,
+    };
     matches!(rel_info.size, RelocationSize::BitMasking(_)).then_some(DeferredRelocationPatch {
         rel_info,
+        previous_written_value,
         written_value,
     })
 }
@@ -1753,6 +1766,7 @@ struct SectionPatch {
 #[derive(Clone, Copy)]
 struct DeferredRelocationPatch {
     rel_info: RelocationKindInfo,
+    previous_written_value: u64,
     written_value: u64,
 }
 
@@ -1912,6 +1926,25 @@ fn materialize_deferred_relocation_patch(
     if data.len() != previous_output.len() {
         return Err("deferred relocation patch output size changed".to_owned());
     }
+    let RelocationSize::BitMasking(mask) = deferred_relocation.rel_info.size else {
+        return Err("deferred relocation patch is not instruction-shaped".to_owned());
+    };
+    if mask.instruction.write_windows_size() != data.len() {
+        return Err("deferred relocation patch output size changed".to_owned());
+    }
+
+    let mut replayed_previous_output = previous_output.to_vec();
+    deferred_relocation
+        .rel_info
+        .write_to_buffer(
+            deferred_relocation.previous_written_value,
+            &mut replayed_previous_output,
+        )
+        .map_err(|error| format!("failed to validate deferred relocation patch: {error:#}"))?;
+    if replayed_previous_output != previous_output {
+        return Err("deferred relocation patch encoding changed".to_owned());
+    }
+
     data.copy_from_slice(previous_output);
     deferred_relocation
         .rel_info
@@ -9586,6 +9619,40 @@ mod tests {
     }
 
     #[test]
+    fn relocation_target_patch_defers_aarch64_instruction_payloads() {
+        let (mut previous, first_value_range, _) = duplicate_symbol_name_elf();
+        previous[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+        let mut current = previous.clone();
+        current[first_value_range.clone()].copy_from_slice(&0x108_u64.to_le_bytes());
+        let mut state = state("args", b"output", &[("input.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x2000,
+            Some("duplicate"),
+            Some(("input.o", 1, 0x100)),
+            0,
+            300,
+            4,
+            object::elf::R_AARCH64_JUMP26,
+            0,
+        );
+        let mut relocations = vec![relocation];
+
+        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.output_patches.len(), 1);
+        assert!(patches.output_patches[0].deferred_relocation.is_some());
+        assert_eq!(patches.output_patches[0].data, vec![0; 4]);
+        assert_eq!(relocations[0].written_value, Some(0x1008));
+    }
+
+    #[test]
     fn deferred_riscv_instruction_patches_preserve_non_relocation_bits() {
         let rel_info = riscv64::relocation_type_from_raw(object::elf::R_RISCV_JAL).unwrap();
         let previous_output = 0x0000_006f_u32.to_le_bytes();
@@ -9598,6 +9665,7 @@ mod tests {
             &previous_output,
             DeferredRelocationPatch {
                 rel_info,
+                previous_written_value: 0,
                 written_value: 8,
             },
         )
@@ -9620,12 +9688,35 @@ mod tests {
             &previous_output,
             DeferredRelocationPatch {
                 rel_info,
+                previous_written_value: 0,
                 written_value: 8,
             },
         )
         .unwrap();
 
         assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn deferred_riscv_call_patches_reject_relaxed_output_windows() {
+        let rel_info = riscv64::relocation_type_from_raw(object::elf::R_RISCV_CALL_PLT).unwrap();
+        let previous_output = 0x0000_006f_u32.to_le_bytes();
+        let mut data = vec![0; previous_output.len()];
+
+        let result = materialize_deferred_relocation_patch(
+            &mut data,
+            &previous_output,
+            DeferredRelocationPatch {
+                rel_info,
+                previous_written_value: 0,
+                written_value: 8,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(reason) if reason == "deferred relocation patch output size changed"
+        ));
     }
 
     #[test]
