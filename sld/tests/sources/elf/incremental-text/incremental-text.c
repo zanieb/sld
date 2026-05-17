@@ -14,7 +14,7 @@
 //#SldExtraLinkArgs:--eh-frame-hdr
 //#Config:eh-frame-data:eh-frame
 //#TestIncrementalChangedSection:.eh_frame
-//#TestIncrementalChangedSectionOffset:32
+//#TestIncrementalChangedSectionOffset:36
 
 int incremental_text_value(void);
 
