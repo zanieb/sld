@@ -965,11 +965,7 @@ fn output_symbol_value_patches(
         )?;
         let symbol = match symbol {
             Ok(Some(symbol)) => symbol,
-            Ok(None) => {
-                return Ok(Err(
-                    "missing output symbol for incremental value patch".to_owned()
-                ));
-            }
+            Ok(None) => continue,
             Err(error) => return Ok(Err(error)),
         };
         let Some(value_range) = symbol.value_range else {
@@ -9511,7 +9507,7 @@ mod tests {
     }
 
     #[test]
-    fn output_symbol_value_patches_reject_missing_output_symbols() {
+    fn output_symbol_value_patches_skip_missing_output_symbols() {
         let (output, _, _) = duplicate_symbol_name_elf();
 
         let patches = output_symbol_value_patches(
@@ -9522,12 +9518,10 @@ mod tests {
                 target_value: 0x208,
             }],
         )
+        .unwrap()
         .unwrap();
 
-        assert!(matches!(
-            patches,
-            Err(reason) if reason == "missing output symbol for incremental value patch"
-        ));
+        assert!(patches.is_empty());
     }
 
     #[test]
