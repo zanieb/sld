@@ -965,7 +965,11 @@ fn output_symbol_value_patches(
         )?;
         let symbol = match symbol {
             Ok(Some(symbol)) => symbol,
-            Ok(None) => continue,
+            Ok(None) => {
+                return Ok(Err(
+                    "missing output symbol for incremental value patch".to_owned(),
+                ));
+            }
             Err(error) => return Ok(Err(error)),
         };
         let Some(value_range) = symbol.value_range else {
