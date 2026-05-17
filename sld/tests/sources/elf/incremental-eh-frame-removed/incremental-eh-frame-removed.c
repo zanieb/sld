@@ -20,24 +20,26 @@
 #define INCREMENTAL_EH_FRAME_REMOVED_VALUE 42
 #endif
 
-__attribute__((section(".data.incremental_eh_frame_removed"), used)) volatile int
-    incremental_eh_frame_removed_value = INCREMENTAL_EH_FRAME_REMOVED_VALUE;
+__attribute__((section(".data.incremental_eh_frame_removed"),
+               used)) volatile int incremental_eh_frame_removed_value =
+    INCREMENTAL_EH_FRAME_REMOVED_VALUE;
 
-__attribute__((section(".text.incremental_eh_frame_removed_primary"), noinline, used)) int
+__attribute__((section(".text.incremental_eh_frame_removed_primary"), noinline,
+               used)) int
 incremental_eh_frame_removed_primary(void) {
-    return incremental_eh_frame_removed_value;
+  return incremental_eh_frame_removed_value;
 }
 
 #ifndef INCREMENTAL_EH_FRAME_REMOVED
-__attribute__((section(".text.incremental_eh_frame_removed_extra"), noinline, used)) int
-incremental_eh_frame_removed_extra(void) {
-    return incremental_eh_frame_removed_value + 1;
+__attribute__((section(".text.incremental_eh_frame_removed_extra"), noinline,
+               used)) int incremental_eh_frame_removed_extra(void) {
+  return incremental_eh_frame_removed_value + 1;
 }
 #endif
 
 int unchanged(void);
 
 void _start(void) {
-    (void)incremental_eh_frame_removed_primary();
-    (void)unchanged();
+  (void)incremental_eh_frame_removed_primary();
+  (void)unchanged();
 }

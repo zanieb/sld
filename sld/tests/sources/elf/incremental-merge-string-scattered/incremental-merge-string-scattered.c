@@ -12,10 +12,10 @@
 extern const char incremental_merge_string_scattered_a[];
 extern const char incremental_merge_string_scattered_c[];
 
-const char *value_a(void) { return incremental_merge_string_scattered_a; }
-const char *value_c(void) { return incremental_merge_string_scattered_c; }
+const char* value_a(void) { return incremental_merge_string_scattered_a; }
+const char* value_c(void) { return incremental_merge_string_scattered_c; }
 
 void _start(void) {
-    (void)value_a();
-    (void)value_c();
+  (void)value_a();
+  (void)value_c();
 }

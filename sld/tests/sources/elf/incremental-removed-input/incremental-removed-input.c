@@ -14,6 +14,6 @@ int value(void) { return incremental_removed_input_value; }
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

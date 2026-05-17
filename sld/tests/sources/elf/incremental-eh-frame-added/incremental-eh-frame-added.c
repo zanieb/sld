@@ -27,24 +27,25 @@
 #define INCREMENTAL_EH_FRAME_ADDED_VALUE 42
 #endif
 
-__attribute__((section(".data.incremental_eh_frame_added"), used)) volatile int
-    incremental_eh_frame_added_value = INCREMENTAL_EH_FRAME_ADDED_VALUE;
+__attribute__((section(".data.incremental_eh_frame_added"),
+               used)) volatile int incremental_eh_frame_added_value =
+    INCREMENTAL_EH_FRAME_ADDED_VALUE;
 
 __attribute__((section(".text.incremental_eh_frame_added"), noinline, used)) int
 incremental_eh_frame_added_primary(void) {
-    return INCREMENTAL_EH_FRAME_ADDED_VALUE;
+  return INCREMENTAL_EH_FRAME_ADDED_VALUE;
 }
 
 #ifdef INCREMENTAL_EH_FRAME_ADDED
-__attribute__((section(".text.incremental_eh_frame_added"), noinline, used)) int
-incremental_eh_frame_added_extra(void) {
-    return 1;
+__attribute__((section(".text.incremental_eh_frame_added"), noinline,
+               used)) int incremental_eh_frame_added_extra(void) {
+  return 1;
 }
 #endif
 
 int unchanged(void);
 
 void _start(void) {
-    (void)incremental_eh_frame_added_primary();
-    (void)unchanged();
+  (void)incremental_eh_frame_added_primary();
+  (void)unchanged();
 }

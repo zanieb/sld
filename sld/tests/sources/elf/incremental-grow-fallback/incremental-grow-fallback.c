@@ -16,5 +16,5 @@ extern volatile unsigned char incremental_grow_fallback_value[];
 volatile unsigned char incremental_grow_fallback_sink;
 
 void _start(void) {
-    incremental_grow_fallback_sink = incremental_grow_fallback_value[0];
+  incremental_grow_fallback_sink = incremental_grow_fallback_value[0];
 }

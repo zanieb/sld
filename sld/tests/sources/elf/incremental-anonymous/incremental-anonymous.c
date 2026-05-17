@@ -8,13 +8,14 @@
 //#TestIncrementalChangedInput:incremental-anonymous.c.o
 //#TestIncrementalChangedSection:.rodata..L__unnamed_1
 
-__attribute__((section(".rodata..L__unnamed_1"), used)) volatile const int anonymous_value = 42;
+__attribute__((section(".rodata..L__unnamed_1"),
+               used)) volatile const int anonymous_value = 42;
 
 int value(void) { return anonymous_value; }
 
 int unchanged(void);
 
 void _start(void) {
-    (void)value();
-    (void)unchanged();
+  (void)value();
+  (void)unchanged();
 }

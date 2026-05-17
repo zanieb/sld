@@ -13,10 +13,10 @@
 extern const char incremental_merge_string_shared_a[];
 extern const char incremental_merge_string_shared_b[];
 
-const char *value_a(void) { return incremental_merge_string_shared_a; }
-const char *value_b(void) { return incremental_merge_string_shared_b; }
+const char* value_a(void) { return incremental_merge_string_shared_a; }
+const char* value_b(void) { return incremental_merge_string_shared_b; }
 
 void _start(void) {
-    (void)value_a();
-    (void)value_b();
+  (void)value_a();
+  (void)value_b();
 }
