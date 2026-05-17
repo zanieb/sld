@@ -1,4 +1,5 @@
 //#Arch:x86_64
+//#CompArgs:-Wa,-mx86-used-note=no
 //#DiffEnabled:false
 //#LinkArgs:-nostdlib
 //#RunEnabled:false
