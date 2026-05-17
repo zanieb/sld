@@ -1,6 +1,6 @@
 # sld
 
-sld (pronounced slide) is a slop linker. The intent of this project is to provide very fast linking for development builds, potentially sacrificing correctness and maintainability to that end.
+sld (pronounced slid) is a slop linker. The intent of this project is to provide very fast linking for development builds, potentially sacrificing correctness and maintainability to that end.
 
 This is an experiment.
 
