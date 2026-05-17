@@ -191,6 +191,10 @@
 //! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
 //! Only used when TestIncrementalChangedExpectPatch is false.
 //!
+//! TestIncrementalChangedPatchedSectionCount:{count} Acceptable changed-section patch count for a
+//! changed-input relink. Can be repeated. Defaults to the exact count implied by
+//! TestIncrementalChangedSection.
+//!
 //! TestIncrementalChangedExpectReuse:{bool} Whether the changed-input incremental relink should
 //! log reuse of unchanged input sections. Defaults to false.
 //!
@@ -851,6 +855,7 @@ struct Config {
     test_incremental_reordered_inputs: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reason: Option<String>,
+    test_incremental_changed_patched_section_counts: Vec<usize>,
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
     test_incremental_changed_comp_args: Option<ArgumentSet>,
@@ -1583,6 +1588,7 @@ impl Config {
             test_incremental_reordered_inputs: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reason: None,
+            test_incremental_changed_patched_section_counts: Vec::new(),
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
             test_incremental_changed_comp_args: None,
@@ -2109,6 +2115,12 @@ fn process_directive(
         }
         "TestIncrementalChangedFallbackReason" => {
             config.test_incremental_changed_fallback_reason = Some(arg.to_owned());
+        }
+        "TestIncrementalChangedPatchedSectionCount" => {
+            config.test_incremental_changed_patched_section_counts.push(
+                arg.parse()
+                    .context("Invalid TestIncrementalChangedPatchedSectionCount")?,
+            );
         }
         "TestIncrementalChangedExpectReuse" => {
             config.test_incremental_changed_expect_reuse = arg.to_lowercase().parse()?;
@@ -2806,6 +2818,8 @@ impl ProgramInputs {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
             let fallback_message = "changed-input patch unavailable before loading inputs";
+            let fallback_recorded =
+                log.contains(fallback_message) && log.contains("full relink: input file changed:");
             if config.platform == PlatformKind::MachO {
                 if log.contains("patched ") && log.contains(" changed input file") {
                     bail!(
@@ -2840,23 +2854,35 @@ impl ProgramInputs {
                 );
                 if !log.contains(&patched_input_message) {
                     bail!(
-                        "Incremental test failed for {}: changed-input relink did not patch the \
-                        changed input before loading all inputs. Log:\n{}",
+                        "Incremental test failed for {}: changed-input relink did not patch \
+                        the changed input before loading all inputs. Log:\n{}",
                         self.name(),
                         log
                     );
-                }
-                let patched_section_count = changed_inputs.len() * changed_sections.len();
-                let patched_section_message = format!(
-                    "patched {patched_section_count} changed input sections before loading inputs"
-                );
-                if !log.contains(&patched_section_message) {
-                    bail!(
-                        "Incremental test failed for {}: changed-input relink did not narrow the \
-                        update to the changed section. Log:\n{}",
-                        self.name(),
-                        log
-                    );
+                } else {
+                    let patched_section_counts = if config
+                        .test_incremental_changed_patched_section_counts
+                        .is_empty()
+                    {
+                        vec![changed_inputs.len() * changed_sections.len()]
+                    } else {
+                        config
+                            .test_incremental_changed_patched_section_counts
+                            .clone()
+                    };
+                    if !patched_section_counts.iter().any(|patched_section_count| {
+                        let patched_section_message = format!(
+                            "patched {patched_section_count} changed input sections before loading inputs"
+                        );
+                        log.contains(&patched_section_message)
+                    }) {
+                        bail!(
+                            "Incremental test failed for {}: changed-input relink did not narrow \
+                            the update to the changed section. Log:\n{}",
+                            self.name(),
+                            log
+                        );
+                    }
                 }
             } else if log.contains("patched ") && log.contains(" changed input file") {
                 bail!(
@@ -2865,8 +2891,7 @@ impl ProgramInputs {
                     self.name(),
                     log
                 );
-            } else if !log.contains(fallback_message)
-                || !log.contains("full relink: input file changed:")
+            } else if !fallback_recorded
                 || config
                     .test_incremental_changed_fallback_reason
                     .as_ref()
