@@ -336,6 +336,11 @@ pub(crate) trait Platform:
     /// should be considered content and thus prevent the output section from being discarded.
     fn is_zero_sized_section_content(section_id: OutputSectionId) -> bool;
 
+    /// Whether symbols at the start of a deleted span should stay in the output symtab.
+    fn preserves_deleted_span_start_symbols() -> bool {
+        false
+    }
+
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails];
 
     fn finalise_group_layout(

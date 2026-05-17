@@ -4491,10 +4491,11 @@ impl<'data> SymbolCopyInfo<'data> {
             && let Some(deltas) = section_relax_deltas.get(section.0)
             && let Ok(offset) = object.symbol_offset_in_section(sym, section)
             && deltas.deletes_input_offset(offset)
-            && deltas.delta_bytes_at(offset) == 0
+            && (!P::preserves_deleted_span_start_symbols() || deltas.delta_bytes_at(offset) == 0)
         {
-            // Symbols at the start of a deleted span still point at the compacted output location.
-            // Only symbols in the interior of deleted bytes lose their output address entirely.
+            // ELF relaxation can preserve labels at a deleted span start because they still map to
+            // the compacted output address. Other deletion sources, such as Mach-O dead stripping,
+            // remove those symbols together with the bytes they name.
             return None;
         }
 
