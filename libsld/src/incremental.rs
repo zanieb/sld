@@ -13915,6 +13915,7 @@ mod tests {
         assert!(!update_marker_path(&state_dir).exists());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn changed_args_force_initial_link() {
         let dir = tempfile::tempdir().unwrap();
