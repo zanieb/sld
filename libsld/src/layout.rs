@@ -321,6 +321,7 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>>(
         output_sections: &output_sections,
         output_order: &output_order,
         section_layouts: &section_layouts,
+        merged_section_layouts: &merged_section_layouts,
         merged_string_start_addresses: &merged_string_start_addresses,
         merged_strings: &merged_strings,
         per_symbol_flags: &per_symbol_flags,
@@ -1319,6 +1320,7 @@ pub(crate) struct FinaliseLayoutResources<'scope, 'data, P: Platform> {
     output_sections: &'scope OutputSections<'data, P>,
     output_order: &'scope OutputOrder,
     pub(crate) section_layouts: &'scope OutputSectionMap<OutputRecordLayout>,
+    merged_section_layouts: &'scope OutputSectionMap<OutputRecordLayout>,
     merged_string_start_addresses: &'scope MergedStringStartAddresses,
     merged_strings: &'scope OutputSectionMap<MergedStringsSection<'data>>,
     dynamic_symbol_definitions: &'scope Vec<DynamicSymbolDefinition<'data, P>>,
@@ -3337,7 +3339,9 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
                 OrderEvent::SegmentStart(segment_id) => active_segments.push(segment_id),
                 OrderEvent::SegmentEnd(segment_id) => active_segments.retain(|a| *a != segment_id),
                 OrderEvent::Section(section_id) => {
-                    if *keep_sections.get(section_id) {
+                    let primary_section_id = output_sections.primary_output_section(section_id);
+
+                    if *keep_sections.get(primary_section_id) {
                         let needs_segment_content = section_needs_segment_content(section_id);
                         active_segments.retain(|segment_id| {
                             if needs_segment_content
@@ -3550,23 +3554,7 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
         }
 
         SymbolPlacement::SectionGroupStart(section_id) => {
-            let primary = resources.section_layouts.get(section_id);
-            let mut start = (primary.mem_size > 0).then_some(primary.mem_offset);
-
-            for (id, info) in resources.output_sections.ids_with_info() {
-                if let SectionKind::Secondary(primary_id) = info.kind
-                    && primary_id == section_id
-                {
-                    let sec = resources.section_layouts.get(id);
-                    if sec.mem_size > 0 {
-                        start = Some(
-                            start.map_or(sec.mem_offset, |current| current.min(sec.mem_offset)),
-                        );
-                    }
-                }
-            }
-
-            start.unwrap_or(primary.mem_offset)
+            resources.merged_section_layouts.get(section_id).mem_offset
         }
 
         SymbolPlacement::SectionEnd(section_id) => {
@@ -3575,21 +3563,8 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
         }
 
         SymbolPlacement::SectionGroupEnd(section_id) => {
-            let primary = resources.section_layouts.get(section_id);
-            let mut end = (primary.mem_size > 0).then_some(primary.mem_offset + primary.mem_size);
-
-            for (id, info) in resources.output_sections.ids_with_info() {
-                if let SectionKind::Secondary(primary_id) = info.kind
-                    && primary_id == section_id
-                {
-                    let sec = resources.section_layouts.get(id);
-                    if sec.mem_size > 0 {
-                        let candidate_end = sec.mem_offset + sec.mem_size;
-                        end = Some(end.map_or(candidate_end, |current| current.max(candidate_end)));
-                    }
-                }
-            }
-            end.unwrap_or(primary.mem_offset + primary.mem_size)
+            let sec = resources.merged_section_layouts.get(section_id);
+            sec.mem_offset + sec.mem_size
         }
 
         SymbolPlacement::DefsymAbsolute(value) => value,
