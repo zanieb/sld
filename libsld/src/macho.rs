@@ -2241,6 +2241,7 @@ impl platform::Platform for MachO {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn ad_hoc_codesign(path: &Path) -> Result {
     #[cfg(target_os = "macos")]
     {
