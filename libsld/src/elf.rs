@@ -471,6 +471,10 @@ impl platform::Platform for Elf {
         section_id != output_section_id::SFRAME
     }
 
+    fn preserves_deleted_span_start_symbols() -> bool {
+        true
+    }
+
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails] {
         &SECTION_DEFINITIONS
     }
