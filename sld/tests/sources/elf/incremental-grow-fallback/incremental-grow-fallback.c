@@ -10,6 +10,8 @@
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:could not resolve patchable sections
 //#TestIncrementalChangedSymbolBytes:incremental_grow_fallback_value=0x0102030480
+//#Config:writer-bootstrap-fallback-relink:incremental-grow-fallback
+//#SldExtraLinkArgs:--threads=1
 
 extern volatile unsigned char incremental_grow_fallback_value[];
 
