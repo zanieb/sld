@@ -194,6 +194,7 @@ impl Output {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
