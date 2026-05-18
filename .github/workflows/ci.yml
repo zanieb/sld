@@ -9,299 +9,33 @@ on:
 
 permissions: {}
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: '-D warnings'
-
 jobs:
-  test-nightly:
-    name: Test Linux (${{ contains(matrix.runs-on, 'arm') && 'AArch64' || 'x86_64'}}, ${{ matrix.container }}${{ matrix.test-qemu && ', QEMU' || ''}})
+  check-fmt:
+    uses: ./.github/workflows/check-fmt.yml
 
-    strategy:
-      matrix:
-        runs-on:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-        container:
-          - 'ubuntu:24.04'
-          - 'opensuse/tumbleweed:latest'
-          - 'rust:1.94-alpine'
-        test-qemu:
-          - false
-        test-plugins:
-          - false
-        include:
-          - runs-on: ubuntu-24.04
-            container: 'ubuntu:25.10'
-            test-qemu: true
-          - runs-on: ubuntu-24.04-arm
-            container: 'ubuntu:25.10'
-            test-qemu: false
-            test-plugins: true
-          - runs-on: ubuntu-24.04
-            container: 'ubuntu:26.04'
-            test-qemu: true
-          - runs-on: ubuntu-24.04-arm
-            container: 'ubuntu:26.04'
-            test-qemu: false
-        exclude: # TODO: https://github.com/actions/runner/issues/1637
-          - runs-on: ubuntu-24.04-arm
-            container: 'rust:1.94-alpine'
-      fail-fast: false
+  check-lint:
+    uses: ./.github/workflows/check-lint.yml
 
-    runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 10
+  check-minimal-versions:
+    uses: ./.github/workflows/check-minimal-versions.yml
 
-    container:
-      image: ${{ matrix.container }}
+  check-nix:
+    uses: ./.github/workflows/check-nix.yml
 
-    steps:
-      - run: echo "SLD_TEST_CONFIG=test-config-ci.toml" >> $GITHUB_ENV
-      - run: echo "SLD_TEST_CROSS=all" >> $GITHUB_ENV
-        if: ${{ matrix.test-qemu }}
-      - run: apt-get update && apt-get -y install gcc g++ clang clang-format lld curl bubblewrap
-        if: ${{ contains(matrix.container, 'ubuntu') }}
-      - run: apt-get update && apt-get -y install qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu gcc-loongarch64-linux-gnu g++-loongarch64-linux-gnu binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu binutils-loongarch64-linux-gnu
-        if: ${{ matrix.test-qemu }}
-      - run: zypper refresh && zypper in -y gcc gcc-c++ glibc-devel-static clang lld curl rustup bubblewrap
-        if: ${{ contains(matrix.container, 'opensuse') }}
-      - run: apk add build-base lld clang clang-extra-tools bash curl tar
-        if: ${{ contains(matrix.container, 'alpine') }}
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
-        id: rust-toolchain
-        with:
-          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl,riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl,loongarch64-unknown-linux-gnu,loongarch64-unknown-linux-musl
-          components: rustc-codegen-cranelift-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ runner.os }}-${{ matrix.container }}-${{ matrix.runs-on }}
-      - run: cargo build --profile ci --workspace --no-default-features
-      - run: cargo test --profile ci --features plugins
-        if: ${{ matrix.test-plugins }}
-      - run: SLD_TEST_CROSS=$SLD_TEST_CROSS cargo test --profile ci --workspace
+  check-pinact:
+    uses: ./.github/workflows/check-pinact.yml
 
-  riscv-build:
-    name: Build Linux (RISC-V)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-        with:
-          targets: riscv64gc-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install build-essential lld gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
-      - run: cp -f .cargo/config.toml.cross-riscv .cargo/config.toml
-      - run: cargo build --target riscv64gc-unknown-linux-gnu
+  check-zizmor:
+    uses: ./.github/workflows/check-zizmor.yml
+    permissions:
+      contents: read
+      security-events: write
 
-  loongarch64-build:
-    name: Build Linux (LoongArch64)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    container:
-      image: ubuntu:25.10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - run: apt-get update && apt-get install -y build-essential lld gcc gcc-loongarch64-linux-gnu g++-loongarch64-linux-gnu curl
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-        with:
-          targets: loongarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: cp -f .cargo/config.toml.cross-loongarch64 .cargo/config.toml
-      - run: cargo build --target loongarch64-unknown-linux-gnu
+  build-dev-binaries:
+    uses: ./.github/workflows/build-dev-binaries.yml
 
-  wasip1-build:
-    name: Build wasip1
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    container:
-      image: ubuntu:25.10
-    steps:
-      - name: Install xz-utils
-        run: apt-get update && apt-get install -y xz-utils
-      - name: Setup Wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
-        with:
-          version: '43.0.0'
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - run: apt-get install --update -y build-essential gcc gcc-multilib clang curl
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-        with:
-          targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --target wasm32-wasip1
-      - run: cp -f .cargo/config.toml.cross-wasm32p1 .cargo/config.toml
-      # -p libsld prevents integration tests from running. they depend on
-      # spawning processes, which isn't supported on wasi.
-      - run: cargo test --profile ci -p libsld --target wasm32-wasip1
+  test:
+    uses: ./.github/workflows/test.yml
 
-  macho-build:
-    name: Test Mach-O (AArch64)
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --profile ci --workspace --no-default-features
-      - run: cargo test --profile ci --workspace
-
-  windows-build:
-    name: Build Windows (x86_64)
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --profile ci --workspace --no-default-features
-
-  minimal-versions:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - run: sudo apt-get update && sudo apt-get -y install gcc g++ clang clang-format lld curl
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack,cargo-minimal-versions
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo minimal-versions --direct test --profile ci
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      # This is where we check that we're not using features from a more recent rust version. When
-      # updating this, please also update workspace.package.rust-version in `Cargo.toml`.
-      - uses: dtolnay/rust-toolchain@1.94.0
-        id: rust-toolchain
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --target x86_64-unknown-linux-gnu
-
-  rustfmt:
-    name: Check formatting
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  yamlfmt:
-    name: yamlfmt
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.26.0'
-          cache: false
-      - run: go install github.com/google/yamlfmt/cmd/yamlfmt@v0.21.0
-      - run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - run: yamlfmt -lint .
-
-  spelling:
-    name: Spell Check with Typos
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Spell Check Repo
-        uses: crate-ci/typos@v1.46.1
-
-  calc-matrix:
-    name: Find Nix checks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      matrix: ${{ steps.calc-matrix.outputs.matrix }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v34
-        with:
-          nix_on_tmpfs: true
-
-      - name: Calculate check
-        id: calc-matrix
-        run: |
-          set -euo pipefail
-          matrix=$(nix flake show --json | jq -c '.checks."x86_64-linux"|keys_unsorted')
-          echo "Matrix: $matrix"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  nix-checks:
-    needs:
-      - calc-matrix
-    strategy:
-      fail-fast: false
-      matrix:
-        check: ${{ fromJson(needs.calc-matrix.outputs.matrix) }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    name: Nix/${{ matrix.check }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v34
-
-      - name: Restore Nix store
-        uses: nix-community/cache-nix-action/restore@v7
-        id: cache
-        with:
-          primary-key: ${{ runner.os }}-${{ hashFiles( 'flake.lock', 'Cargo.lock') }}
-
-      - name: Run ${{ matrix.check }}
-        run: nix build .#checks.x86_64-linux.${MATRIX_CHECK} -L --show-trace
-        env:
-          MATRIX_CHECK: ${{ matrix.check }}
+  test-external:
+    uses: ./.github/workflows/test-external.yml

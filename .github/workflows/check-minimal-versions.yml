@@ -1,0 +1,26 @@
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  minimal-versions:
+    name: "cargo minimal-versions"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: sudo apt-get update && sudo apt-get -y install gcc g++ clang clang-format lld curl
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install Rust toolchain"
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: taiki-e/install-action@7be9fd86bd1707236395105d6e9329dd1511a7e1 # v2.79.0
+        with:
+          tool: cargo-hack,cargo-minimal-versions
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo +stable minimal-versions --direct test --profile ci

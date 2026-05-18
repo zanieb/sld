@@ -1,0 +1,34 @@
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  clippy:
+    name: "clippy on linux"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # This is where we check that we're not using features from a more recent rust version. When
+      # updating this, please also update workspace.package.rust-version in `Cargo.toml`.
+      - name: "Install Rust toolchain"
+        run: rustup toolchain install 1.94.0 --profile minimal --component clippy --no-self-update
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo +1.94.0 clippy --workspace --target x86_64-unknown-linux-gnu
+
+  typos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Spell Check Repo
+        uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # v1.46.1
