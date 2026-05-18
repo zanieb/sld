@@ -683,6 +683,7 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::compact_unwind_dwarf_offset_hint;
+    use super::compact_unwind_section_addend;
     use super::path_matches_library;
     use super::rewrite_compacted_macho_eh_frame_cie_pointers;
     use linker_utils::relaxation::SectionRelaxDeltas;
@@ -744,6 +745,17 @@ mod tests {
         rewrite_compacted_macho_eh_frame_cie_pointers(&input, &deltas, &mut out).unwrap();
 
         assert_eq!(&out[12..16], &[12, 0, 0, 0]);
+    }
+
+    #[test]
+    fn compact_unwind_section_addend_tracks_dead_strip_compaction() {
+        let deltas = SectionRelaxDeltas::new(vec![(0x1000, 0x2bb0)]);
+
+        assert_eq!(
+            compact_unwind_section_addend(Some(&deltas), 0x139d4),
+            0x10e24
+        );
+        assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
     }
 }
 
@@ -2249,6 +2261,10 @@ fn compact_unwind_dwarf_offset_hint(output_offset: u64) -> u32 {
     }
 }
 
+fn compact_unwind_section_addend(relax_deltas: Option<&SectionRelaxDeltas>, addend: u64) -> u64 {
+    opt_input_to_output(relax_deltas, addend)
+}
+
 fn eh_frame_fde_infos<'data>(
     object: &ObjectLayout<'data, MachO>,
     layout: &MachOLayout<'data>,
@@ -2541,6 +2557,15 @@ fn read_compact_unwind_entries<'data>(
         let field_addend = match field_offset {
             0 | 16 | 24 => read_u64(data, offset)?,
             _ => 0,
+        };
+        let field_addend = if rel.r_extern {
+            field_addend
+        } else {
+            let section_index = object::SectionIndex(rel.r_symbolnum as usize - 1);
+            compact_unwind_section_addend(
+                object.section_relax_deltas.get(section_index.0),
+                field_addend,
+            )
         };
         let value = resolution
             .raw_value

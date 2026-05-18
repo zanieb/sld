@@ -173,4 +173,9 @@ mod tests {
             assert_eq!(part_id, part_id2);
         }
     }
+
+    #[test]
+    fn eh_frame_is_packed_without_inter_input_padding() {
+        assert!(EH_FRAME.should_pack());
+    }
 }

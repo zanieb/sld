@@ -2362,16 +2362,17 @@ fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = Mach
                 scope,
             )?;
         }
-        if state.object.section(section_index)?.is_executable() {
-            load_macho_unwind_metadata_for_symbol::<A>(
-                state,
-                common,
-                symbol_index,
-                resources,
-                queue,
-                scope,
-            )?;
-        }
+    }
+
+    if state.object.section(section_index)?.is_executable() {
+        load_macho_unwind_metadata_for_symbol::<A>(
+            state,
+            common,
+            symbol_index,
+            resources,
+            queue,
+            scope,
+        )?;
     }
 
     Ok(true)
@@ -2588,6 +2589,50 @@ fn ensure_compact_unwind_lookup<'data>(
     let relocations = state.relocations(compact_section_index)?.relocations;
     let mut relocation_indices_by_entry: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut entry_starts_by_symbol: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut symbols_by_section: HashMap<usize, Vec<(u64, usize, bool)>> = HashMap::new();
+    for (symbol_index, symbol) in state.object.enumerate_symbols() {
+        let Some(section_index) = state.object.symbol_section(symbol, symbol_index)? else {
+            continue;
+        };
+        let Ok(symbol_offset) = state.object.symbol_offset_in_section(symbol, section_index) else {
+            continue;
+        };
+        symbols_by_section
+            .entry(section_index.0)
+            .or_default()
+            .push((
+                symbol_offset,
+                symbol_index.0,
+                symbol.n_desc.get(LE) & N_ALT_ENTRY != 0,
+            ));
+    }
+    let mut subsection_boundaries_by_section: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut symbols_by_subsection: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
+    for (section_index, symbols) in symbols_by_section {
+        let section_size = state
+            .object
+            .section_size(state.object.section(object::SectionIndex(section_index))?)?;
+        let mut boundaries = vec![0];
+        boundaries.extend(symbols.iter().filter_map(|(offset, _, is_alt)| {
+            (!*is_alt && *offset < section_size).then_some(*offset)
+        }));
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for (offset, symbol_index, _) in symbols {
+            let boundary_index = boundaries.partition_point(|boundary| *boundary <= offset);
+            if boundary_index == 0 {
+                continue;
+            }
+            let subsection_start = boundaries[boundary_index - 1];
+            symbols_by_subsection
+                .entry((section_index, subsection_start))
+                .or_default()
+                .push(symbol_index);
+        }
+
+        subsection_boundaries_by_section.insert(section_index, boundaries);
+    }
 
     for (relocation_index, rel) in relocations.iter().copied().enumerate() {
         let rel_info = rel.info(LE);
@@ -2617,6 +2662,32 @@ fn ensure_compact_unwind_lookup<'data>(
                 .entry(rel_info.r_symbolnum as usize)
                 .or_default()
                 .push(entry_start);
+        } else if field_offset == 0 && rel_info.r_symbolnum > 0 {
+            let section_index = rel_info.r_symbolnum as usize - 1;
+            ensure!(
+                section_index < state.sections.len(),
+                "Mach-O __compact_unwind relocation references invalid section ordinal {}",
+                rel_info.r_symbolnum
+            );
+            let symbol_offset = macho_read_u64(data, offset)?;
+            let Some(boundaries) = subsection_boundaries_by_section.get(&section_index) else {
+                continue;
+            };
+            let boundary_index = boundaries.partition_point(|boundary| *boundary <= symbol_offset);
+            if boundary_index == 0 {
+                continue;
+            }
+            let subsection_start = boundaries[boundary_index - 1];
+            if let Some(symbol_indices) =
+                symbols_by_subsection.get(&(section_index, subsection_start))
+            {
+                for symbol_index in symbol_indices {
+                    entry_starts_by_symbol
+                        .entry(*symbol_index)
+                        .or_default()
+                        .push(entry_start);
+                }
+            }
         }
     }
 
@@ -2799,6 +2870,16 @@ fn macho_read_u32(data: &[u8], offset: usize) -> Result<u32> {
         .get(offset..end)
         .with_context(|| format!("Mach-O 32-bit read at offset {offset:#x} is out of bounds"))?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn macho_read_u64(data: &[u8], offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .context("Mach-O 64-bit read offset overflow")?;
+    let bytes = data
+        .get(offset..end)
+        .with_context(|| format!("Mach-O 64-bit read at offset {offset:#x} is out of bounds"))?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 pub(crate) fn macho_live_eh_frame_cies(
