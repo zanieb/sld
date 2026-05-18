@@ -152,7 +152,10 @@ When working on tests, you can temporarily disable the formatting check by setti
 
 ## Running external tests
 
-sld can run some external test suites. Currently only the test suite of mold is supported.
+sld can run external test suites. The repository supports the mold suite plus a curated LLVM LLD
+corpus for ELF and Mach-O. The LLVM subset is vendored under
+[`external_test_suites/llvm-project`](./external_test_suites/llvm-project) with per-test
+attribution in its curation manifest.
 
 You can run the mold tests as follows:
 
@@ -163,17 +166,32 @@ git submodule update --init --recursive
 cargo test --features mold_tests
 ```
 
-The output will be placed under `fakes-debug/out/test/`.
+The mold output will be placed under `fakes-debug/out/test/`.
 
-You can use this command instead of the second one to run all external tests together:
+You can run the curated LLVM LLD subsets directly:
+
+```sh
+# Linux-oriented ELF corpus
+cargo test --features llvm_elf_tests external_test_suites/llvm-project/ELF
+
+# macOS-oriented Mach-O corpus
+cargo test --features llvm_macho_tests external_test_suites/llvm-project/MachO
+```
+
+You can use this command instead of the mold and LLVM ELF commands to run the host-neutral
+external-test aggregate:
 
 ```sh
 cargo test --features external_tests
 ```
 
-Some tests are configured to be skipped by default. A list of these skipped tests can be found at:
+Some tests are configured to be skipped by default. The skip lists live at:
 
 [sld/tests/external_tests/mold_skip_tests.toml](./sld/tests/external_tests/mold_skip_tests.toml): for the mold tests.
+
+[sld/tests/external_tests/llvm_elf_skip_tests.toml](./sld/tests/external_tests/llvm_elf_skip_tests.toml): for the curated LLVM ELF tests.
+
+[sld/tests/external_tests/llvm_macho_skip_tests.toml](./sld/tests/external_tests/llvm_macho_skip_tests.toml): for the curated LLVM Mach-O tests.
 
 However, you can also run the tests without skipping any of them:
 
@@ -181,7 +199,13 @@ However, you can also run the tests without skipping any of them:
 # Run mold tests without skipping any test
 SLD_IGNORE_SKIP=mold cargo test --features mold_tests
 
-# Run all external tests without skipping any test
+# Run the curated LLVM ELF subset without skipping any test
+SLD_IGNORE_SKIP=llvm_elf cargo test --features llvm_elf_tests
+
+# Run the curated LLVM Mach-O subset without skipping any test
+SLD_IGNORE_SKIP=llvm_macho cargo test --features llvm_macho_tests
+
+# Run the host-neutral aggregate without skipping any test
 SLD_IGNORE_SKIP=all cargo test --features external_tests
 ```
 
@@ -193,6 +217,10 @@ When debugging a failing test, it can be useful to see how other linkers (such a
 SLD_EXTERNAL_LINKER=ld cargo test --features mold_tests discard.sh
 
 SLD_EXTERNAL_LINKER=lld cargo test --features mold_tests allow-multiple-definition.sh
+
+SLD_EXTERNAL_LINKER=lld cargo test --features llvm_elf_tests gc-sections.sh
+
+SLD_EXTERNAL_LINKER=ld cargo test --features llvm_macho_tests reloc-subtractor.sh
 ```
 
 The skip list is still applied, so `expect_failure` tests work as usual. This is useful for determining whether a test that fails with sld also fails with another linker, or whether the failure is specific to sld.

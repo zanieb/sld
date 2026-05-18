@@ -1,0 +1,5 @@
+[skipped_groups.current_sld_failures]
+reason = "Known current sld failures retained as regression sentinels."
+tests = [
+  "arm64-reloc-tlv-load.sh", # Panics while computing Mach-O segment layout for imported TLV data.
+]

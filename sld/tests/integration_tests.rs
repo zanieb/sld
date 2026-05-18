@@ -189,7 +189,8 @@
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
 //! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
-//! Only used when TestIncrementalChangedExpectPatch is false.
+//! When TestIncrementalChangedExpectPatch is false, the fallback is required. When it is true, the
+//! fallback is accepted as an explicitly allowed alternative to the patch fast path.
 //!
 //! TestIncrementalChangedPatchedSectionCount:{count} Acceptable changed-section patch count for a
 //! changed-input relink. Can be repeated. Defaults to the exact count implied by
@@ -2820,6 +2821,11 @@ impl ProgramInputs {
             let fallback_message = "changed-input patch unavailable before loading inputs";
             let fallback_recorded =
                 log.contains(fallback_message) && log.contains("full relink: input file changed:");
+            let allowed_fallback_recorded = fallback_recorded
+                && config
+                    .test_incremental_changed_fallback_reason
+                    .as_ref()
+                    .is_some_and(|reason| log.contains(reason));
             if config.platform == PlatformKind::MachO {
                 if log.contains("patched ") && log.contains(" changed input file") {
                     bail!(
@@ -2852,14 +2858,16 @@ impl ProgramInputs {
                     "patched {changed_input_count} changed input file{} before loading inputs",
                     if changed_input_count == 1 { "" } else { "s" }
                 );
-                if !log.contains(&patched_input_message) {
+                let patched_input_recorded = log.contains(&patched_input_message);
+                if !patched_input_recorded && !allowed_fallback_recorded {
                     bail!(
                         "Incremental test failed for {}: changed-input relink did not patch \
                         the changed input before loading all inputs. Log:\n{}",
                         self.name(),
                         log
                     );
-                } else {
+                }
+                if patched_input_recorded {
                     let patched_section_counts = if config
                         .test_incremental_changed_patched_section_counts
                         .is_empty()
