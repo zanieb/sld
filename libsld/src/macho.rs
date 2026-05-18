@@ -67,6 +67,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use zerocopy::BigEndian;
 use zerocopy::FromBytes;
@@ -1437,6 +1438,7 @@ impl platform::Platform for MachO {
         output.write(layout, |sized_output, layout| {
             macho_writer::write::<A>(sized_output, layout, incremental)
         })?;
+        #[cfg(target_os = "macos")]
         if layout.args().should_adhoc_codesign && !layout.symbol_db.output_kind.is_partial_object()
         {
             ad_hoc_codesign(output.path())?;
@@ -2241,28 +2243,25 @@ impl platform::Platform for MachO {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[cfg(target_os = "macos")]
 fn ad_hoc_codesign(path: &Path) -> Result {
-    #[cfg(target_os = "macos")]
-    {
-        timing_phase!("Ad-hoc code sign Mach-O output");
+    timing_phase!("Ad-hoc code sign Mach-O output");
 
-        let output = std::process::Command::new("codesign")
-            .arg("-s")
-            .arg("-")
-            .arg("-f")
-            .arg(path)
-            .output()
-            .with_context(|| format!("Failed to run codesign for `{}`", path.display()))?;
+    let output = std::process::Command::new("codesign")
+        .arg("-s")
+        .arg("-")
+        .arg("-f")
+        .arg(path)
+        .output()
+        .with_context(|| format!("Failed to run codesign for `{}`", path.display()))?;
 
-        ensure!(
-            output.status.success(),
-            "codesign failed for `{}`:\n{}{}",
-            path.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    ensure!(
+        output.status.success(),
+        "codesign failed for `{}`:\n{}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     Ok(())
 }
