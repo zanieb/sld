@@ -1,0 +1,64 @@
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  calc-matrix:
+    name: "find nix checks"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.calc-matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        with:
+          nix_on_tmpfs: true
+
+      - name: Calculate check
+        id: calc-matrix
+        run: |
+          set -euo pipefail
+          matrix=$(nix flake show --json | jq -c '.checks."x86_64-linux"|keys_unsorted')
+          echo "Matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  nix-checks:
+    needs:
+      - calc-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJson(needs.calc-matrix.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    name: "Nix/${{ matrix.check }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        id: cache
+        with:
+          primary-key: ${{ runner.os }}-${{ hashFiles( 'flake.lock', 'Cargo.lock') }}
+
+      - name: Run ${{ matrix.check }}
+        run: nix build .#checks.x86_64-linux.${MATRIX_CHECK} -L --show-trace
+        env:
+          MATRIX_CHECK: ${{ matrix.check }}

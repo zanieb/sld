@@ -253,6 +253,20 @@ workflow or other YAML files, run:
 yamlfmt .
 ```
 
+GitHub Actions references are pinned to immutable commit SHAs with
+[`pinact`](https://github.com/suzuki-shunsuke/pinact). If you change workflow action references,
+refresh the pins with:
+
+```sh
+pinact run
+```
+
+To verify that the pins are still present, run:
+
+```sh
+pinact run --check
+```
+
 ### Naming
 
 When in doubt, do what is done in the Rust standard library. e.g. when making a name CamelCase, only

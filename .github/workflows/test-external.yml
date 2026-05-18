@@ -1,12 +1,5 @@
-name: Run external tests
-
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - "**"
+  workflow_call:
 
 permissions: {}
 
@@ -16,7 +9,7 @@ env:
 
 jobs:
   external-tests:
-    name: Run mold tests
+    name: "mold"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     container:
@@ -29,14 +22,18 @@ jobs:
               g++-aarch64-linux-gnu g++-riscv64-linux-gnu g++-loongarch64-linux-gnu \
               && mkdir /sde && wget -O- -q https://downloadmirror.intel.com/859732/sde-external-9.58.0-2025-06-16-lin.tar.xz | tar -C /sde --strip-components=1 --xz -xf - && ln -s /sde/sde64 /usr/bin
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - name: "Install Rustup"
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: "Install Rust toolchain"
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check regressions
-        run: SLD_TEST_CROSS=all cargo test --features mold_tests external_test_suites/mold -- --skip expect_failure
+        run: SLD_TEST_CROSS=all cargo +stable test --features mold_tests external_test_suites/mold -- --skip expect_failure
       - name: Check tests that should fail still fail
-        run: SLD_TEST_CROSS=all cargo test --features mold_tests expect_failure
+        run: SLD_TEST_CROSS=all cargo +stable test --features mold_tests expect_failure
