@@ -24,7 +24,7 @@ clang -target x86_64-unknown-linux-gnu -c "$workdir/eh-frame-gc.s" \
   -o "$workdir/eh-frame-gc.so"
 
 if command -v readelf >/dev/null 2>&1; then
-  readelf -S "$workdir/eh-frame-gc.so" | grep -q '.test_personality_section'
+  readelf -SW "$workdir/eh-frame-gc.so" | grep -q '.test_personality_section'
 else
   echo "eh-frame-gc skipped"
 fi
