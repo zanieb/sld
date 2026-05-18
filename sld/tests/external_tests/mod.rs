@@ -1,3 +1,4 @@
+mod llvm_curated_tests;
 mod mold_tests;
 
 use crate::Filter;
@@ -15,6 +16,14 @@ use std::sync::OnceLock;
 pub(super) fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
     if cfg!(feature = "mold_tests") {
         mold_tests::collect_tests(tests, filter)?;
+    }
+
+    if cfg!(feature = "llvm_elf_tests") {
+        llvm_curated_tests::collect_elf_tests(tests, filter)?;
+    }
+
+    if cfg!(feature = "llvm_macho_tests") {
+        llvm_curated_tests::collect_macho_tests(tests, filter)?;
     }
 
     let _ = (tests, filter);
@@ -124,7 +133,7 @@ impl FakesDir {
                     .expect("failed to create temp directory for external linker fakes");
                 let tmp_path = tmp.path();
 
-                for link_name in &["mold", "ld", "ld.lld"] {
+                for link_name in &["mold", "ld", "ld.lld", "ld64"] {
                     let link = tmp_path.join(link_name);
                     // Note, we can't just create a symlink, since lld requires that it's invoked as
                     // "ld.lld" to work properly. Instead, we create a wrapper script.

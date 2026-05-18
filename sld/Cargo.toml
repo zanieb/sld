@@ -61,5 +61,7 @@ perfetto = ["libsld/perfetto"]
 wasm = ["libsld/wasm"]
 
 # external tests
-external_tests = ["mold_tests"]
+external_tests = ["mold_tests", "llvm_elf_tests"]
+llvm_elf_tests = []
+llvm_macho_tests = []
 mold_tests = []

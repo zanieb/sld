@@ -8,15 +8,15 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  external-tests:
-    name: "mold"
+  external-tests-linux:
+    name: Run Linux external tests
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     container:
       image: "ubuntu:25.04"
     steps:
       - run: |
-          apt-get update && apt-get -y install gcc g++ clang lld curl bubblewrap git zstd qemu-user gdb dwarfdump perl wget xz-utils \
+          apt-get update && apt-get -y install gcc g++ clang lld binutils curl bubblewrap git zstd qemu-user gdb dwarfdump perl wget xz-utils \
               binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu binutils-loongarch64-linux-gnu \
               gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-loongarch64-linux-gnu \
               g++-aarch64-linux-gnu g++-riscv64-linux-gnu g++-loongarch64-linux-gnu \
@@ -37,3 +37,32 @@ jobs:
         run: SLD_TEST_CROSS=all cargo +stable test --features mold_tests external_test_suites/mold -- --skip expect_failure
       - name: Check tests that should fail still fail
         run: SLD_TEST_CROSS=all cargo +stable test --features mold_tests expect_failure
+      - name: Check curated LLVM ELF regressions
+        run: cargo +stable test --features llvm_elf_tests external_test_suites/llvm-project/ELF -- --skip expect_failure
+      - name: Check curated LLVM ELF tests that should fail still fail
+        run: cargo +stable test --features llvm_elf_tests expect_failure
+
+  external-tests-macos:
+    name: Run macOS external tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+    env:
+      SLD_EXTERNAL_TEST_BASH: /opt/homebrew/bin/bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Bash
+        run: brew install bash
+      - name: "Install Rustup"
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: "Install Rust toolchain"
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check curated LLVM Mach-O regressions
+        run: cargo +stable test --features llvm_macho_tests external_test_suites/llvm-project/MachO -- --skip expect_failure
+      - name: Check curated LLVM Mach-O tests that should fail still fail
+        run: cargo +stable test --features llvm_macho_tests expect_failure

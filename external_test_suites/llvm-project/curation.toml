@@ -1,0 +1,65 @@
+[upstream]
+project = "llvm/llvm-project"
+commit = "992df0aed5dda0a644c8939daa81b028f198651b"
+license = "Apache-2.0 WITH LLVM-exception"
+license_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/LICENSE.TXT"
+
+[[tests]]
+path = "MachO/test/arm64-relocs.sh"
+derived_from = "lld/test/MachO/arm64-relocs.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/MachO/arm64-relocs.s"
+adaptation = "Reduced to a standalone AArch64 Mach-O relocation smoke test that assembles with clang, links with ld64, and checks exported symbols."
+
+[[tests]]
+path = "MachO/test/reloc-subtractor.sh"
+derived_from = "lld/test/MachO/reloc-subtractor.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/MachO/reloc-subtractor.s"
+adaptation = "Reduced to a standalone subtractor-relocation dylib link that keeps the relocation pattern and verifies the output symbols."
+
+[[tests]]
+path = "ELF/test/gc-sections.sh"
+derived_from = "lld/test/ELF/gc-sections.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/ELF/gc-sections.s"
+adaptation = "Reduced to a focused --gc-sections check that verifies a live function remains while an unreachable one is removed."
+
+[[tests]]
+path = "ELF/test/archive-activation.sh"
+derived_from = "lld/test/ELF/archive.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/ELF/archive.s"
+adaptation = "Reduced to a focused archive member activation check with a single referenced symbol."
+
+[[tests]]
+path = "MachO/test/arm64-reloc-got-load.sh"
+derived_from = "lld/test/MachO/arm64-reloc-got-load.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/MachO/arm64-reloc-got-load.s"
+adaptation = "Reduced to a dylib-import case that keeps the GOTPAGE/GOTPAGEOFF relocation pattern and verifies the imported symbols remain unresolved in the linked image."
+
+[[tests]]
+path = "MachO/test/arm64-reloc-tlv-load.sh"
+derived_from = "lld/test/MachO/arm64-reloc-tlv-load.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/MachO/arm64-reloc-tlv-load.s"
+adaptation = "Reduced to a thread-local variable import case that keeps the TLVPPAGE/TLVPPAGEOFF relocation pattern and verifies the imported symbols remain unresolved in the linked image."
+
+[[tests]]
+path = "MachO/test/arm64-reloc-pointer-to-got.sh"
+derived_from = "lld/test/MachO/arm64-reloc-pointer-to-got.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/MachO/arm64-reloc-pointer-to-got.s"
+adaptation = "Reduced to a standalone dylib link that preserves POINTER_TO_GOT input relocations and verifies the linked image exports the expected symbols."
+
+[[tests]]
+path = "ELF/test/common-symbols.sh"
+derived_from = "lld/test/ELF/common.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/ELF/common.s"
+adaptation = "Reduced to a focused common-symbol layout smoke test that checks the resulting ELF symbol bindings with nm."
+
+[[tests]]
+path = "ELF/test/common-gc.sh"
+derived_from = "lld/test/ELF/common-gc.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/ELF/common-gc.s"
+adaptation = "Reduced to paired links with and without --gc-sections, verifying that reachable common storage survives while unreachable common storage is discarded."
+
+[[tests]]
+path = "ELF/test/eh-frame-gc.sh"
+derived_from = "lld/test/ELF/eh-frame-gc.s"
+upstream_url = "https://github.com/llvm/llvm-project/blob/992df0aed5dda0a644c8939daa81b028f198651b/lld/test/ELF/eh-frame-gc.s"
+adaptation = "Reduced to a shared-object --gc-sections case that keeps a personality reference alive and verifies the preserved section with readelf when available."

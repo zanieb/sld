@@ -33,6 +33,7 @@ jobs:
           - {target: x86_64-unknown-linux-gnu, runs-on: ubuntu-22.04}
           - {target: aarch64-unknown-linux-gnu, runs-on: ubuntu-22.04-arm}
           - {target: riscv64gc-unknown-linux-gnu, runs-on: ubuntu-22.04-arm, build: zigbuild}
+          - {target: aarch64-apple-darwin, runs-on: macos-latest}
 
           - {target: x86_64-unknown-linux-musl, runs-on: ubuntu-22.04, musl: true, args: --features=mimalloc}
           - {target: aarch64-unknown-linux-musl, runs-on: ubuntu-22.04-arm, musl: true, args: --features=mimalloc}
@@ -41,7 +42,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y clang
-        if: matrix.build != 'zigbuild'
+        if: runner.os == 'Linux' && matrix.build != 'zigbuild'
 
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -74,7 +75,7 @@ jobs:
         run: cargo +stable build --release
 
       - name: Switch to linking with sld
-        if: matrix.build != 'zigbuild' # zigbuild ignores this config
+        if: runner.os == 'Linux' && matrix.build != 'zigbuild' # zigbuild ignores this config
         run: |
           mkdir -p "$HOME/.cargo"
           SLD="${PWD}/target/release/sld"
@@ -82,8 +83,23 @@ jobs:
           echo -e "[target.${{matrix.target}}]\nlinker = \"clang\"\nrustflags = [\"-Clink-arg=--ld-path=$SLD\"]\n" >>"$HOME/.cargo/config.toml"
           cat "$HOME/.cargo/config.toml"
 
+      - name: Switch to linking with sld on macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$HOME/.cargo"
+          SLD="${PWD}/target/release/sld"
+          $SLD --version
+          echo -e "[target.${{matrix.target}}]\nlinker = \"$SLD\"\nrustflags = [\"-Clink-arg=-flavor\", \"-Clink-arg=darwin\"]\n" >>"$HOME/.cargo/config.toml"
+          cat "$HOME/.cargo/config.toml"
+
       - name: Build release binary
-        run: cargo +stable ${{matrix.build || 'build' }} ${{matrix.args}} --profile dist --target ${{ matrix.target }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            SLD_SAVE_BASE="${PWD}/target/sld-self-link-saves" \
+              cargo +stable ${{matrix.build || 'build' }} ${{matrix.args}} --profile dist --target ${{ matrix.target }}
+          else
+            cargo +stable ${{matrix.build || 'build' }} ${{matrix.args}} --profile dist --target ${{ matrix.target }}
+          fi
 
       - name: Create tarballs
         run: |
@@ -91,7 +107,14 @@ jobs:
           mkdir "$n"
           cp "target/${{ matrix.target }}/dist/sld" "$n"
           cp README.md LICENSE* CHANGELOG.md "$n"
-          readelf -p .comment "$n/sld" | grep "Linker: sld" || echo "::warning::'$n' wasn't linked with sld"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            file "$n/sld" | grep "Mach-O 64-bit executable arm64" || echo "::warning::'$n' wasn't recognized as an arm64 Mach-O executable"
+            grep -R "Original output file: .*target/${{ matrix.target }}/dist/deps/sld-" \
+              target/sld-self-link-saves/*/run-with >/dev/null \
+              || { echo "::error::'$n' wasn't captured as an sld-linked macOS dist binary"; exit 1; }
+          else
+            readelf -p .comment "$n/sld" | grep "Linker: sld" || echo "::warning::'$n' wasn't linked with sld"
+          fi
           tar zcf $n.tar.gz $n
 
       - name: Release # zizmor: ignore[superfluous-actions]
