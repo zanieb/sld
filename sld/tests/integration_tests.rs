@@ -82,6 +82,9 @@
 //! ExpectMachOBuildVersion:{platform} {min-os} {sdk} Checks that the output Mach-O contains an
 //! LC_BUILD_VERSION load command with the specified values.
 //!
+//! ExpectMachOUnwindInfoSld:{symbol-name} Checks that sld's final Mach-O `__unwind_info` contains
+//! an unwind entry for the specified symbol's final image offset.
+//!
 //! Mode:{mode} Set linking mode to static (default), dynamic or unspecified. Cannot be used
 //! together with LinkerDriver.
 //!
@@ -338,6 +341,7 @@ use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -1325,6 +1329,7 @@ struct Assertions {
     expected_section_bytes: Vec<ExpectedSectionBytes>,
     expected_section_types: Vec<ExpectedSectionType>,
     expected_macho_build_version: Option<ExpectedMachOBuildVersion>,
+    expected_sld_macho_unwind_info: Vec<String>,
     no_empty_load_segments: bool,
     output_file_matches: Vec<OutputFileMatch>,
     max_thunks: u64,
@@ -1914,6 +1919,10 @@ fn process_directive(
             config.assertions.expected_macho_build_version =
                 Some(ExpectedMachOBuildVersion::parse(arg.trim())?);
         }
+        "ExpectMachOUnwindInfoSld" => config
+            .assertions
+            .expected_sld_macho_unwind_info
+            .push(arg.trim().to_owned()),
         "ExpectDynamic" => config
             .assertions
             .expected_dynamic_entries
@@ -3571,6 +3580,71 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
 
 fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn macho_regular_unwind_function_offsets(bytes: &[u8]) -> Result<HashSet<u32>> {
+    const MACHO_UNWIND_REGULAR_SECOND_LEVEL: u32 = 2;
+
+    let index_offset = read_macho_unwind_u32(bytes, 20, "index offset")? as usize;
+    let index_count = read_macho_unwind_u32(bytes, 24, "index count")? as usize;
+    let mut function_offsets = HashSet::new();
+
+    for index in 0..index_count.saturating_sub(1) {
+        let index_entry_offset = index_offset + index * 3 * size_of::<u32>();
+        let second_level_offset =
+            read_macho_unwind_u32(bytes, index_entry_offset + 4, "second-level page offset")?
+                as usize;
+        ensure!(
+            read_macho_unwind_u32(bytes, second_level_offset, "second-level page kind")?
+                == MACHO_UNWIND_REGULAR_SECOND_LEVEL,
+            "Expected sld Mach-O __unwind_info to use regular second-level pages"
+        );
+        let page_entry_offset = read_macho_unwind_u16(
+            bytes,
+            second_level_offset + size_of::<u32>(),
+            "second-level page entry offset",
+        )? as usize;
+        let page_entry_count = read_macho_unwind_u16(
+            bytes,
+            second_level_offset + size_of::<u32>() + size_of::<u16>(),
+            "second-level page entry count",
+        )? as usize;
+
+        for page_entry in 0..page_entry_count {
+            let function_offset = read_macho_unwind_u32(
+                bytes,
+                second_level_offset + page_entry_offset + page_entry * 2 * size_of::<u32>(),
+                "regular unwind function offset",
+            )?;
+            function_offsets.insert(function_offset);
+        }
+    }
+
+    Ok(function_offsets)
+}
+
+fn read_macho_unwind_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
+    let end = offset
+        .checked_add(size_of::<u16>())
+        .context("Mach-O __unwind_info u16 offset overflow")?;
+    read_u16_le(
+        bytes
+            .get(offset..end)
+            .with_context(|| format!("Mach-O __unwind_info {field} is out of bounds"))?,
+    )
+    .with_context(|| format!("Failed to read Mach-O __unwind_info {field}"))
+}
+
+fn read_macho_unwind_u32(bytes: &[u8], offset: usize, field: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(size_of::<u32>())
+        .context("Mach-O __unwind_info u32 offset overflow")?;
+    read_u32_le(
+        bytes
+            .get(offset..end)
+            .with_context(|| format!("Mach-O __unwind_info {field} is out of bounds"))?,
+    )
+    .with_context(|| format!("Failed to read Mach-O __unwind_info {field}"))
 }
 
 fn mutation_section_file_range(
@@ -5407,6 +5481,7 @@ impl Assertions {
             }
             object::File::MachO64(macho_obj) => {
                 self.verify_macho_build_version(&macho_obj)?;
+                self.verify_sld_macho_unwind_info(&macho_obj, linker_used)?;
                 if !self.expected_comments.is_empty() {
                     bail!("ExpectComment is not supported for MachO",);
                 }
@@ -5598,6 +5673,49 @@ impl Assertions {
             } else if !actual_comments.iter().any(|actual| actual == expected) {
                 bail!("Expected .comment `{expected}`");
             }
+        }
+
+        Ok(())
+    }
+
+    fn verify_sld_macho_unwind_info<'data>(
+        &self,
+        obj: &object::read::macho::MachOFile64<'data>,
+        linker_used: &Linker,
+    ) -> Result {
+        if self.expected_sld_macho_unwind_info.is_empty() || !linker_used.is_sld() {
+            return Ok(());
+        }
+
+        let unwind_info = obj
+            .section_by_name("__unwind_info")
+            .context("Expected Mach-O __unwind_info section")?
+            .data()
+            .context("Failed to read Mach-O __unwind_info section")?;
+        let unwind_function_offsets = macho_regular_unwind_function_offsets(unwind_info)?;
+
+        for symbol_name in &self.expected_sld_macho_unwind_info {
+            let symbol = obj
+                .symbols()
+                .find(|symbol| symbol.name().ok() == Some(symbol_name.as_str()))
+                .with_context(|| {
+                    format!("Expected Mach-O unwind symbol `{symbol_name}` to exist")
+                })?;
+            let image_offset = symbol
+                .address()
+                .checked_sub(0x1_0000_0000)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .with_context(|| {
+                    format!(
+                        "Mach-O unwind symbol `{symbol_name}` address {:#x} is outside the 32-bit image range",
+                        symbol.address()
+                    )
+                })?;
+
+            ensure!(
+                unwind_function_offsets.contains(&image_offset),
+                "Expected sld Mach-O __unwind_info to contain `{symbol_name}` at image offset {image_offset:#x}, got offsets {unwind_function_offsets:#x?}"
+            );
         }
 
         Ok(())
