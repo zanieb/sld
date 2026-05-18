@@ -33,6 +33,7 @@ from typing import Any
 
 
 CRATES_API = "https://crates.io/api/v1"
+CRATES_PAGE_SIZE = 100
 USER_AGENT = "sld-top-crates-validation"
 
 
@@ -192,9 +193,15 @@ def crate_version(crate: dict[str, Any]) -> str:
 def fetch_top_crates(limit: int) -> list[CrateSpec]:
     if limit < 1:
         raise RuntimeError("--limit must be at least 1")
-    url = f"{CRATES_API}/crates?sort=downloads&per_page={limit}"
-    data = fetch_json(url)
-    crates = data.get("crates", [])
+
+    crates: list[dict[str, Any]] = []
+    url = top_crates_source(limit)
+    while len(crates) < limit and url:
+        data = fetch_json(url)
+        crates.extend(data.get("crates", []))
+        next_page = data.get("meta", {}).get("next_page")
+        url = urllib.parse.urljoin(f"{CRATES_API}/crates", str(next_page)) if next_page else ""
+
     if len(crates) < limit:
         raise RuntimeError(f"crates.io returned {len(crates)} crates for limit {limit}")
     return [
@@ -205,6 +212,11 @@ def fetch_top_crates(limit: int) -> list[CrateSpec]:
         )
         for crate in crates[:limit]
     ]
+
+
+def top_crates_source(limit: int) -> str:
+    page_size = min(limit, CRATES_PAGE_SIZE)
+    return f"{CRATES_API}/crates?sort=downloads&per_page={page_size}"
 
 
 def fetch_named_crate(name: str) -> CrateSpec:
@@ -478,7 +490,7 @@ def validate_crate(crate: CrateSpec, index: int, total: int, args: argparse.Name
 def write_manifest(crates: list[CrateSpec], args: argparse.Namespace) -> None:
     manifest = {
         "fetched_at": now_iso(),
-        "source": f"{CRATES_API}/crates?sort=downloads&per_page={args.limit}",
+        "source": top_crates_source(args.limit),
         "crates": [dataclasses.asdict(crate) for crate in crates],
     }
     (args.work_dir / "top-crates.json").write_text(
