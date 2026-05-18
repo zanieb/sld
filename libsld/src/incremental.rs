@@ -780,13 +780,12 @@ fn relocation_target_patches_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        let deferred_relocation =
-            deferred_instruction_relocation_patch(
-                &file,
-                relocation.kind,
-                previous_written_value,
-                written_value,
-            );
+        let deferred_relocation = deferred_instruction_relocation_patch(
+            &file,
+            relocation.kind,
+            previous_written_value,
+            written_value,
+        );
         let data = if deferred_relocation.is_some() {
             let Ok(size) = usize::try_from(relocation.size) else {
                 return Ok(Err(format!(
