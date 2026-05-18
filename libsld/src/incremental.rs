@@ -723,6 +723,7 @@ fn relocation_target_patches_for_input(
     relocations: &mut [RelocationRecord],
     input: &FileState,
     bytes: &[u8],
+    previous_bytes: Option<&[u8]>,
 ) -> Result<std::result::Result<RelocationTargetPatches, String>> {
     let mut input_ranges = Vec::new();
     let mut output_patches = Vec::new();
@@ -761,6 +762,20 @@ fn relocation_target_patches_for_input(
             continue;
         }
         if current.section_index.0 as u32 != target.section_index {
+            if current.section_offset == target.section_offset
+                && let Some(previous_bytes) = previous_bytes
+                && relocation_target_section_was_renumbered(
+                    previous_bytes,
+                    input.path.as_str(),
+                    &target.input,
+                    target.section_index,
+                    &file,
+                    current.section_index,
+                )?
+            {
+                target.section_index = current.section_index.0 as u32;
+                continue;
+            }
             return Ok(Err(format!(
                 "relocation target moved in {}",
                 display_hex_path(&input.path)
@@ -844,6 +859,36 @@ fn relocation_target_patches_for_input(
         output_patches,
         output_symbols,
     }))
+}
+
+fn relocation_target_section_was_renumbered(
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    input_ref: &str,
+    previous_section_index: u32,
+    current_file: &object::File<'_>,
+    current_section_index: object::SectionIndex,
+) -> Result<bool> {
+    let Some(previous_input_bytes) = patch_input_bytes(previous_bytes, input_file_path, input_ref)?
+    else {
+        return Ok(false);
+    };
+    let previous_file = object::File::parse(previous_input_bytes.bytes)
+        .context("Failed to parse previous relocation target input")?;
+    let previous_section = previous_file
+        .section_by_index(object::SectionIndex(previous_section_index as usize))
+        .context("Missing previous relocation target section")?;
+    let current_section = current_file
+        .section_by_index(current_section_index)
+        .context("Missing current relocation target section")?;
+    let Ok(previous_section_name) = previous_section.name() else {
+        return Ok(false);
+    };
+    let Ok(current_section_name) = current_section.name() else {
+        return Ok(false);
+    };
+
+    Ok(previous_section_name == current_section_name)
 }
 
 fn deferred_instruction_relocation_patch(
@@ -1079,6 +1124,7 @@ fn patch_changed_inputs(
                 &mut previous.relocations,
                 input,
                 &bytes,
+                previous_snapshot_bytes.as_deref(),
             )? {
                 Ok(patches) => patches,
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -9560,9 +9606,14 @@ mod tests {
         );
         let mut relocations = vec![relocation];
 
-        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
-            .unwrap()
-            .unwrap();
+        let patches = relocation_target_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(patches.input_ranges, vec![first_value_range]);
         assert_eq!(patches.output_patches.len(), 1);
@@ -9607,9 +9658,14 @@ mod tests {
         );
         let mut relocations = vec![relocation];
 
-        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
-            .unwrap()
-            .unwrap();
+        let patches = relocation_target_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(patches.output_patches.len(), 1);
         assert!(patches.output_patches[0].deferred_relocation.is_some());
@@ -9641,9 +9697,14 @@ mod tests {
         );
         let mut relocations = vec![relocation];
 
-        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
-            .unwrap()
-            .unwrap();
+        let patches = relocation_target_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(patches.output_patches.len(), 1);
         assert!(patches.output_patches[0].deferred_relocation.is_some());
@@ -9741,13 +9802,78 @@ mod tests {
         );
         let mut relocations = vec![relocation];
 
-        let patches =
-            relocation_target_patches_for_input(&mut relocations, &input, &current).unwrap();
+        let patches = relocation_target_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap();
 
         assert!(matches!(
             patches,
             Err(reason) if reason == "relocation target moved in input.o"
         ));
+    }
+
+    #[test]
+    fn relocation_target_patch_accepts_same_offset_section_renumbering() {
+        let (previous, first_value_range, _) = duplicate_symbol_name_elf();
+        let mut current = previous.clone();
+        current[0x7e..0x80].copy_from_slice(&2_u16.to_le_bytes());
+        let section_headers_offset = 0xe0;
+        let text_section_header = section_headers_offset + 64;
+        let symtab_section_header = section_headers_offset + 128;
+        let previous_text_section = current[text_section_header..text_section_header + 64].to_vec();
+        current.copy_within(
+            symtab_section_header..symtab_section_header + 64,
+            text_section_header,
+        );
+        current[symtab_section_header..symtab_section_header + 64]
+            .copy_from_slice(&previous_text_section);
+        let mut state = state("args", b"output", &[("input.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            42,
+            Some(0x1000),
+            0x2000,
+            Some("duplicate"),
+            Some(("input.o", 1, 0x100)),
+            0,
+            300,
+            8,
+            1,
+            0,
+        );
+        let mut relocations = vec![relocation];
+
+        let patches = relocation_target_patches_for_input(
+            &mut relocations,
+            &input,
+            &current,
+            Some(&previous),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.input_ranges, vec![first_value_range]);
+        assert!(patches.output_patches.is_empty());
+        assert_eq!(
+            relocations[0]
+                .target
+                .as_ref()
+                .map(|target| target.section_index),
+            Some(2)
+        );
+        assert_eq!(
+            relocations[0]
+                .target
+                .as_ref()
+                .map(|target| target.section_offset),
+            Some(0x100)
+        );
     }
 
     fn duplicate_symbol_name_elf() -> (Vec<u8>, std::ops::Range<usize>, std::ops::Range<usize>) {
