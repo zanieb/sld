@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "libsld"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "anyhow",
  "ar",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "linker-diff"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "linker-layout"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "anyhow",
  "postcard",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "linker-trace"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "anyhow",
  "postcard",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "linker-utils"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -1779,7 +1779,7 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "sld-linker"
-version = "0.8.0"
+version = "2026.5.20"
 dependencies = [
  "ar",
  "dhat",

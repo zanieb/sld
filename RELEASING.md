@@ -9,8 +9,8 @@
 * Trigger the github release action by pushing a tag for the version number.
 
 ```shell
-git tag 0.6.0 # Where "0.6.0" is the number in Cargo.toml 
-git push origin refs/tags/0.6.0
+git tag 2026.5.20 # Where "2026.5.20" is the number in Cargo.toml
+git push origin refs/tags/2026.5.20
 ```
 
 That should trigger the `release.yml` workflow in GitHub. You can follow its progress in the
