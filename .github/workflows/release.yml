@@ -64,12 +64,6 @@ jobs:
         with:
           use-cache: false
 
-      - name: Extract release notes
-        if: env.IS_RELEASE == 'true'
-        shell: bash
-        run: |
-          awk "/## ${VERSION_TAG}/{flag=1; next} /^## / && flag{exit} flag" CHANGELOG.md >REL.md
-
       - name: Build stage1
         run: cargo +stable build --release
 
@@ -90,7 +84,7 @@ jobs:
           n="sld-linker-${VERSION_TAG}-${{ matrix.target }}"
           mkdir "$n"
           cp "target/${{ matrix.target }}/dist/sld" "$n"
-          cp README.md LICENSE* CHANGELOG.md "$n"
+          cp README.md LICENSE* "$n"
           readelf -p .comment "$n/sld" | grep "Linker: sld" || echo "::warning::'$n' wasn't linked with sld"
           tar zcf $n.tar.gz $n
 
@@ -98,7 +92,6 @@ jobs:
         if: env.IS_RELEASE == 'true'
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
-          body_path: REL.md
           draft: true
           files: |
             sld-linker-*.tar.gz

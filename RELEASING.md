@@ -1,10 +1,6 @@
 # Releasing sld
 
 * Manually trigger the release workflow to verify that it still works.
-* Run `git cliff {previous version}...`
-* Copy output into `CHANGELOG.md` and edit as necessary.
-* The header for the release must be just the version number that is going to be released.
-  * If in doubt, run the awk command from `release.yml`
 * Change version in workspace `Cargo.toml`
 * Search for `version = "{old version}"` for other places to update.
 * Ensure that the above changes are merged into the main repository.
@@ -20,8 +16,7 @@ git push origin refs/tags/0.6.0
 That should trigger the `release.yml` workflow in GitHub. You can follow its progress in the
 Actions tab in GitHub.
 
-When complete, it should create the release in GitHub Releases.
-
-Maintainers can then edit the release notes associated with the release.
+When complete, it should create the release in GitHub Releases. Maintainers can then use
+`git cliff {previous version}...` as a starting point when editing the associated release notes.
 
 If everything looks good, publish the release.
