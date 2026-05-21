@@ -1605,7 +1605,15 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
 
     let rel_info = A::relocation_from_raw(rel)?;
     let (mut resolution, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
-    resolution.raw_value = resolution.raw_value.wrapping_add(paired_addend as u64);
+    let implicit_addend = if rel.r_type == macho::ARM64_RELOC_UNSIGNED {
+        read_relocation_addend(out, offset_in_section as usize, rel_info.size)?
+    } else {
+        0
+    };
+    resolution.raw_value = resolution
+        .raw_value
+        .wrapping_add(implicit_addend)
+        .wrapping_add(paired_addend as u64);
 
     let raw_value = resolution.raw_value;
     let got_load_relaxed_to_direct = matches!(
