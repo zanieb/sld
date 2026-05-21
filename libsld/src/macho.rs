@@ -1613,7 +1613,7 @@ impl platform::Platform for MachO {
             let data = state.object.raw_section_data(section_header)?;
             common.allocate(
                 part_id::MACHO_UNWIND_INFO,
-                macho_unwind_info_allocation_size(macho_eh_frame_fde_count(data)?),
+                macho_unwind_info_allocation_size(macho_eh_frame_fde_count(data)? * 2),
             );
             if macho_unwind_atom_gc_enabled(state, resources.symbol_db.args) {
                 return Ok(());
@@ -1759,7 +1759,7 @@ impl platform::Platform for MachO {
         );
         common.allocate(
             part_id::MACHO_UNWIND_INFO,
-            macho_unwind_info_allocation_size(data.len() / MACHO_COMPACT_UNWIND_ENTRY_SIZE),
+            macho_unwind_info_allocation_size(data.len() / MACHO_COMPACT_UNWIND_ENTRY_SIZE * 2),
         );
         if macho_unwind_atom_gc_enabled(object, resources.symbol_db.args) {
             return Ok(());

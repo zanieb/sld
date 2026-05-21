@@ -1968,6 +1968,10 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
     entries.sort_by_key(|entry| entry.function_offset);
     entries.dedup_by_key(|entry| entry.function_offset);
 
+    let text = layout.section_layouts.get(output_section_id::TEXT);
+    let text_end = macho_image_offset(text.mem_offset + text.mem_size)?;
+    add_unwind_info_gap_entries(&mut entries, text_end);
+
     let mut personalities = Vec::new();
     for entry in &mut entries {
         if let Some(personality_offset) = entry.personality_offset {
@@ -2098,8 +2102,6 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
         }
     }
 
-    let text = layout.section_layouts.get(output_section_id::TEXT);
-    let text_end = macho_image_offset(text.mem_offset + text.mem_size)?;
     let last_entry_end = entries.last().map_or(text_end, |entry| {
         entry.function_offset.saturating_add(entry.length.max(1))
     });
@@ -2114,6 +2116,34 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
     )?;
 
     Ok(())
+}
+
+fn add_unwind_info_gap_entries(entries: &mut Vec<UnwindInfoEntry>, text_end: u32) {
+    let mut gap_entries = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.encoding == 0 || entry.length == 0 {
+            continue;
+        }
+
+        let entry_end = entry.function_offset.saturating_add(entry.length);
+        let next_start = entries
+            .get(index + 1)
+            .map_or(text_end, |next| next.function_offset);
+        if entry_end >= next_start {
+            continue;
+        }
+
+        gap_entries.push(UnwindInfoEntry {
+            function_offset: entry_end,
+            length: next_start - entry_end,
+            encoding: 0,
+            personality_offset: None,
+            lsda_offset: None,
+        });
+    }
+
+    entries.extend(gap_entries);
+    entries.sort_by_key(|entry| entry.function_offset);
 }
 
 fn collect_unwind_info_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindInfoEntry>> {
