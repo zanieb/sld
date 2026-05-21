@@ -50,6 +50,7 @@ pub struct MachOArgs {
     pub(crate) dylib_symbol_ordinals: HashMap<Vec<u8>, u8>,
     pub(crate) install_name: Option<Vec<u8>>,
     pub(crate) sysroot: Option<PathBuf>,
+    pub(crate) export_list_path: Option<PathBuf>,
     pub(crate) relocation_model: RelocationModel,
     pub(crate) should_output_executable: bool,
     pub(crate) is_dynamiclib: bool,
@@ -90,6 +91,7 @@ impl Default for MachOArgs {
             dylib_symbol_ordinals: HashMap::new(),
             install_name: None,
             sysroot: None,
+            export_list_path: None,
             should_adhoc_codesign: cfg!(target_os = "macos"),
             dead_strip: false,
             platform_version: MachOPlatformVersion {
@@ -118,6 +120,7 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
             .field("dylib_symbol_ordinals", &dylib_symbol_ordinals)
             .field("install_name", &args.install_name)
             .field("sysroot", &args.sysroot)
+            .field("export_list_path", &args.export_list_path)
             .field("relocation_model", &args.relocation_model)
             .field("should_output_executable", &args.should_output_executable)
             .field("is_dynamiclib", &args.is_dynamiclib)
@@ -180,6 +183,14 @@ impl platform::Args for MachOArgs {
 
     fn sysroot(&self) -> Option<&Path> {
         self.sysroot.as_deref()
+    }
+
+    fn export_list_path(&self) -> Option<&Path> {
+        self.export_list_path.as_deref()
+    }
+
+    fn export_list_roots_archive_symbols(&self) -> bool {
+        true
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
@@ -644,10 +655,16 @@ fn handle_ld64_multi_arg<S: AsRef<str>, I: Iterator<Item = S>>(
             args.install_name = Some(value.as_ref().as_bytes().to_vec());
             Ok(true)
         }
-        "-Wl,-exported_symbols_list" => {
-            input
+        "-exported_symbols_list" | "--exported_symbols_list" | "-Wl,-exported_symbols_list" => {
+            let value = input
                 .next()
-                .context("-Wl,-exported_symbols_list requires an argument")?;
+                .context("-exported_symbols_list requires an argument")?;
+            let value = value
+                .as_ref()
+                .strip_prefix("-Wl,")
+                .unwrap_or(value.as_ref());
+            args.common_mut().save_dir.handle_file(value);
+            args.export_list_path = Some(PathBuf::from(value));
             Ok(true)
         }
         "-ObjC" | "-nodefaultlibs" => Ok(true),
@@ -698,6 +715,23 @@ fn handle_wl_arg<S: AsRef<str>, I: Iterator<Item = S>>(
                     }
                 };
                 args.install_name = Some(value.as_bytes().to_vec());
+            }
+            "-exported_symbols_list" => {
+                let value = match values.next() {
+                    Some(value) => value.to_owned(),
+                    None => {
+                        let value = input
+                            .next()
+                            .context("-Wl,-exported_symbols_list requires an argument")?;
+                        value
+                            .as_ref()
+                            .strip_prefix("-Wl,")
+                            .unwrap_or(value.as_ref())
+                            .to_owned()
+                    }
+                };
+                args.common_mut().save_dir.handle_file(&value);
+                args.export_list_path = Some(PathBuf::from(value));
             }
             _ if value.starts_with("-l") && value.len() > 2 => {
                 args.add_linked_library(&value[2..])?;

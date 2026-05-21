@@ -15,9 +15,13 @@ pub(crate) struct ExportList<'data>(MatchRules<'data>);
 
 impl<'data> ExportList<'data> {
     pub(crate) fn parse(data: ScriptData<'data>) -> Result<Self> {
-        parse_export_list
-            .parse(BStr::new(data.raw))
-            .map_err(|err| error!("Failed to parse symbol export list:\n{err}"))
+        if data.raw.trim_ascii_start().starts_with(b"{") {
+            parse_export_list
+                .parse(BStr::new(data.raw))
+                .map_err(|err| error!("Failed to parse symbol export list:\n{err}"))
+        } else {
+            parse_line_export_list(data.raw)
+        }
     }
 
     // Based on Version Script counterpart
@@ -53,6 +57,22 @@ impl<'data> ExportList<'data> {
         self.0.push(matcher);
         Ok(())
     }
+}
+
+fn parse_line_export_list<'input>(input: &'input [u8]) -> Result<ExportList<'input>> {
+    let mut out = ExportList::default();
+
+    for line in input.split(|byte| *byte == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let matcher = parse_matcher(&mut BStr::new(line), true)
+            .map_err(|err| error!("Failed to parse symbol export list:\n{err}"))?;
+        out.0.push(matcher);
+    }
+
+    Ok(out)
 }
 
 fn parse_export_list<'input>(input: &mut &'input BStr) -> winnow::Result<ExportList<'input>> {
@@ -120,6 +140,17 @@ mod tests {
         assert!(export_list.contains(&UnversionedSymbolName::prehashed(b"baz-test")));
         assert!(export_list.contains(&UnversionedSymbolName::prehashed(b"qux")));
         assert!(!export_list.contains(&UnversionedSymbolName::prehashed(b"not_exported")));
+    }
+
+    #[test]
+    fn parse_line_list() {
+        let data = ScriptData {
+            raw: b"# Apple exported symbols list\n_foo\n\n_bar*\n",
+        };
+        let export_list = ExportList::parse(data).unwrap();
+        assert!(export_list.contains(&UnversionedSymbolName::prehashed(b"_foo")));
+        assert!(export_list.contains(&UnversionedSymbolName::prehashed(b"_bar_test")));
+        assert!(!export_list.contains(&UnversionedSymbolName::prehashed(b"_baz")));
     }
 
     #[test]

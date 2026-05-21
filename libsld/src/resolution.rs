@@ -290,7 +290,7 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                         .split_off_mut(..s.symbol_id_range.len())
                         .unwrap();
 
-                    if s.is_optional() {
+                    if s.is_optional() && !export_list_roots_object(s, symbol_db) {
                         definitions_out_per_file.push(AtomicTake::new(definitions_out));
                     } else {
                         work_items_do(
@@ -375,6 +375,33 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                 .collect(),
         },
     }
+}
+
+fn export_list_roots_object<'data, P: Platform>(
+    object: &SequencedInputObject<'data, P>,
+    symbol_db: &SymbolDb<'data, P>,
+) -> bool {
+    if !symbol_db.args.export_list_roots_archive_symbols() {
+        return false;
+    }
+    let Some(export_list) = &symbol_db.export_list else {
+        return false;
+    };
+
+    object
+        .parsed
+        .object
+        .enumerate_symbols()
+        .any(|(symbol_index, symbol)| {
+            if symbol.is_undefined() || symbol.is_local() || symbol.is_hidden() {
+                return false;
+            }
+            let symbol_id = object.symbol_id_range.input_to_id(symbol_index);
+            let Ok(symbol_name) = symbol_db.symbol_name(symbol_id) else {
+                return false;
+            };
+            export_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
+        })
 }
 
 fn resolve_sections<'data, P: Platform>(

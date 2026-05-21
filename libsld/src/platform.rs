@@ -1275,6 +1275,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    fn export_list_roots_archive_symbols(&self) -> bool {
+        false
+    }
+
     fn should_gc_sections(&self) -> bool {
         true
     }
