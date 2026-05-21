@@ -1585,6 +1585,28 @@ impl platform::Platform for MachO {
             // Relocations in these sections are traversed atom-by-atom from
             // `load_object_symbol`, so section materialisation alone must not
             // make every atom reachable.
+            // Compaction retains no-dead-strip atoms in a loaded section, so
+            // traverse them as roots before their relocations reach the writer.
+            let mut no_dead_strip_symbols = Vec::new();
+            for (symbol_index, symbol) in state.object.enumerate_symbols() {
+                if symbol.n_desc.get(LE) & (N_ALT_ENTRY | N_NO_DEAD_STRIP) != N_NO_DEAD_STRIP {
+                    continue;
+                }
+                if state.object.symbol_section(symbol, symbol_index)? == Some(section_index) {
+                    no_dead_strip_symbols.push(symbol_index);
+                }
+            }
+            for symbol_index in no_dead_strip_symbols {
+                load_macho_subsection_symbol::<A>(
+                    state,
+                    common,
+                    symbol_index,
+                    section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+            }
             return Ok(());
         }
         if state.object.section_name(section_header)? == b"__eh_frame" {
