@@ -655,12 +655,16 @@ fn handle_ld64_multi_arg<S: AsRef<str>, I: Iterator<Item = S>>(
             args.dead_strip = true;
             Ok(true)
         }
-        _ if arg.starts_with("-Wl,") => handle_wl_arg(args, arg),
+        _ if arg.starts_with("-Wl,") => handle_wl_arg(args, arg, input),
         _ => Ok(false),
     }
 }
 
-fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
+fn handle_wl_arg<S: AsRef<str>, I: Iterator<Item = S>>(
+    args: &mut MachOArgs,
+    arg: &str,
+    input: &mut I,
+) -> Result<bool> {
     let Some(rest) = arg.strip_prefix("-Wl,") else {
         return Ok(false);
     };
@@ -680,9 +684,19 @@ fn handle_wl_arg(args: &mut MachOArgs, arg: &str) -> Result<bool> {
                 args.add_framework(framework, DylibLoadKind::Weak)?;
             }
             "-install_name" => {
-                let value = values
-                    .next()
-                    .context("-Wl,-install_name requires an argument")?;
+                let value = match values.next() {
+                    Some(value) => value.to_owned(),
+                    None => {
+                        let value = input
+                            .next()
+                            .context("-Wl,-install_name requires an argument")?;
+                        value
+                            .as_ref()
+                            .strip_prefix("-Wl,")
+                            .unwrap_or(value.as_ref())
+                            .to_owned()
+                    }
+                };
                 args.install_name = Some(value.as_bytes().to_vec());
             }
             _ if value.starts_with("-l") && value.len() > 2 => {
@@ -891,6 +905,22 @@ mod tests {
         assert_eq!(
             args.install_name.as_deref(),
             Some(b"@rpath/libsld-wl.dylib".as_slice())
+        );
+    }
+
+    #[test]
+    fn split_wl_install_name_records_dynamiclib_id_path() {
+        let mut args = MachOArgs::default();
+
+        parse(
+            &mut args,
+            ["-Wl,-install_name", "-Wl,@rpath/libsld-split-wl.dylib"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.install_name.as_deref(),
+            Some(b"@rpath/libsld-split-wl.dylib".as_slice())
         );
     }
 
