@@ -1,5 +1,6 @@
 use crate::alignment::Alignment;
 use crate::alignment::NUM_ALIGNMENTS;
+use crate::output_section_id::EH_FRAME as EH_FRAME_SECTION;
 use crate::output_section_id::FINI;
 use crate::output_section_id::INIT;
 use crate::output_section_id::OutputSectionId;
@@ -134,14 +135,14 @@ impl PartId {
 }
 
 impl PartId {
-    /// Returns whether we should skip adding padding after this section. This is a special rule
-    /// that's just for `.init` and `.fini`. The `.init` section `crti.o` contains the start of a
-    /// function and `crtn.o` contains the end of that function. If `.init` has say alignment = 4
-    /// and we add padding after it to bring it up to a multiple of 4 bytes, then we'll break the
-    /// function, since the padding bytes won't be valid instructions.
+    /// Returns whether we should skip adding padding after this section. The `.init` section
+    /// `crti.o` contains the start of a function and `crtn.o` contains the end of that function. If
+    /// `.init` has say alignment = 4 and we add padding after it to bring it up to a multiple of 4
+    /// bytes, then we'll break the function, since the padding bytes won't be valid instructions.
+    /// `.eh_frame` is also a contiguous frame stream where padding can look like a terminator.
     pub(crate) fn should_pack(self) -> bool {
         let section_id = self.output_section_id();
-        section_id == INIT || section_id == FINI
+        section_id == EH_FRAME_SECTION || section_id == INIT || section_id == FINI
     }
 }
 

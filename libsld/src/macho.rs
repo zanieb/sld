@@ -1520,7 +1520,7 @@ impl platform::Platform for MachO {
             per_symbol_flags,
             symbol_db,
         );
-        compact_dead_macho_eh_frame(object, common, output_sections, symbol_db);
+        compact_macho_eh_frame(object, common, output_sections, symbol_db);
     }
 
     fn finalise_object_layout<'data>(
@@ -3113,16 +3113,12 @@ fn compact_dead_macho_subsections<'data>(
     }
 }
 
-fn compact_dead_macho_eh_frame<'data>(
+fn compact_macho_eh_frame<'data>(
     object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
     common: &mut crate::layout::CommonGroupState<'data, MachO>,
     output_sections: &crate::output_section_id::OutputSections<MachO>,
     symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
 ) {
-    if !macho_unwind_atom_gc_enabled(object, symbol_db.args) {
-        return;
-    }
-
     let Some((section_index, section_header)) = object.object.section_by_name("__eh_frame") else {
         return;
     };
@@ -3136,12 +3132,18 @@ fn compact_dead_macho_eh_frame<'data>(
     let Ok(data) = object.object.raw_section_data(section_header) else {
         return;
     };
+    let filter_live_entries = macho_unwind_atom_gc_enabled(object, symbol_db.args);
     let live_fdes = object
         .format_specific
         .live_eh_frame_fdes
         .get(section_index.0);
-    let Ok(live_cies) = macho_live_eh_frame_cies(data, live_fdes) else {
-        return;
+    let live_cies = if filter_live_entries {
+        let Ok(live_cies) = macho_live_eh_frame_cies(data, live_fdes) else {
+            return;
+        };
+        Some(live_cies)
+    } else {
+        None
     };
 
     let mut raw_deltas = Vec::new();
@@ -3153,6 +3155,13 @@ fn compact_dead_macho_eh_frame<'data>(
         };
         let length = length as usize;
         if length == 0 {
+            // Final linked images concatenate input frame streams, so an input
+            // terminator must not hide FDEs from later objects.
+            let Ok(bytes_deleted) = u32::try_from(data.len() - offset) else {
+                raw_deltas.clear();
+                break;
+            };
+            raw_deltas.push((offset as u64, bytes_deleted));
             break;
         }
         if length == 0xffff_ffff {
@@ -3174,11 +3183,14 @@ fn compact_dead_macho_eh_frame<'data>(
             raw_deltas.clear();
             break;
         };
-        let keep = if cie_pointer == 0 {
-            live_cies.contains(&(offset as u64))
-        } else {
-            live_fdes.is_some_and(|entries| entries.contains(&(offset as u64)))
-        };
+        let keep = !filter_live_entries
+            || if cie_pointer == 0 {
+                live_cies
+                    .as_ref()
+                    .is_some_and(|entries| entries.contains(&(offset as u64)))
+            } else {
+                live_fdes.is_some_and(|entries| entries.contains(&(offset as u64)))
+            };
         if !keep {
             let Ok(bytes_deleted) = u32::try_from(entry_end - offset) else {
                 raw_deltas.clear();

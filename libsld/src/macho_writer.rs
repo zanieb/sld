@@ -1353,6 +1353,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let mut paired_addend = 0;
     let mut paired_subtractor = None;
     let section_header = object_layout.object.section(section_index)?;
+    let is_eh_frame = object_layout.object.section_name(section_header)? == b"__eh_frame";
     let live_unwind_ranges =
         macho_writer_live_unwind_relocation_ranges(object_layout, layout, section_index)?;
     let live_subsection_ranges =
@@ -1381,12 +1382,10 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             paired_subtractor = None;
             continue;
         }
-        if let Some(deltas) = relax_deltas {
-            rel.r_address = deltas
-                .input_to_output_offset(input_offset)
-                .try_into()
-                .context("Compacted Mach-O relocation offset exceeds u32")?;
-        }
+        let output_offset = opt_input_to_output(relax_deltas, input_offset);
+        rel.r_address = output_offset
+            .try_into()
+            .context("Compacted Mach-O relocation offset exceeds u32")?;
         if rel.r_type == macho::ARM64_RELOC_ADDEND {
             paired_addend = macho_addend(rel);
             continue;
@@ -1404,11 +1403,24 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             continue;
         }
         if let Some(subtractor) = paired_subtractor.take() {
+            let eh_frame_addend_adjustment = if is_eh_frame {
+                macho_eh_frame_subtractor_addend_adjustment(
+                    object_layout,
+                    section_index,
+                    relax_deltas,
+                    subtractor,
+                    input_offset,
+                    output_offset,
+                )?
+            } else {
+                0
+            };
             apply_subtractor_relocation::<A>(
                 object_layout,
                 subtractor,
                 rel,
                 paired_addend,
+                eh_frame_addend_adjustment,
                 layout,
                 out,
             )?;
@@ -1433,6 +1445,42 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     );
 
     Ok(())
+}
+
+fn macho_eh_frame_subtractor_addend_adjustment<'data>(
+    object_layout: &ObjectLayout<'data, MachO>,
+    section_index: object::SectionIndex,
+    relax_deltas: Option<&SectionRelaxDeltas>,
+    subtractor: RelocationInfo,
+    input_offset: u64,
+    output_offset: u64,
+) -> Result<i64> {
+    // __eh_frame pcrel fields use subtractor addends based on their input field position. Keep the
+    // same target when compaction moves the field differently than the subtractor symbol.
+    let field_deleted = input_offset - output_offset;
+    let subtractor_input_offset = if subtractor.r_extern {
+        let symbol_index = SymbolIndex(subtractor.r_symbolnum as usize);
+        let symbol = object_layout.object.symbol(symbol_index)?;
+        if object_layout.object.symbol_section(symbol, symbol_index)? == Some(section_index) {
+            Some(
+                object_layout
+                    .object
+                    .symbol_offset_in_section(symbol, section_index)?,
+            )
+        } else {
+            None
+        }
+    } else if subtractor.r_symbolnum == section_index.0 as u32 + 1 {
+        Some(0)
+    } else {
+        None
+    };
+    let subtractor_deleted = subtractor_input_offset.map_or(0, |input_offset| {
+        input_offset - opt_input_to_output(relax_deltas, input_offset)
+    });
+    (i128::from(field_deleted) - i128::from(subtractor_deleted))
+        .try_into()
+        .context("Compacted Mach-O __eh_frame subtractor addend adjustment exceeds i64")
 }
 
 fn is_tlv_init_relocation(section: &SectionEntry, rel: RelocationInfo) -> bool {
@@ -1492,6 +1540,7 @@ fn apply_subtractor_relocation<'data, A: Arch<Platform = MachO>>(
     subtractor: RelocationInfo,
     rel: RelocationInfo,
     paired_addend: i64,
+    addend_adjustment: i64,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
 ) -> Result {
@@ -1513,6 +1562,7 @@ fn apply_subtractor_relocation<'data, A: Arch<Platform = MachO>>(
         .raw_value
         .wrapping_add(addend)
         .wrapping_add(paired_addend as u64)
+        .wrapping_add(addend_adjustment as u64)
         .wrapping_sub(negative.raw_value);
 
     rel_info.write_to_buffer(value, &mut out[offset_in_section..])?;
