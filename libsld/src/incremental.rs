@@ -17,6 +17,8 @@ use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
 use object::ObjectSymbol as _;
+use rayon::iter::IntoParallelIterator as _;
+use rayon::iter::ParallelIterator as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 #[cfg(unix)]
@@ -43,7 +45,9 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v30";
+const STATE_VERSION: &str = "sld-incremental-state-v32";
+const STATE_VERSION_V31: &str = "sld-incremental-state-v31";
+const STATE_VERSION_V30: &str = "sld-incremental-state-v30";
 const STATE_VERSION_V29: &str = "sld-incremental-state-v29";
 const STATE_VERSION_V28: &str = "sld-incremental-state-v28";
 const STATE_VERSION_V27: &str = "sld-incremental-state-v27";
@@ -80,11 +84,15 @@ const METADATA_UPDATE_FILE: &str = "metadata-update";
 const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v1";
 const USER_STATE_DIR_ENV: &str = "SLD_STATE_DIR";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
+const COMPRESSED_INPUT_SNAPSHOT_SUFFIX: &str = ".zstd";
+const INPUT_SNAPSHOT_COMPRESSION_LEVEL: i32 = 1;
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const LINK_START_FILE: &str = "link-start";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
+const COMPRESSED_SECTIONS_FILE_PREFIX: &str = "sections-zstd-";
+const SECTIONS_COMPRESSION_LEVEL: i32 = 1;
 const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
@@ -298,6 +306,7 @@ type BuildIdHashStateAndTree = (Option<BuildIdHashState>, Option<Vec<[u8; blake3
 struct FileState {
     path: String,
     content: FileContentState,
+    snapshot_identity: Option<FileIdentity>,
     patch: Option<FilePatchState>,
 }
 
@@ -592,13 +601,13 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 continue;
             }
             checked_ambiguous_inputs = true;
-            if input_content_matches_snapshot(&state_dir, input, &path)? {
+            if input_content_matches_previous(&state_dir, input, &path)? {
                 continue;
             }
             changed_inputs.push((index, path));
             continue;
         }
-        if input_content_matches_snapshot(&state_dir, input, &path)? {
+        if input_content_matches_previous(&state_dir, input, &path)? {
             rewritten_inputs.push((index, path));
             continue;
         }
@@ -611,6 +620,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             rewritten_inputs.iter().map(|(_, path)| path.as_path()),
         )?;
         refresh_rewritten_input_identities(&mut previous, &rewritten_inputs);
+        refresh_input_snapshot_identities_at_indices(
+            &state_dir,
+            &mut previous.input_files,
+            rewritten_inputs.iter().map(|(input_index, _)| *input_index),
+        );
     }
 
     if !changed_inputs.is_empty() {
@@ -1561,6 +1575,7 @@ fn patch_changed_inputs(
             previous.sections_file = None;
         }
         previous.input_files[*input_index].content = input_content;
+        previous.input_files[*input_index].snapshot_identity = None;
         previous.input_files[*input_index].patch = Some(FilePatchState {
             fingerprint: fingerprint.clone(),
             sections: current_sections
@@ -1747,6 +1762,11 @@ fn patch_changed_inputs(
         state_dir,
         changed_inputs.iter().map(|(_, path)| path.as_path()),
     )?;
+    refresh_input_snapshot_identities_at_indices(
+        state_dir,
+        &mut previous.input_files,
+        changed_inputs.iter().map(|(input_index, _)| *input_index),
+    );
     refresh_input_file_identities_at_indices(
         &mut previous.input_files,
         changed_inputs.iter().map(|(input_index, _)| *input_index),
@@ -2463,12 +2483,13 @@ impl PreparedState {
 
         let mut input_files = self.current.input_files.clone();
         {
-            timing_phase!("Hash incremental patch inputs");
-            record_patchable_input_hashes(&mut input_files, file_loader, &sections);
-        }
-        {
             timing_phase!("Snapshot incremental inputs");
-            snapshot_loaded_files(&self.current.state_dir, file_loader)?;
+            snapshot_loaded_files(
+                &self.current.state_dir,
+                file_loader,
+                &mut input_files,
+                &sections,
+            )?;
         }
         refresh_input_file_identities(&mut input_files);
 
@@ -2864,6 +2885,16 @@ impl PersistedState {
                     path.display()
                 ));
             }
+            let bytes = if patch_records_file.starts_with(COMPRESSED_SECTIONS_FILE_PREFIX) {
+                zstd::stream::decode_all(bytes.as_slice()).with_context(|| {
+                    format!(
+                        "Failed to decompress incremental patch records `{}`",
+                        path.display()
+                    )
+                })?
+            } else {
+                bytes
+            };
             let contents = std::str::from_utf8(&bytes)
                 .context("Invalid UTF-8 in incremental patch record sidecar")?;
             let block = parse_compact_records_block(contents.lines())?;
@@ -3002,6 +3033,8 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V31
+            && version != STATE_VERSION_V30
             && version != STATE_VERSION_V29
             && version != STATE_VERSION_V28
             && version != STATE_VERSION_V27
@@ -3110,6 +3143,8 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V31
+            || version == STATE_VERSION_V30
             || version == STATE_VERSION_V29
             || version == STATE_VERSION_V28
             || version == STATE_VERSION_V27
@@ -3140,9 +3175,12 @@ impl PersistedState {
                 .next()
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
-                if version != STATE_VERSION {
+                if version != STATE_VERSION
+                    && version != STATE_VERSION_V31
+                    && version != STATE_VERSION_V30
+                {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -3783,60 +3821,66 @@ fn write_indexed_records_streaming(
         .map(|(input_file, _)| *input_file)
         .collect::<Vec<_>>();
     input_files.sort_unstable();
-    let mut offset = 0;
-    let mut locations = Vec::with_capacity(input_files.len());
-    let mut location_by_owner = HashMap::new();
-    for input_file in input_files {
-        let records = &records_by_input[input_file];
-        let sections = records
-            .sections
-            .iter()
-            .map(|record| (*record).clone())
-            .collect::<Vec<_>>();
-        let relocations = records
-            .relocations
-            .iter()
-            .map(|record| (*record).clone())
-            .collect::<Vec<_>>();
-        let fdes = records
-            .fdes
-            .iter()
-            .map(|record| (*record).clone())
-            .collect::<Vec<_>>();
-        let dynamic_relocations = records
-            .dynamic_relocations
-            .iter()
-            .map(|record| (*record).clone())
-            .collect::<Vec<_>>();
-        let mut block = String::new();
-        write_rendered_records(
-            &mut block,
-            &sections,
-            &relocations,
-            &fdes,
-            &dynamic_relocations,
-        )
-        .expect("writing incremental patch records to String should not fail");
-        if writer.write_str(&block).is_err() {
-            if let Some(error) = writer.take_error() {
-                return Err(error).with_context(|| {
+    let blocks = input_files
+        .into_par_iter()
+        .map(|input_file| {
+            let records = &records_by_input[input_file];
+            let sections = records
+                .sections
+                .iter()
+                .map(|record| (*record).clone())
+                .collect::<Vec<_>>();
+            let relocations = records
+                .relocations
+                .iter()
+                .map(|record| (*record).clone())
+                .collect::<Vec<_>>();
+            let fdes = records
+                .fdes
+                .iter()
+                .map(|record| (*record).clone())
+                .collect::<Vec<_>>();
+            let dynamic_relocations = records
+                .dynamic_relocations
+                .iter()
+                .map(|record| (*record).clone())
+                .collect::<Vec<_>>();
+            let mut block = String::new();
+            write_rendered_records(
+                &mut block,
+                &sections,
+                &relocations,
+                &fdes,
+                &dynamic_relocations,
+            )
+            .expect("writing incremental patch records to String should not fail");
+            let block = zstd::stream::encode_all(block.as_bytes(), SECTIONS_COMPRESSION_LEVEL)
+                .with_context(|| {
                     format!(
-                        "Failed to write indexed incremental sections `{}`",
+                        "Failed to compress indexed incremental sections `{}`",
                         tmp_path.display()
                     )
-                });
-            }
-            return Err(crate::error!(
-                "Failed to render indexed incremental sections `{}`",
+                })?;
+            Ok((input_file, block))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut offset = 0;
+    let mut locations = Vec::with_capacity(blocks.len());
+    let mut location_by_owner = HashMap::new();
+    for (input_file, block) in blocks {
+        writer.write_bytes(&block).with_context(|| {
+            format!(
+                "Failed to write indexed incremental sections `{}`",
                 tmp_path.display()
-            ));
-        }
+            )
+        })?;
         let len = block.len() as u64;
         let location = PatchRecordLocation {
             input_file: input_file.to_owned(),
             offset,
             len,
-            hash: hash_bytes(block.as_bytes()),
+            hash: hash_bytes(&block),
         };
         location_by_owner.insert(input_file, location.clone());
         locations.push(location);
@@ -3873,7 +3917,7 @@ fn write_indexed_records_streaming(
             tmp_path.display()
         )
     })?;
-    let file_name = format!("{SECTIONS_FILE_PREFIX}{hash}");
+    let file_name = format!("{COMPRESSED_SECTIONS_FILE_PREFIX}{hash}");
     let path = state_dir.join(&file_name);
     let _ = std::fs::remove_file(&path);
     std::fs::rename(&tmp_path, &path).with_context(|| {
@@ -3888,7 +3932,6 @@ fn write_indexed_records_streaming(
 struct SectionSidecarWriter {
     file: std::io::BufWriter<std::fs::File>,
     hasher: blake3::Hasher,
-    error: Option<std::io::Error>,
 }
 
 impl SectionSidecarWriter {
@@ -3896,34 +3939,18 @@ impl SectionSidecarWriter {
         Self {
             file: std::io::BufWriter::new(file),
             hasher: blake3::Hasher::new(),
-            error: None,
         }
     }
 
-    fn take_error(&mut self) -> Option<std::io::Error> {
-        self.error.take()
+    fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.hasher.update(bytes);
+        Ok(())
     }
 
     fn finish(mut self) -> std::io::Result<String> {
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
         self.file.flush()?;
         Ok(self.hasher.finalize().to_hex().to_string())
-    }
-}
-
-impl std::fmt::Write for SectionSidecarWriter {
-    fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        if self.error.is_some() {
-            return Err(std::fmt::Error);
-        }
-        if let Err(error) = self.file.write_all(text.as_bytes()) {
-            self.error = Some(error);
-            return Err(std::fmt::Error);
-        }
-        self.hasher.update(text.as_bytes());
-        Ok(())
     }
 }
 
@@ -3944,6 +3971,29 @@ fn add_section_input<'a>(
 fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
     validate_sections_file_name(file_name)?;
     let path = state_dir.join(file_name);
+    if file_name.starts_with(COMPRESSED_SECTIONS_FILE_PREFIX) {
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "Failed to read compressed incremental sections `{}`",
+                path.display()
+            )
+        })?;
+        let expected_name = compressed_section_sidecar_file_name(&bytes);
+        if file_name != expected_name {
+            return Err(crate::error!(
+                "Incremental sections `{}` do not match their content hash",
+                path.display()
+            ));
+        }
+        let contents = zstd::stream::decode_all(bytes.as_slice()).with_context(|| {
+            format!(
+                "Failed to decompress incremental sections `{}`",
+                path.display()
+            )
+        })?;
+        return String::from_utf8(contents)
+            .context("Invalid UTF-8 in compressed incremental sections");
+    }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read incremental sections `{}`", path.display()))?;
     if file_name.starts_with(SECTIONS_FILE_PREFIX) {
@@ -3962,7 +4012,8 @@ fn validate_sections_file_name(file_name: &str) -> Result {
     if file_name == SECTIONS_FILE {
         return Ok(());
     }
-    if !file_name.starts_with(SECTIONS_FILE_PREFIX)
+    if !(file_name.starts_with(SECTIONS_FILE_PREFIX)
+        || file_name.starts_with(COMPRESSED_SECTIONS_FILE_PREFIX))
         || file_name.contains('/')
         || file_name.contains('\\')
         || Path::new(file_name).is_absolute()
@@ -8803,12 +8854,16 @@ fn fingerprint_loaded_files(
                 .and_then(|previous| previous.get(path.as_str()).copied());
             let content =
                 FileContentState::from_input_file(input_file, previous.map(|file| &file.content));
+            let snapshot_identity = previous
+                .filter(|previous| previous.content == content)
+                .and_then(|previous| previous.snapshot_identity.clone());
             let patch = previous
                 .filter(|previous| previous.content == content)
                 .and_then(|previous| previous.patch.clone());
             FileState {
                 path,
                 content,
+                snapshot_identity,
                 patch,
             }
         })
@@ -8816,31 +8871,6 @@ fn fingerprint_loaded_files(
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
-}
-
-fn record_patchable_input_hashes(
-    input_files: &mut [FileState],
-    file_loader: &FileLoader<'_>,
-    sections: &[SectionRecord],
-) {
-    let patchable_inputs = sections
-        .iter()
-        .map(|section| section.input_file.as_str())
-        .collect::<HashSet<_>>();
-    let loaded_by_path = file_loader
-        .loaded_files
-        .iter()
-        .map(|file| (encode_path(&file.filename), *file))
-        .collect::<HashMap<_, _>>();
-    for input in input_files {
-        input.patch = None;
-        if input.content.hash.is_empty()
-            && patchable_inputs.contains(input.path.as_str())
-            && let Some(input_file) = loaded_by_path.get(&input.path)
-        {
-            input.content.hash = hash_bytes(input_file.data());
-        }
-    }
 }
 
 fn parse_prefixed_line<'a>(line: Option<&'a str>, expected_prefix: &str) -> Result<&'a str> {
@@ -9251,6 +9281,7 @@ fn parse_input_line(line: &str, patch_section_mode: PatchSectionReadMode) -> Res
         .next()
         .filter(|fingerprint| *fingerprint != ABSENT_FIELD);
     let patch_sections = parts.next().filter(|sections| *sections != ABSENT_FIELD);
+    let snapshot_identity = parts.next().map(FileIdentity::parse).transpose()?.flatten();
     let patch = match patch_fingerprint.zip(patch_sections) {
         Some((fingerprint, raw_sections)) => {
             let sections = match patch_section_mode {
@@ -9276,6 +9307,7 @@ fn parse_input_line(line: &str, patch_section_mode: PatchSectionReadMode) -> Res
             hash,
             identity,
         },
+        snapshot_identity,
         patch,
     })
 }
@@ -9311,7 +9343,7 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
 
 fn render_input_line_rest(input: &FileState) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         input.path,
         input.content.len,
         input.content.hash,
@@ -9323,7 +9355,11 @@ fn render_input_line_rest(input: &FileState) -> String {
         input
             .patch
             .as_ref()
-            .map_or_else(|| ABSENT_FIELD.to_owned(), render_patch_sections)
+            .map_or_else(|| ABSENT_FIELD.to_owned(), render_patch_sections),
+        input
+            .snapshot_identity
+            .as_ref()
+            .map_or_else(|| ABSENT_FIELD.to_owned(), FileIdentity::render)
     )
 }
 
@@ -9797,21 +9833,92 @@ fn parse_compact_dynamic_relocation_line(
     })
 }
 
-fn snapshot_loaded_files(state_dir: &Path, file_loader: &FileLoader<'_>) -> Result<usize> {
-    snapshot_input_paths(
-        state_dir,
-        file_loader
-            .loaded_files
-            .iter()
-            .map(|input_file| input_file.filename.as_path()),
-    )
+fn snapshot_loaded_files(
+    state_dir: &Path,
+    file_loader: &FileLoader<'_>,
+    input_files: &mut [FileState],
+    sections: &[SectionRecord],
+) -> Result<usize> {
+    let patchable_inputs = sections
+        .iter()
+        .map(|section| section.input_file.as_str())
+        .collect::<HashSet<_>>();
+    let input_indices = input_files
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (input.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for input in input_files.iter_mut() {
+        input.patch = None;
+    }
+
+    let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+    for input_file in &file_loader.loaded_files {
+        let path = encode_path(&input_file.filename);
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(index) = input_indices.get(&path).copied() else {
+            continue;
+        };
+        let is_patchable = patchable_inputs.contains(path.as_str());
+        tasks.push((
+            index,
+            *input_file,
+            is_patchable,
+            input_files[index].content.hash.is_empty(),
+        ));
+    }
+
+    let results = tasks
+        .into_par_iter()
+        .map(|(index, input_file, is_patchable, should_hash)| {
+            if !is_patchable {
+                return Ok((
+                    index,
+                    false,
+                    should_hash.then(|| hash_loaded_input_bytes(input_file.data())),
+                    None,
+                ));
+            }
+            let (did_snapshot, hash, snapshot_identity) = snapshot_loaded_input_file(
+                state_dir,
+                &input_file.filename,
+                input_file.data(),
+                should_hash,
+            )?;
+            Ok((index, did_snapshot, hash, snapshot_identity))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut snapshotted = 0;
+    for (index, did_snapshot, hash, snapshot_identity) in results {
+        if let Some(hash) = hash {
+            input_files[index].content.hash = hash;
+        }
+        if did_snapshot {
+            snapshotted += 1;
+        }
+        input_files[index].snapshot_identity = snapshot_identity;
+    }
+    Ok(snapshotted)
 }
 
-fn input_content_matches_snapshot(
+fn input_content_matches_previous(
     state_dir: &Path,
     previous_input: &FileState,
     current_path: &Path,
 ) -> Result<bool> {
+    if !previous_input.content.hash.is_empty() {
+        let bytes = match std::fs::read(current_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        return Ok(previous_input.content.len == bytes.len() as u64
+            && previous_input.content.hash == hash_bytes(&bytes));
+    }
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     files_equal(&snapshot, current_path)
 }
@@ -9823,25 +9930,43 @@ fn read_verified_input_snapshot(
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     let bytes = match std::fs::read(&snapshot) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let compressed_snapshot =
+                compressed_input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+            let bytes = match std::fs::read(&compressed_snapshot) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            zstd::stream::decode_all(bytes.as_slice()).with_context(|| {
+                format!(
+                    "Failed to decompress incremental input snapshot `{}`",
+                    compressed_snapshot.display()
+                )
+            })?
+        }
         Err(error) => return Err(error.into()),
     };
-    if !snapshot_bytes_match_previous_content(&previous_input.content, &snapshot, &bytes)? {
+    if !snapshot_bytes_match_previous_content(previous_input, &snapshot, &bytes)? {
         return Ok(None);
     }
     Ok(Some(bytes))
 }
 
 fn snapshot_bytes_match_previous_content(
-    previous: &FileContentState,
+    previous_input: &FileState,
     snapshot: &Path,
     bytes: &[u8],
 ) -> Result<bool> {
+    let previous = &previous_input.content;
     if previous.len != bytes.len() as u64 {
         return Ok(false);
     }
     if !previous.hash.is_empty() {
         return Ok(previous.hash == hash_bytes(bytes));
+    }
+    if let Some(expected_identity) = previous_input.snapshot_identity.as_ref() {
+        return Ok(FileIdentity::from_path(snapshot)?.as_ref() == Some(expected_identity));
     }
     previous.identity_matches_snapshot_path(snapshot)
 }
@@ -9951,6 +10076,24 @@ fn refresh_input_file_identities_at_indices(
     }
 }
 
+fn refresh_input_snapshot_identities_at_indices(
+    state_dir: &Path,
+    input_files: &mut [FileState],
+    indices: impl IntoIterator<Item = usize>,
+) {
+    let mut seen = HashSet::new();
+    for index in indices {
+        if !seen.insert(index) {
+            continue;
+        }
+        let Some(input) = input_files.get_mut(index) else {
+            continue;
+        };
+        let snapshot = input_snapshot_path_for_encoded_path(state_dir, &input.path);
+        input.snapshot_identity = FileIdentity::from_path(&snapshot).ok().flatten();
+    }
+}
+
 fn refresh_input_file_identity(input: &mut FileState) {
     let Ok(path) = decode_path(&input.path) else {
         return;
@@ -10016,7 +10159,76 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
             target.display()
         )
     })?;
+    let _ = std::fs::remove_file(compressed_input_snapshot_path(state_dir, path));
     Ok(true)
+}
+
+fn snapshot_loaded_input_file(
+    state_dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    should_hash: bool,
+) -> Result<(bool, Option<String>, Option<FileIdentity>)> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok((false, should_hash.then(|| hash_bytes(bytes)), None)),
+    };
+    if !metadata.is_file() || metadata.permissions().readonly() {
+        return Ok((false, should_hash.then(|| hash_bytes(bytes)), None));
+    }
+
+    let snapshot_dir = input_snapshot_dir(state_dir);
+    std::fs::create_dir_all(&snapshot_dir).with_context(|| {
+        format!(
+            "Failed to create incremental input snapshot directory `{}`",
+            snapshot_dir.display()
+        )
+    })?;
+
+    let target = input_snapshot_path(state_dir, path);
+    let tmp = target.with_file_name(format!(
+        "{}.{}.tmp",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("input"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+
+    if clone_snapshot_bytes(path, &tmp) {
+        let _ = std::fs::remove_file(&target);
+        std::fs::rename(&tmp, &target).with_context(|| {
+            format!(
+                "Failed to install incremental input snapshot `{}`",
+                target.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(compressed_input_snapshot_path(state_dir, path));
+        let snapshot_identity = FileIdentity::from_path(&target)?;
+        return Ok((true, None, snapshot_identity));
+    }
+
+    let compressed_target = compressed_input_snapshot_path(state_dir, path);
+    let compressed_tmp = compressed_target.with_file_name(format!(
+        "{}.{}.tmp",
+        compressed_target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("input.zstd"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&compressed_tmp);
+    let hash = write_compressed_loaded_snapshot(bytes, &compressed_tmp, should_hash)?;
+    let _ = std::fs::remove_file(&compressed_target);
+    std::fs::rename(&compressed_tmp, &compressed_target).with_context(|| {
+        format!(
+            "Failed to install compressed incremental input snapshot `{}`",
+            compressed_target.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&target);
+    Ok((true, hash, None))
 }
 
 fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
@@ -10040,6 +10252,48 @@ fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
         )
     })?;
     Ok(())
+}
+
+fn write_compressed_loaded_snapshot(
+    bytes: &[u8],
+    target: &Path,
+    should_hash: bool,
+) -> Result<Option<String>> {
+    let output = std::fs::File::create(target).with_context(|| {
+        format!(
+            "Failed to create compressed incremental input snapshot `{}`",
+            target.display()
+        )
+    })?;
+    let mut encoder = zstd::stream::Encoder::new(output, INPUT_SNAPSHOT_COMPRESSION_LEVEL)
+        .context("Failed to initialize incremental input snapshot compression")?;
+    let mut hasher = should_hash.then(blake3::Hasher::new);
+    for chunk in bytes.chunks(64 * 1024) {
+        encoder.write_all(chunk).with_context(|| {
+            format!(
+                "Failed to write compressed incremental input snapshot `{}`",
+                target.display()
+            )
+        })?;
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(chunk);
+        }
+    }
+    encoder
+        .finish()
+        .context("Failed to finish incremental input snapshot compression")?;
+    Ok(hasher.map(|hasher| hasher.finalize().to_hex().to_string()))
+}
+
+fn hash_loaded_input_bytes(bytes: &[u8]) -> String {
+    const PARALLEL_HASH_THRESHOLD: usize = 256 * 1024;
+    if bytes.len() < PARALLEL_HASH_THRESHOLD {
+        return hash_bytes(bytes);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_rayon(bytes);
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(target_vendor = "apple")]
@@ -10088,6 +10342,19 @@ fn input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
 
 fn input_snapshot_path_for_encoded_path(state_dir: &Path, encoded_path: &str) -> PathBuf {
     input_snapshot_dir(state_dir).join(hash_text(encoded_path))
+}
+
+fn compressed_input_snapshot_path(state_dir: &Path, path: &Path) -> PathBuf {
+    compressed_input_snapshot_path_for_encoded_path(state_dir, &encode_path(path))
+}
+
+fn compressed_input_snapshot_path_for_encoded_path(
+    state_dir: &Path,
+    encoded_path: &str,
+) -> PathBuf {
+    let mut path = input_snapshot_path_for_encoded_path(state_dir, encoded_path).into_os_string();
+    path.push(COMPRESSED_INPUT_SNAPSHOT_SUFFIX);
+    PathBuf::from(path)
 }
 
 fn input_snapshot_dir(state_dir: &Path) -> PathBuf {
@@ -10311,6 +10578,10 @@ fn section_sidecar_file_name(contents: &str) -> String {
     format!("{SECTIONS_FILE_PREFIX}{}", hash_text(contents))
 }
 
+fn compressed_section_sidecar_file_name(contents: &[u8]) -> String {
+    format!("{COMPRESSED_SECTIONS_FILE_PREFIX}{}", hash_bytes(contents))
+}
+
 fn args_hash(args: &impl platform::Args) -> String {
     hash_text(&format!("{args:?}"))
 }
@@ -10365,6 +10636,7 @@ mod tests {
                 .map(|(path, bytes)| FileState {
                     path: hex::encode(path),
                     content: FileContentState::from_bytes(bytes),
+                    snapshot_identity: None,
                     patch: None,
                 })
                 .collect(),
@@ -11116,6 +11388,7 @@ mod tests {
         let mut input_files = vec![FileState {
             path: encode_path(&input),
             content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
             patch: None,
         }];
 
@@ -11154,6 +11427,54 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn compressed_loaded_snapshot_hashes_and_round_trips_loaded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("snapshot.o");
+
+        let hash = write_compressed_loaded_snapshot(b"loaded-object", &target, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(hash, hash_bytes(b"loaded-object"));
+        assert_eq!(
+            zstd::stream::decode_all(std::fs::read(target).unwrap().as_slice()).unwrap(),
+            b"loaded-object"
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn verified_snapshot_reads_compressed_fallback_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        let compressed_snapshot = compressed_input_snapshot_path(&state_dir, &input);
+        std::fs::create_dir_all(compressed_snapshot.parent().unwrap()).unwrap();
+        write_compressed_loaded_snapshot(b"loaded-object", &compressed_snapshot, false).unwrap();
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_bytes(b"loaded-object"),
+            snapshot_identity: None,
+            patch: None,
+        };
+
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &previous)
+                .unwrap()
+                .unwrap(),
+            b"loaded-object"
+        );
+    }
+
+    #[test]
+    fn loaded_input_hash_matches_regular_hash_for_parallel_input() {
+        let bytes = vec![7; 512 * 1024];
+
+        assert_eq!(hash_loaded_input_bytes(&bytes), hash_bytes(&bytes));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn input_identity_refresh_can_target_changed_indices() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.o");
@@ -11165,11 +11486,13 @@ mod tests {
             FileState {
                 path: encode_path(&first),
                 content: FileContentState::from_bytes(b""),
+                snapshot_identity: None,
                 patch: None,
             },
             FileState {
                 path: encode_path(&second),
                 content: FileContentState::from_bytes(b""),
+                snapshot_identity: None,
                 patch: None,
             },
         ];
@@ -11199,6 +11522,7 @@ mod tests {
         let mut previous = FileState {
             path: encode_path(&input),
             content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
             patch: None,
         };
         refresh_input_file_identities(std::slice::from_mut(&mut previous));
@@ -11208,7 +11532,7 @@ mod tests {
         std::fs::rename(&replacement, &input).unwrap();
 
         assert!(!previous.content.identity_matches_path(&input).unwrap());
-        assert!(input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
+        assert!(input_content_matches_previous(&state_dir, &previous, &input).unwrap());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -11223,6 +11547,7 @@ mod tests {
         let mut previous = FileState {
             path: encode_path(&input),
             content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
             patch: None,
         };
         refresh_input_file_identities(std::slice::from_mut(&mut previous));
@@ -11231,7 +11556,41 @@ mod tests {
         std::fs::write(&replacement, b"changed").unwrap();
         std::fs::rename(&replacement, &input).unwrap();
 
-        assert!(!input_content_matches_snapshot(&state_dir, &previous, &input).unwrap());
+        assert!(!input_content_matches_previous(&state_dir, &previous, &input).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn snapshot_identity_verifies_hashless_snapshot_until_snapshot_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState {
+                len: 6,
+                hash: String::new(),
+                identity: None,
+            },
+            snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
+            patch: None,
+        };
+
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &previous)
+                .unwrap()
+                .unwrap(),
+            b"object"
+        );
+        std::fs::write(&snapshot, b"damage").unwrap();
+        assert!(
+            read_verified_input_snapshot(&state_dir, &previous)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -11264,6 +11623,7 @@ mod tests {
         let previous = FileState {
             path: encode_path(&input),
             content: content_hash_with_path_identity(&input, &bytes),
+            snapshot_identity: None,
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -11323,6 +11683,7 @@ mod tests {
         let previous = FileState {
             path: encode_path(&input),
             content: content_hash_with_path_identity(&input, &bytes),
+            snapshot_identity: None,
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -11363,6 +11724,7 @@ mod tests {
         let previous = FileState {
             path: encode_path(&input),
             content: content_hash_with_path_identity(&input, &bytes),
+            snapshot_identity: None,
             patch: None,
         };
         let input_ref = encode_path(&input);
@@ -13582,6 +13944,7 @@ mod tests {
         let previous = FileState {
             path: encode_path(&input),
             content: content_hash_with_path_identity(&input, &previous_archive),
+            snapshot_identity: None,
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 sections: vec![FilePatchSectionState {
@@ -13939,7 +14302,7 @@ mod tests {
         let rendered = state.render();
 
         assert!(rendered.contains(&format!(
-            "\tpatch-hash\t{}:1:4:100:4:{}:text-hash,{}:3:8:112:12:{}:data-hash,{}:5:16:128:16:-:-\n",
+            "\tpatch-hash\t{}:1:4:100:4:{}:text-hash,{}:3:8:112:12:{}:data-hash,{}:5:16:128:16:-:-\t-\n",
             hex::encode("a.o"),
             hex::encode(".text.foo"),
             hex::encode("a.o"),
@@ -14052,6 +14415,7 @@ mod tests {
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
+            snapshot_identity: None,
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 sections: vec![FilePatchSectionState {
@@ -14094,6 +14458,7 @@ mod tests {
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
+            snapshot_identity: None,
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 sections: vec![FilePatchSectionState {
@@ -14152,6 +14517,7 @@ mod tests {
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
+            snapshot_identity: None,
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 sections: vec![FilePatchSectionState {
@@ -14183,12 +14549,13 @@ mod tests {
     }
 
     #[test]
-    fn record_patchable_input_hashes_drops_inherited_eager_patch_metadata() {
+    fn snapshot_loaded_files_drops_inherited_eager_patch_metadata() {
         let arena = colosseum::sync::Arena::new();
         let file_loader = FileLoader::new(&arena);
         let mut input_files = vec![FileState {
             path: hex::encode("a.o"),
             content: FileContentState::from_bytes(b"a"),
+            snapshot_identity: None,
             patch: Some(FilePatchState {
                 fingerprint: "legacy-patch-hash".to_owned(),
                 sections: Vec::new(),
@@ -14196,9 +14563,29 @@ mod tests {
             }),
         }];
 
-        record_patchable_input_hashes(&mut input_files, &file_loader, &[]);
+        snapshot_loaded_files(Path::new("unused"), &file_loader, &mut input_files, &[]).unwrap();
 
         assert!(input_files[0].patch.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn content_hash_matches_rewritten_input_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_bytes(b"object"),
+            snapshot_identity: None,
+            patch: None,
+        };
+
+        assert!(!input_snapshot_path(&state_dir, &input).exists());
+        assert!(input_content_matches_previous(&state_dir, &previous, &input).unwrap());
+        std::fs::write(&input, b"changed").unwrap();
+        assert!(!input_content_matches_previous(&state_dir, &previous, &input).unwrap());
     }
 
     #[test]
@@ -14425,6 +14812,7 @@ mod tests {
             input_files: vec![FileState {
                 path: encode_path(&missing_input),
                 content: FileContentState::from_bytes(b"previous"),
+                snapshot_identity: None,
                 patch: None,
             }],
             sections: Vec::new(),
@@ -14465,6 +14853,7 @@ mod tests {
         let previous = FileState {
             path: encode_path(&input),
             content: content_hash_with_path_identity(&input, &bytes),
+            snapshot_identity: None,
             patch: None,
         };
         let sections = vec![section_record(input.to_str().unwrap(), 1, 64, 8)];
@@ -14881,7 +15270,15 @@ mod tests {
         state.write(dir.path()).unwrap();
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let sections_file = metadata.sections_file.clone().unwrap();
-        let sidecar = std::fs::read_to_string(dir.path().join(sections_file)).unwrap();
+        let sidecar = String::from_utf8(
+            zstd::stream::decode_all(
+                std::fs::read(dir.path().join(sections_file))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             sidecar
                 .lines()
@@ -14924,6 +15321,63 @@ mod tests {
         assert_eq!(restored.sections, expected_sections);
         assert_eq!(restored.fdes, state.fdes);
         assert_eq!(restored.dynamic_relocations, state.dynamic_relocations);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn v30_uncompressed_canonical_index_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        let sidecar = state.render_sections();
+        let file_name = section_sidecar_file_name(&sidecar);
+        state
+            .write_sections(dir.path(), &file_name, &sidecar)
+            .unwrap();
+        let location = PatchRecordLocation {
+            input_file: hex::encode("a.o"),
+            offset: 0,
+            len: sidecar.len() as u64,
+            hash: hash_bytes(sidecar.as_bytes()),
+        };
+        let index = state
+            .render_index(&file_name, Some(&file_name), &[location])
+            .replacen(STATE_VERSION, STATE_VERSION_V30, 1);
+        std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
+
+        assert_eq!(
+            PersistedState::read(dir.path()).unwrap().unwrap().sections,
+            state.sections
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn v31_compressed_canonical_index_without_snapshot_identity_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+
+        let current = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        let legacy = current
+            .replacen(STATE_VERSION, STATE_VERSION_V31, 1)
+            .lines()
+            .map(|line| {
+                if line.starts_with("input\t") {
+                    line.strip_suffix("\t-").unwrap()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.path().join(INDEX_FILE), legacy).unwrap();
+
+        let restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert!(restored.input_files[0].snapshot_identity.is_none());
+        assert_eq!(restored.sections, state.sections);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -15055,7 +15509,7 @@ mod tests {
             .unwrap()
             .sections_file
             .unwrap();
-        assert!(sections_file.starts_with(SECTIONS_FILE_PREFIX));
+        assert!(sections_file.starts_with(COMPRESSED_SECTIONS_FILE_PREFIX));
         assert!(dir.path().join(&sections_file).exists());
         let index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
         assert!(index.contains(&format!("\nindexed-sections-file\t{sections_file}\n")));
@@ -15289,6 +15743,7 @@ mod tests {
         let input = FileState {
             path: encode_path(&path),
             content: FileContentState::from_path_identity_only(&path).unwrap(),
+            snapshot_identity: None,
             patch: None,
         };
 

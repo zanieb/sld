@@ -5260,12 +5260,27 @@ fn read_incremental_state_text(output: &Path) -> Result<String> {
             .or_else(|| line.strip_prefix("indexed-sections-file\t"))
     }) {
         let sections_path = state_dir.join(sections_file);
-        let sections = std::fs::read_to_string(&sections_path).with_context(|| {
-            format!(
-                "Failed to read incremental sections `{}`",
-                sections_path.display()
-            )
-        })?;
+        let sections = if sections_file.starts_with("sections-zstd-") {
+            let bytes = std::fs::read(&sections_path).with_context(|| {
+                format!(
+                    "Failed to read compressed incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?;
+            String::from_utf8(zstd::stream::decode_all(bytes.as_slice())?).with_context(|| {
+                format!(
+                    "Invalid UTF-8 in incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?
+        } else {
+            std::fs::read_to_string(&sections_path).with_context(|| {
+                format!(
+                    "Failed to read incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?
+        };
         state_text.push('\n');
         state_text.push_str(&sections);
     }

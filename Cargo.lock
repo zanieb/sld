@@ -1803,6 +1803,7 @@ dependencies = [
  "toml",
  "wait-timeout",
  "which",
+ "zstd",
 ]
 
 [[package]]
