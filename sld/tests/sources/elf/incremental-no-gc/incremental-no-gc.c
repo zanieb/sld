@@ -11,7 +11,6 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedSymbolBytes:incremental_no_gc_unused=0x2b000000
-//#TestIncrementalStateContains:2e646174612e696e6372656d656e74616c5f6e6f5f67635f756e75736564
 
 #ifdef INCREMENTAL_NO_GC_CHANGED
 #define INCREMENTAL_NO_GC_VALUE 43

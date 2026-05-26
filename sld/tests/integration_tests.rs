@@ -5255,10 +5255,10 @@ fn read_incremental_state_text(output: &Path) -> Result<String> {
             index_path.display()
         )
     })?;
-    if let Some(sections_file) = state_text
-        .lines()
-        .find_map(|line| line.strip_prefix("sections-file\t"))
-    {
+    if let Some(sections_file) = state_text.lines().find_map(|line| {
+        line.strip_prefix("sections-file\t")
+            .or_else(|| line.strip_prefix("indexed-sections-file\t"))
+    }) {
         let sections_path = state_dir.join(sections_file);
         let sections = std::fs::read_to_string(&sections_path).with_context(|| {
             format!(

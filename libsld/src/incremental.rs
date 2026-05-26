@@ -24,11 +24,16 @@ use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::hash::Hash as _;
 use std::hash::Hasher as _;
+use std::io::Read as _;
+use std::io::Seek as _;
+use std::io::SeekFrom;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +43,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v29";
+const STATE_VERSION: &str = "sld-incremental-state-v30";
+const STATE_VERSION_V29: &str = "sld-incremental-state-v29";
 const STATE_VERSION_V28: &str = "sld-incremental-state-v28";
 const STATE_VERSION_V27: &str = "sld-incremental-state-v27";
 const STATE_VERSION_V26: &str = "sld-incremental-state-v26";
@@ -84,6 +90,7 @@ const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const ABSENT_FIELD: &str = "-";
 const RECORD_TEXT_INTERNER_SHARDS: usize = 64;
+const RECORD_BUFFER_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SharedText(Arc<str>);
@@ -134,12 +141,15 @@ impl PartialEq<&str> for SharedText {
 
 struct RecordTextInterner {
     values: [Mutex<HashMap<String, SharedText>>; RECORD_TEXT_INTERNER_SHARDS],
+    inputs: [Mutex<HashMap<(usize, Option<(usize, usize)>), (SharedText, SharedText)>>;
+        RECORD_TEXT_INTERNER_SHARDS],
 }
 
 impl Default for RecordTextInterner {
     fn default() -> Self {
         Self {
             values: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            inputs: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }
     }
 }
@@ -157,6 +167,58 @@ impl RecordTextInterner {
         values.insert(value, shared.clone());
         shared
     }
+
+    fn intern_input(&self, input: InputRef<'_>) -> (SharedText, SharedText) {
+        let key = (
+            std::ptr::from_ref(input.file) as usize,
+            input
+                .entry
+                .map(|entry| (entry.start_offset, entry.end_offset)),
+        );
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let shard = hasher.finish() as usize % RECORD_TEXT_INTERNER_SHARDS;
+        if let Some(texts) = self.inputs[shard].lock().unwrap().get(&key).cloned() {
+            return texts;
+        }
+        let texts = (
+            self.intern(encode_path(&input.file.filename)),
+            self.intern(encode_input_ref(input)),
+        );
+        self.inputs[shard]
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| texts.clone())
+            .clone()
+    }
+}
+
+struct RecordBuffers<T> {
+    values: [Mutex<Vec<T>>; RECORD_BUFFER_SHARDS],
+}
+
+impl<T> Default for RecordBuffers<T> {
+    fn default() -> Self {
+        Self {
+            values: std::array::from_fn(|_| Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl<T> RecordBuffers<T> {
+    fn push(&self, value: T) {
+        let shard = rayon::current_thread_index().unwrap_or(0) % RECORD_BUFFER_SHARDS;
+        self.values[shard].lock().unwrap().push(value);
+    }
+
+    fn take_all(&self) -> Vec<T> {
+        let mut records = Vec::new();
+        for shard in &self.values {
+            records.append(&mut *shard.lock().unwrap());
+        }
+        records
+    }
 }
 
 pub(crate) struct PreparedState {
@@ -167,10 +229,10 @@ pub(crate) struct PreparedState {
     previous_relocations: Vec<RelocationRecord>,
     previous_fdes: Vec<FdeRecord>,
     previous_dynamic_relocations: Vec<DynamicRelocationRecord>,
-    current_sections: Mutex<Vec<SectionRecord>>,
-    current_relocations: Mutex<Vec<RelocationRecord>>,
-    current_fdes: Mutex<Vec<FdeRecord>>,
-    current_dynamic_relocations: Mutex<Vec<DynamicRelocationRecord>>,
+    current_sections: RecordBuffers<SectionRecord>,
+    current_relocations: RecordBuffers<RelocationRecord>,
+    current_fdes: RecordBuffers<FdeRecord>,
+    current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
     record_texts: RecordTextInterner,
     reused_sections: AtomicUsize,
 }
@@ -211,6 +273,16 @@ struct PersistedState {
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
     sections_file: Option<String>,
+    patch_records_file: Option<String>,
+    patch_record_locations: Vec<PatchRecordLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchRecordLocation {
+    input_file: String,
+    offset: u64,
+    len: u64,
+    hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,10 +435,10 @@ pub(crate) fn maybe_prepare(
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         });
@@ -444,10 +516,10 @@ pub(crate) fn maybe_prepare(
         previous_relocations,
         previous_fdes,
         previous_dynamic_relocations,
-        current_sections: Mutex::new(Vec::new()),
-        current_relocations: Mutex::new(Vec::new()),
-        current_fdes: Mutex::new(Vec::new()),
-        current_dynamic_relocations: Mutex::new(Vec::new()),
+        current_sections: RecordBuffers::default(),
+        current_relocations: RecordBuffers::default(),
+        current_fdes: RecordBuffers::default(),
+        current_dynamic_relocations: RecordBuffers::default(),
         record_texts: RecordTextInterner::default(),
         reused_sections: AtomicUsize::new(0),
     })
@@ -556,10 +628,13 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         }) {
             previous.read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
         }
-        let should_filter_records = previous
-            .sections_file
-            .as_deref()
-            .is_some_and(|sections_file| should_filter_sections_sidecar(&state_dir, sections_file));
+        let should_filter_records = previous.patch_records_file.is_some()
+            || previous
+                .sections_file
+                .as_deref()
+                .is_some_and(|sections_file| {
+                    should_filter_sections_sidecar(&state_dir, sections_file)
+                });
         let should_retry_with_full_state = should_filter_records;
         let result = if should_filter_records {
             let result = patch_changed_inputs(
@@ -1032,7 +1107,25 @@ fn patch_changed_inputs(
     let mut fde_add_candidates = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut patched_section_count = 0;
+    let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
+        if previous.input_files[*input_index].patch.is_none()
+            && previous
+                .sections
+                .iter()
+                .any(|section| section.input_file == previous.input_files[*input_index].path)
+        {
+            let patch = current_patch_state_from_snapshot(
+                state_dir,
+                &previous.input_files[*input_index],
+                previous_output.get()?,
+                &previous.sections,
+                &previous.relocations,
+                &previous.fdes,
+                &previous.dynamic_relocations,
+            )?;
+            previous.input_files[*input_index].patch = patch;
+        }
         let previous_patch = {
             let input = &previous.input_files[*input_index];
             match patch_sections_from_previous_state(input, path) {
@@ -1678,6 +1771,8 @@ fn patch_changed_inputs(
         fdes: previous.fdes,
         dynamic_relocations: previous.dynamic_relocations,
         sections_file: previous.sections_file,
+        patch_records_file: previous.patch_records_file,
+        patch_record_locations: previous.patch_record_locations,
     }
     .write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
     clear_incremental_update_marker(state_dir)?;
@@ -2029,6 +2124,12 @@ struct ParsedPatchInputRef {
     range: std::ops::Range<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum PatchInputLookup {
+    MatchArchiveMember,
+    CurrentRecordedRange,
+}
+
 enum ArchiveMemberMatch<'data> {
     Unique(PatchInputBytes<'data>),
     Ambiguous,
@@ -2161,10 +2262,7 @@ impl PreparedState {
     }
 
     fn intern_input_texts(&self, input: InputRef<'_>) -> (SharedText, SharedText) {
-        (
-            self.record_texts.intern(encode_path(&input.file.filename)),
-            self.record_texts.intern(encode_input_ref(input)),
-        )
+        self.record_texts.intern_input(input)
     }
 
     pub(crate) fn try_reuse_section(
@@ -2191,7 +2289,7 @@ impl PreparedState {
             output_offset,
             size,
         );
-        self.current_sections.lock().unwrap().push(record.clone());
+        self.current_sections.push(record.clone());
 
         if !allow_reuse {
             return false;
@@ -2215,8 +2313,6 @@ impl PreparedState {
             return;
         }
         self.current_sections
-            .lock()
-            .unwrap()
             .push(generated_section_record(name, output_offset, size));
     }
 
@@ -2233,18 +2329,15 @@ impl PreparedState {
             return;
         }
         let (input_file, input_text) = self.intern_input_texts(input);
-        self.current_fdes
-            .lock()
-            .unwrap()
-            .push(FdeRecord::new_with_texts(
-                input_file,
-                input_text,
-                section_index,
-                eh_frame_section_index,
-                input_offset,
-                output_offset,
-                size,
-            ));
+        self.current_fdes.push(FdeRecord::new_with_texts(
+            input_file,
+            input_text,
+            section_index,
+            eh_frame_section_index,
+            input_offset,
+            output_offset,
+            size,
+        ));
     }
 
     pub(crate) fn record_relocation(
@@ -2276,8 +2369,6 @@ impl PreparedState {
             )
         });
         self.current_relocations
-            .lock()
-            .unwrap()
             .push(RelocationRecord::new_with_texts(
                 input_file,
                 input_text,
@@ -2308,8 +2399,8 @@ impl PreparedState {
             return;
         }
         let (input_file, input_text) = self.intern_input_texts(input);
-        self.current_dynamic_relocations.lock().unwrap().push(
-            DynamicRelocationRecord::new_with_texts(
+        self.current_dynamic_relocations
+            .push(DynamicRelocationRecord::new_with_texts(
                 input_file,
                 input_text,
                 section_index,
@@ -2317,8 +2408,7 @@ impl PreparedState {
                 output_offset,
                 size,
                 output_info,
-            ),
-        );
+            ));
     }
 
     pub(crate) fn finish(
@@ -2347,53 +2437,39 @@ impl PreparedState {
             (None, None)
         };
 
-        let mut sections = {
-            let mut current_sections = self.current_sections.lock().unwrap();
-            std::mem::take(&mut *current_sections)
-        };
+        let mut sections = self.current_sections.take_all();
         if sections.is_empty() && self.mode == IncrementalMode::Reuse {
             sections.extend(self.previous_sections.iter().cloned());
         }
         sections.sort();
 
-        let mut relocations = {
-            let mut current_relocations = self.current_relocations.lock().unwrap();
-            std::mem::take(&mut *current_relocations)
-        };
+        let mut relocations = self.current_relocations.take_all();
         if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
             relocations.extend(self.previous_relocations.iter().cloned());
         }
         relocations.sort();
 
-        let mut fdes = {
-            let mut current_fdes = self.current_fdes.lock().unwrap();
-            std::mem::take(&mut *current_fdes)
-        };
+        let mut fdes = self.current_fdes.take_all();
         if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
             fdes.extend(self.previous_fdes.iter().cloned());
         }
         fdes.sort();
 
-        let mut dynamic_relocations = {
-            let mut current_dynamic_relocations = self.current_dynamic_relocations.lock().unwrap();
-            std::mem::take(&mut *current_dynamic_relocations)
-        };
+        let mut dynamic_relocations = self.current_dynamic_relocations.take_all();
         if dynamic_relocations.is_empty() && self.mode == IncrementalMode::Reuse {
             dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
         }
         dynamic_relocations.sort();
 
         let mut input_files = self.current.input_files.clone();
-        record_patch_fingerprints(
-            &mut input_files,
-            file_loader,
-            &sections,
-            &relocations,
-            &fdes,
-            &dynamic_relocations,
-            &mut output_bytes,
-        )?;
-        snapshot_loaded_files(&self.current.state_dir, file_loader)?;
+        {
+            timing_phase!("Hash incremental patch inputs");
+            record_patchable_input_hashes(&mut input_files, file_loader, &sections);
+        }
+        {
+            timing_phase!("Snapshot incremental inputs");
+            snapshot_loaded_files(&self.current.state_dir, file_loader)?;
+        }
         refresh_input_file_identities(&mut input_files);
 
         let state = PersistedState {
@@ -2410,10 +2486,15 @@ impl PreparedState {
             fdes,
             dynamic_relocations,
             sections_file: None,
+            patch_records_file: None,
+            patch_record_locations: Vec::new(),
         };
 
         write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
-        state.write(&self.current.state_dir)?;
+        {
+            timing_phase!("Persist incremental index and sections");
+            state.write(&self.current.state_dir)?;
+        }
         clear_incremental_update_marker(&self.current.state_dir)?;
         let reused = self.reused_sections.load(Ordering::Relaxed);
         if reused > 0 {
@@ -2604,6 +2685,16 @@ impl PersistedState {
                 }
                 read_sections_sidecar(state_dir, sections_file).map(Some)
             })?;
+        if load_sections
+            && state.sections_file == state.patch_records_file
+            && state.patch_records_file.is_some()
+        {
+            let records = state.read_all_indexed_records(state_dir)?;
+            state.sections = records.sections;
+            state.relocations = records.relocations;
+            state.fdes = records.fdes;
+            state.dynamic_relocations = records.dynamic_relocations;
+        }
         state.apply_metadata_update(state_dir, patch_section_mode)?;
         Ok(Some(state))
     }
@@ -2613,6 +2704,43 @@ impl PersistedState {
         state_dir: &Path,
         input_files: &HashSet<String>,
     ) -> Result {
+        if let Some(patch_records_file) = self.patch_records_file.as_deref() {
+            let canonical_index = self.sections_file.as_deref() == Some(patch_records_file);
+            if let Some(records) =
+                self.read_indexed_patch_records(state_dir, patch_records_file, input_files)?
+            {
+                self.sections = records.sections;
+                self.relocations = records.relocations;
+                self.fdes = records.fdes;
+                self.dynamic_relocations = records.dynamic_relocations;
+                return Ok(());
+            }
+            if canonical_index {
+                self.sections.clear();
+                self.relocations.clear();
+                self.fdes.clear();
+                self.dynamic_relocations.clear();
+                return Ok(());
+            }
+            if self.patch_record_locations.is_empty() {
+                timing_phase!("Read incremental patch-record sidecar");
+                let contents = read_sections_sidecar(state_dir, patch_records_file)?;
+                let records =
+                    parse_compact_records_block_for_input_files(contents.lines(), input_files)?;
+                if input_files.iter().all(|input_file| {
+                    records
+                        .sections
+                        .iter()
+                        .any(|record| record.input_file.as_str() == input_file)
+                }) {
+                    self.sections = records.sections;
+                    self.relocations = records.relocations;
+                    self.fdes = records.fdes;
+                    self.dynamic_relocations = records.dynamic_relocations;
+                    return Ok(());
+                }
+            }
+        }
         let Some(sections_file) = self.sections_file.as_deref() else {
             return Ok(());
         };
@@ -2624,6 +2752,137 @@ impl PersistedState {
         self.fdes = records.fdes;
         self.dynamic_relocations = records.dynamic_relocations;
         Ok(())
+    }
+
+    fn read_indexed_patch_records(
+        &self,
+        state_dir: &Path,
+        patch_records_file: &str,
+        input_files: &HashSet<String>,
+    ) -> Result<Option<CompactRecords>> {
+        if self.patch_record_locations.is_empty() {
+            return if self.sections_file.as_deref() == Some(patch_records_file) {
+                Ok(Some(CompactRecords::default()))
+            } else {
+                Ok(None)
+            };
+        }
+        let canonical_index = self.sections_file.as_deref() == Some(patch_records_file);
+        let mut locations = self
+            .patch_record_locations
+            .iter()
+            .filter(|location| input_files.contains(&location.input_file))
+            .collect::<Vec<_>>();
+        if !canonical_index
+            && input_files.iter().any(|input_file| {
+                !locations
+                    .iter()
+                    .any(|location| location.input_file == *input_file)
+            })
+        {
+            return Ok(None);
+        }
+        locations.sort_by_key(|location| (location.offset, location.len, location.hash.as_str()));
+        locations.dedup_by(|left, right| {
+            left.offset == right.offset && left.len == right.len && left.hash == right.hash
+        });
+        let mut records =
+            self.read_indexed_records_at_locations(state_dir, patch_records_file, locations)?;
+        records
+            .sections
+            .retain(|record| input_files.contains(record.input_file.as_str()));
+        records.relocations.retain(|record| {
+            input_files.contains(record.input_file.as_str())
+                || record
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| input_files.contains(target.input_file.as_str()))
+        });
+        records
+            .fdes
+            .retain(|record| input_files.contains(record.input_file.as_str()));
+        records
+            .dynamic_relocations
+            .retain(|record| input_files.contains(record.input_file.as_str()));
+        Ok(Some(records))
+    }
+
+    fn read_all_indexed_records(&self, state_dir: &Path) -> Result<CompactRecords> {
+        let Some(patch_records_file) = self.patch_records_file.as_deref() else {
+            return Ok(CompactRecords::default());
+        };
+        let mut locations = self.patch_record_locations.iter().collect::<Vec<_>>();
+        locations.sort_by_key(|location| (location.offset, location.len, location.hash.as_str()));
+        locations.dedup_by(|left, right| {
+            left.offset == right.offset && left.len == right.len && left.hash == right.hash
+        });
+        self.read_indexed_records_at_locations(state_dir, patch_records_file, locations)
+    }
+
+    fn read_indexed_records_at_locations(
+        &self,
+        state_dir: &Path,
+        patch_records_file: &str,
+        locations: Vec<&PatchRecordLocation>,
+    ) -> Result<CompactRecords> {
+        timing_phase!("Read indexed incremental patch records");
+        validate_sections_file_name(patch_records_file)?;
+        let path = state_dir.join(patch_records_file);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .with_context(|| format!("Failed to read incremental sections `{}`", path.display()))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("Failed to stat incremental sections `{}`", path.display()))?
+            .len();
+        let mut records = CompactRecords::default();
+        for location in locations {
+            let end = location
+                .offset
+                .checked_add(location.len)
+                .context("Incremental patch record range overflowed")?;
+            if end > file_len {
+                return Err(crate::error!(
+                    "Incremental patch record range is outside `{}`",
+                    path.display()
+                ));
+            }
+            file.seek(SeekFrom::Start(location.offset))
+                .with_context(|| {
+                    format!("Failed to seek incremental sections `{}`", path.display())
+                })?;
+            let len = usize::try_from(location.len)
+                .context("Incremental patch record range is too large")?;
+            let mut bytes = vec![0; len];
+            file.read_exact(&mut bytes).with_context(|| {
+                format!("Failed to read incremental sections `{}`", path.display())
+            })?;
+            if hash_bytes(&bytes) != location.hash {
+                return Err(crate::error!(
+                    "Incremental patch records `{}` do not match their content hash",
+                    path.display()
+                ));
+            }
+            let contents = std::str::from_utf8(&bytes)
+                .context("Invalid UTF-8 in incremental patch record sidecar")?;
+            let block = parse_compact_records_block(contents.lines())?;
+            records.sections.extend(block.sections);
+            records.relocations.extend(block.relocations);
+            records.fdes.extend(block.fdes);
+            records
+                .dynamic_relocations
+                .extend(block.dynamic_relocations);
+        }
+        records.sections.sort();
+        records.sections.dedup();
+        records.relocations.sort();
+        records.relocations.dedup();
+        records.fdes.sort();
+        records.fdes.dedup();
+        records.dynamic_relocations.sort();
+        records.dynamic_relocations.dedup();
+        Ok(records)
     }
 
     fn read_patch_metadata_for_input_indices(
@@ -2743,6 +3002,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V29
             && version != STATE_VERSION_V28
             && version != STATE_VERSION_V27
             && version != STATE_VERSION_V26
@@ -2844,10 +3104,13 @@ impl PersistedState {
         }
 
         let mut sections_file = None;
+        let mut patch_records_file = None;
+        let mut patch_record_locations = Vec::new();
         let mut relocations = Vec::new();
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V29
             || version == STATE_VERSION_V28
             || version == STATE_VERSION_V27
             || version == STATE_VERSION_V26
@@ -2876,7 +3139,25 @@ impl PersistedState {
             let first_line = lines
                 .next()
                 .context("Missing incremental section input count")?;
-            if first_line.starts_with("sections-file\t") {
+            if first_line.starts_with("indexed-sections-file\t") {
+                if version != STATE_VERSION {
+                    return Err(crate::error!(
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`"
+                    ));
+                }
+                let file =
+                    parse_prefixed_line(Some(first_line), "indexed-sections-file")?.to_owned();
+                validate_sections_file_name(&file)?;
+                sections_file = Some(file.clone());
+                patch_records_file = Some(file);
+                let location_count: usize = parse_prefixed_line(lines.next(), "patch-records")?
+                    .parse()
+                    .context("Invalid incremental patch record location count")?;
+                for _ in 0..location_count {
+                    patch_record_locations.push(parse_patch_record_location_line(lines.next())?);
+                }
+                Vec::new()
+            } else if first_line.starts_with("sections-file\t") {
                 let file = parse_prefixed_line(Some(first_line), "sections-file")?.to_owned();
                 validate_sections_file_name(&file)?;
                 let records = load_sections(&file)?
@@ -2884,6 +3165,27 @@ impl PersistedState {
                     .transpose()?
                     .unwrap_or_default();
                 sections_file = Some(file);
+                if lines
+                    .peek()
+                    .is_some_and(|line| line.starts_with("patch-records-file\t"))
+                {
+                    let file = parse_prefixed_line(lines.next(), "patch-records-file")?.to_owned();
+                    validate_sections_file_name(&file)?;
+                    patch_records_file = Some(file);
+                    if lines
+                        .peek()
+                        .is_some_and(|line| line.starts_with("patch-records\t"))
+                    {
+                        let location_count: usize =
+                            parse_prefixed_line(lines.next(), "patch-records")?
+                                .parse()
+                                .context("Invalid incremental patch record location count")?;
+                        for _ in 0..location_count {
+                            patch_record_locations
+                                .push(parse_patch_record_location_line(lines.next())?);
+                        }
+                    }
+                }
                 relocations = records.relocations;
                 fdes = records.fdes;
                 dynamic_relocations = records.dynamic_relocations;
@@ -2931,12 +3233,25 @@ impl PersistedState {
             fdes,
             dynamic_relocations,
             sections_file,
+            patch_records_file,
+            patch_record_locations,
         })
     }
 
     fn write(&self, state_dir: &Path) -> Result {
-        let sections_file = self.write_sections_streaming(state_dir)?;
-        self.write_index_with_sections_file(state_dir, &sections_file)
+        let (sections_file, locations) = write_indexed_records_streaming(
+            state_dir,
+            &self.sections,
+            &self.relocations,
+            &self.fdes,
+            &self.dynamic_relocations,
+        )?;
+        self.write_index_with_sections_files(
+            state_dir,
+            &sections_file,
+            Some(&sections_file),
+            &locations,
+        )
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -2984,10 +3299,21 @@ impl PersistedState {
 
     fn write_index(&self, state_dir: &Path) -> Result {
         let sections_file = self.sections_file.as_deref().unwrap_or(SECTIONS_FILE);
-        self.write_index_with_sections_file(state_dir, sections_file)
+        self.write_index_with_sections_files(
+            state_dir,
+            sections_file,
+            self.patch_records_file.as_deref(),
+            &self.patch_record_locations,
+        )
     }
 
-    fn write_index_with_sections_file(&self, state_dir: &Path, sections_file: &str) -> Result {
+    fn write_index_with_sections_files(
+        &self,
+        state_dir: &Path,
+        sections_file: &str,
+        patch_records_file: Option<&str>,
+        patch_record_locations: &[PatchRecordLocation],
+    ) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "Failed to create incremental state directory `{}`",
@@ -2997,9 +3323,11 @@ impl PersistedState {
 
         let path = state_dir.join(INDEX_FILE);
         let tmp_path = state_dir.join(format!("{INDEX_FILE}.tmp"));
-        std::fs::write(&tmp_path, self.render_index(sections_file)).with_context(|| {
-            format!("Failed to write incremental state `{}`", tmp_path.display())
-        })?;
+        std::fs::write(
+            &tmp_path,
+            self.render_index(sections_file, patch_records_file, patch_record_locations),
+        )
+        .with_context(|| format!("Failed to write incremental state `{}`", tmp_path.display()))?;
         let _ = std::fs::remove_file(&path);
         std::fs::rename(&tmp_path, &path)
             .with_context(|| format!("Failed to install incremental state `{}`", path.display()))?;
@@ -3034,62 +3362,41 @@ impl PersistedState {
         Ok(())
     }
 
-    fn write_sections_streaming(&self, state_dir: &Path) -> Result<String> {
-        std::fs::create_dir_all(state_dir).with_context(|| {
-            format!(
-                "Failed to create incremental state directory `{}`",
-                state_dir.display()
-            )
-        })?;
-
-        let tmp_path = state_dir.join(format!("{SECTIONS_FILE}.tmp"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "Failed to create incremental sections `{}`",
-                    tmp_path.display()
-                )
-            })?;
-        let mut writer = SectionSidecarWriter::new(file);
-        if self.write_rendered_sections(&mut writer).is_err() {
-            if let Some(error) = writer.take_error() {
-                return Err(error).with_context(|| {
-                    format!(
-                        "Failed to write incremental sections `{}`",
-                        tmp_path.display()
-                    )
-                });
-            }
-            return Err(crate::error!(
-                "Failed to render incremental sections `{}`",
-                tmp_path.display()
-            ));
-        }
-        let hash = writer.finish().with_context(|| {
-            format!(
-                "Failed to finish incremental sections `{}`",
-                tmp_path.display()
-            )
-        })?;
-        let file_name = format!("{SECTIONS_FILE_PREFIX}{hash}");
-        let path = state_dir.join(&file_name);
-        let _ = std::fs::remove_file(&path);
-        std::fs::rename(&tmp_path, &path).with_context(|| {
-            format!(
-                "Failed to install incremental sections `{}`",
-                path.display()
-            )
-        })?;
-        Ok(file_name)
-    }
-
-    fn render_index(&self, sections_file: &str) -> String {
+    fn render_index(
+        &self,
+        sections_file: &str,
+        patch_records_file: Option<&str>,
+        patch_record_locations: &[PatchRecordLocation],
+    ) -> String {
         let mut out = self.render_header_and_inputs();
-        writeln!(&mut out, "sections-file\t{sections_file}").unwrap();
+        if patch_records_file == Some(sections_file) {
+            writeln!(&mut out, "indexed-sections-file\t{sections_file}").unwrap();
+            writeln!(&mut out, "patch-records\t{}", patch_record_locations.len()).unwrap();
+            for location in patch_record_locations {
+                writeln!(
+                    &mut out,
+                    "patch-record\t{}\t{}\t{}\t{}",
+                    location.input_file, location.offset, location.len, location.hash
+                )
+                .unwrap();
+            }
+        } else {
+            writeln!(&mut out, "sections-file\t{sections_file}").unwrap();
+        }
+        if let Some(patch_records_file) = patch_records_file
+            && patch_records_file != sections_file
+        {
+            writeln!(&mut out, "patch-records-file\t{patch_records_file}").unwrap();
+            writeln!(&mut out, "patch-records\t{}", patch_record_locations.len()).unwrap();
+            for location in patch_record_locations {
+                writeln!(
+                    &mut out,
+                    "patch-record\t{}\t{}\t{}\t{}",
+                    location.input_file, location.offset, location.len, location.hash
+                )
+                .unwrap();
+            }
+        }
         out
     }
 
@@ -3244,153 +3551,338 @@ impl PersistedState {
         out
     }
 
-    fn write_rendered_sections(&self, mut out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let mut section_inputs = Vec::new();
-        let mut section_input_ids = HashMap::new();
-        for section in &self.sections {
-            add_section_input(
-                &mut section_inputs,
-                &mut section_input_ids,
-                section.input_file.as_str(),
-                section.input.as_str(),
-            );
-        }
-        for relocation in &self.relocations {
-            add_section_input(
-                &mut section_inputs,
-                &mut section_input_ids,
-                relocation.input_file.as_str(),
-                relocation.input.as_str(),
-            );
-            if let Some(target) = &relocation.target {
-                add_section_input(
-                    &mut section_inputs,
-                    &mut section_input_ids,
-                    target.input_file.as_str(),
-                    target.input.as_str(),
-                );
-            }
-        }
-        for fde in &self.fdes {
-            add_section_input(
-                &mut section_inputs,
-                &mut section_input_ids,
-                fde.input_file.as_str(),
-                fde.input.as_str(),
-            );
-        }
-        for relocation in &self.dynamic_relocations {
-            add_section_input(
-                &mut section_inputs,
-                &mut section_input_ids,
-                relocation.input_file.as_str(),
-                relocation.input.as_str(),
-            );
-        }
+    #[cfg(test)]
+    fn write_rendered_sections(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write_rendered_records(
+            out,
+            &self.sections,
+            &self.relocations,
+            &self.fdes,
+            &self.dynamic_relocations,
+        )
+    }
+}
 
-        writeln!(&mut out, "section-inputs\t{}", section_inputs.len())?;
-        for (input_file, input) in section_inputs {
-            writeln!(&mut out, "section-input\t{input_file}\t{input}")?;
+fn write_rendered_records(
+    mut out: &mut impl std::fmt::Write,
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+) -> std::fmt::Result {
+    let mut section_inputs = Vec::new();
+    let mut section_input_ids = HashMap::new();
+    for section in sections {
+        add_section_input(
+            &mut section_inputs,
+            &mut section_input_ids,
+            section.input_file.as_str(),
+            section.input.as_str(),
+        );
+    }
+    for relocation in relocations {
+        add_section_input(
+            &mut section_inputs,
+            &mut section_input_ids,
+            relocation.input_file.as_str(),
+            relocation.input.as_str(),
+        );
+        if let Some(target) = &relocation.target {
+            add_section_input(
+                &mut section_inputs,
+                &mut section_input_ids,
+                target.input_file.as_str(),
+                target.input.as_str(),
+            );
         }
+    }
+    for fde in fdes {
+        add_section_input(
+            &mut section_inputs,
+            &mut section_input_ids,
+            fde.input_file.as_str(),
+            fde.input.as_str(),
+        );
+    }
+    for relocation in dynamic_relocations {
+        add_section_input(
+            &mut section_inputs,
+            &mut section_input_ids,
+            relocation.input_file.as_str(),
+            relocation.input.as_str(),
+        );
+    }
 
-        writeln!(&mut out, "sections\t{}", self.sections.len())?;
-        for section in &self.sections {
-            let section_input_id =
-                section_input_ids[&(section.input_file.as_str(), section.input.as_str())];
-            writeln!(
-                &mut out,
-                "section\t{}\t{}\t{}\t{}",
-                section_input_id, section.section_index, section.output_offset, section.size
-            )?;
-        }
-        writeln!(&mut out, "relocs\t{}", self.relocations.len())?;
-        for relocation in &self.relocations {
-            let section_input_id =
-                section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-            let (target_section_input_id, target_section_index, target_section_offset) =
-                relocation.target.as_ref().map_or(
+    writeln!(&mut out, "section-inputs\t{}", section_inputs.len())?;
+    for (input_file, input) in section_inputs {
+        writeln!(&mut out, "section-input\t{input_file}\t{input}")?;
+    }
+
+    writeln!(&mut out, "sections\t{}", sections.len())?;
+    for section in sections {
+        let section_input_id =
+            section_input_ids[&(section.input_file.as_str(), section.input.as_str())];
+        writeln!(
+            &mut out,
+            "section\t{}\t{}\t{}\t{}",
+            section_input_id, section.section_index, section.output_offset, section.size
+        )?;
+    }
+    writeln!(&mut out, "relocs\t{}", relocations.len())?;
+    for relocation in relocations {
+        let section_input_id =
+            section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
+        let (target_section_input_id, target_section_index, target_section_offset) =
+            relocation.target.as_ref().map_or(
+                (
+                    ABSENT_FIELD.to_owned(),
+                    ABSENT_FIELD.to_owned(),
+                    ABSENT_FIELD.to_owned(),
+                ),
+                |target| {
                     (
-                        ABSENT_FIELD.to_owned(),
-                        ABSENT_FIELD.to_owned(),
-                        ABSENT_FIELD.to_owned(),
-                    ),
-                    |target| {
-                        (
-                            section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
-                                .to_string(),
-                            target.section_index.to_string(),
-                            target.section_offset.to_string(),
-                        )
-                    },
-                );
+                        section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
+                            .to_string(),
+                        target.section_index.to_string(),
+                        target.section_offset.to_string(),
+                    )
+                },
+            );
+        writeln!(
+            &mut out,
+            "reloc2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            section_input_id,
+            relocation.section_index,
+            relocation.target_symbol_id,
+            relocation.relocation_offset,
+            relocation.output_offset,
+            relocation.size,
+            relocation.kind,
+            relocation.addend,
+            relocation
+                .written_value
+                .map_or_else(|| ABSENT_FIELD.to_owned(), |value| value.to_string()),
+            relocation.target_value,
+            relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
+            target_section_input_id,
+            target_section_index,
+            target_section_offset
+        )?;
+    }
+    writeln!(&mut out, "fdes\t{}", fdes.len())?;
+    for fde in fdes {
+        let section_input_id = section_input_ids[&(fde.input_file.as_str(), fde.input.as_str())];
+        writeln!(
+            &mut out,
+            "fde\t{}\t{}\t{}\t{}\t{}\t{}",
+            section_input_id,
+            fde.section_index,
+            fde.eh_frame_section_index,
+            fde.input_offset,
+            fde.output_offset,
+            fde.size
+        )?;
+    }
+    writeln!(&mut out, "dynrels\t{}", dynamic_relocations.len())?;
+    for relocation in dynamic_relocations {
+        let section_input_id =
+            section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
+        if let (Some(output_r_offset), Some(output_r_info)) =
+            (relocation.output_r_offset, relocation.output_r_info)
+        {
             writeln!(
                 &mut out,
-                "reloc2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "dynrel\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
                 relocation.section_index,
-                relocation.target_symbol_id,
                 relocation.relocation_offset,
                 relocation.output_offset,
                 relocation.size,
-                relocation.kind,
-                relocation.addend,
-                relocation
-                    .written_value
-                    .map_or_else(|| ABSENT_FIELD.to_owned(), |value| value.to_string()),
-                relocation.target_value,
-                relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
-                target_section_input_id,
-                target_section_index,
-                target_section_offset
+                output_r_offset,
+                output_r_info
             )?;
-        }
-        writeln!(&mut out, "fdes\t{}", self.fdes.len())?;
-        for fde in &self.fdes {
-            let section_input_id =
-                section_input_ids[&(fde.input_file.as_str(), fde.input.as_str())];
+        } else {
             writeln!(
                 &mut out,
-                "fde\t{}\t{}\t{}\t{}\t{}\t{}",
+                "dynrel\t{}\t{}\t{}\t{}\t{}",
                 section_input_id,
-                fde.section_index,
-                fde.eh_frame_section_index,
-                fde.input_offset,
-                fde.output_offset,
-                fde.size
+                relocation.section_index,
+                relocation.relocation_offset,
+                relocation.output_offset,
+                relocation.size
             )?;
         }
-        writeln!(&mut out, "dynrels\t{}", self.dynamic_relocations.len())?;
-        for relocation in &self.dynamic_relocations {
-            let section_input_id =
-                section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-            if let (Some(output_r_offset), Some(output_r_info)) =
-                (relocation.output_r_offset, relocation.output_r_info)
-            {
-                writeln!(
-                    &mut out,
-                    "dynrel\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    section_input_id,
-                    relocation.section_index,
-                    relocation.relocation_offset,
-                    relocation.output_offset,
-                    relocation.size,
-                    output_r_offset,
-                    output_r_info
-                )?;
-            } else {
-                writeln!(
-                    &mut out,
-                    "dynrel\t{}\t{}\t{}\t{}\t{}",
-                    section_input_id,
-                    relocation.section_index,
-                    relocation.relocation_offset,
-                    relocation.output_offset,
-                    relocation.size
-                )?;
-            }
-        }
-        Ok(())
     }
+    Ok(())
+}
+
+fn write_indexed_records_streaming(
+    state_dir: &Path,
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+) -> Result<(String, Vec<PatchRecordLocation>)> {
+    std::fs::create_dir_all(state_dir).with_context(|| {
+        format!(
+            "Failed to create incremental state directory `{}`",
+            state_dir.display()
+        )
+    })?;
+
+    let tmp_path = state_dir.join("sections-indexed.tmp");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)
+        .with_context(|| {
+            format!(
+                "Failed to create indexed incremental sections `{}`",
+                tmp_path.display()
+            )
+        })?;
+    let mut writer = SectionSidecarWriter::new(file);
+    let mut records_by_input = HashMap::<&str, CompactRecordRefs<'_>>::new();
+    for record in sections {
+        records_by_input
+            .entry(record.input_file.as_str())
+            .or_default()
+            .sections
+            .push(record);
+    }
+    let mut relocation_aliases = Vec::new();
+    for record in relocations {
+        records_by_input
+            .entry(record.input_file.as_str())
+            .or_default()
+            .relocations
+            .push(record);
+        if let Some(target) = record.target.as_ref()
+            && target.input_file != record.input_file
+        {
+            relocation_aliases.push((target.input_file.as_str(), record.input_file.as_str()));
+        }
+    }
+    for record in fdes {
+        records_by_input
+            .entry(record.input_file.as_str())
+            .or_default()
+            .fdes
+            .push(record);
+    }
+    for record in dynamic_relocations {
+        records_by_input
+            .entry(record.input_file.as_str())
+            .or_default()
+            .dynamic_relocations
+            .push(record);
+    }
+    let mut input_files = records_by_input
+        .iter()
+        .map(|(input_file, _)| *input_file)
+        .collect::<Vec<_>>();
+    input_files.sort_unstable();
+    let mut offset = 0;
+    let mut locations = Vec::with_capacity(input_files.len());
+    let mut location_by_owner = HashMap::new();
+    for input_file in input_files {
+        let records = &records_by_input[input_file];
+        let sections = records
+            .sections
+            .iter()
+            .map(|record| (*record).clone())
+            .collect::<Vec<_>>();
+        let relocations = records
+            .relocations
+            .iter()
+            .map(|record| (*record).clone())
+            .collect::<Vec<_>>();
+        let fdes = records
+            .fdes
+            .iter()
+            .map(|record| (*record).clone())
+            .collect::<Vec<_>>();
+        let dynamic_relocations = records
+            .dynamic_relocations
+            .iter()
+            .map(|record| (*record).clone())
+            .collect::<Vec<_>>();
+        let mut block = String::new();
+        write_rendered_records(
+            &mut block,
+            &sections,
+            &relocations,
+            &fdes,
+            &dynamic_relocations,
+        )
+        .expect("writing incremental patch records to String should not fail");
+        if writer.write_str(&block).is_err() {
+            if let Some(error) = writer.take_error() {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to write indexed incremental sections `{}`",
+                        tmp_path.display()
+                    )
+                });
+            }
+            return Err(crate::error!(
+                "Failed to render indexed incremental sections `{}`",
+                tmp_path.display()
+            ));
+        }
+        let len = block.len() as u64;
+        let location = PatchRecordLocation {
+            input_file: input_file.to_owned(),
+            offset,
+            len,
+            hash: hash_bytes(block.as_bytes()),
+        };
+        location_by_owner.insert(input_file, location.clone());
+        locations.push(location);
+        offset += len;
+    }
+    relocation_aliases.sort_unstable();
+    relocation_aliases.dedup();
+    for (target_input_file, owner_input_file) in relocation_aliases {
+        let Some(owner_location) = location_by_owner.get(owner_input_file) else {
+            continue;
+        };
+        let mut location = owner_location.clone();
+        location.input_file = target_input_file.to_owned();
+        locations.push(location);
+    }
+    locations.sort_by(|left, right| {
+        (
+            left.input_file.as_str(),
+            left.offset,
+            left.len,
+            left.hash.as_str(),
+        )
+            .cmp(&(
+                right.input_file.as_str(),
+                right.offset,
+                right.len,
+                right.hash.as_str(),
+            ))
+    });
+    locations.dedup();
+    let hash = writer.finish().with_context(|| {
+        format!(
+            "Failed to finish indexed incremental sections `{}`",
+            tmp_path.display()
+        )
+    })?;
+    let file_name = format!("{SECTIONS_FILE_PREFIX}{hash}");
+    let path = state_dir.join(&file_name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "Failed to install indexed incremental sections `{}`",
+            path.display()
+        )
+    })?;
+    Ok((file_name, locations))
 }
 
 struct SectionSidecarWriter {
@@ -3965,6 +4457,7 @@ fn read_output_bytes(path: &Path) -> Result<memmap2::Mmap> {
     })
 }
 
+#[cfg(test)]
 fn record_patch_fingerprints<F>(
     input_files: &mut [FileState],
     file_loader: &FileLoader<'_>,
@@ -3976,6 +4469,33 @@ fn record_patch_fingerprints<F>(
 ) -> Result
 where
     F: FnOnce() -> Result<memmap2::Mmap>,
+{
+    record_patch_fingerprints_for_inputs(
+        input_files,
+        file_loader,
+        sections,
+        relocations,
+        fdes,
+        dynamic_relocations,
+        output,
+        |_| true,
+    )
+}
+
+#[cfg(test)]
+fn record_patch_fingerprints_for_inputs<F, P>(
+    input_files: &mut [FileState],
+    file_loader: &FileLoader<'_>,
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+    output: &mut LazyOutputBytes<F>,
+    should_record: P,
+) -> Result
+where
+    F: FnOnce() -> Result<memmap2::Mmap>,
+    P: Fn(&crate::input_data::InputFile) -> bool,
 {
     let mut sections_by_file = HashMap::<&str, Vec<&SectionRecord>>::new();
     for section in sections {
@@ -4054,70 +4574,24 @@ where
             input.patch = None;
             continue;
         };
-        let patch_sections = direct_copy_patch_sections(
+        if !should_record(input_file) {
+            input.patch = None;
+            continue;
+        }
+        let patch = current_patch_state(
             input_file.data(),
             input.path.as_str(),
             output.get()?,
             sections,
             input_dynamic_relocations
-                .into_iter()
-                .flat_map(|relocations| relocations.iter().copied()),
-        )?;
-        let dynamic_relocation_patches = dynamic_relocation_patches_for_input(
-            input_file.data(),
-            input.path.as_str(),
-            input_dynamic_relocations
-                .into_iter()
-                .flat_map(|relocations| relocations.iter().copied()),
-        )?;
-        let relocation_addend_ranges = relocation_addend_ranges_for_input(
-            input_file.data(),
-            input.path.as_str(),
-            input_relocations
-                .into_iter()
-                .flat_map(|relocations| relocations.iter().copied()),
-        )?;
-        let relocation_target_ranges = relocation_target_ranges_for_input(
-            input_file.data(),
-            input.path.as_str(),
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            input_relocations.map(Vec::as_slice).unwrap_or_default(),
             input_relocation_targets
-                .into_iter()
-                .flat_map(|relocations| relocations.iter().copied()),
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            input_fdes.map(Vec::as_slice).unwrap_or_default(),
         )?;
-        let fde_relocation_ranges = fde_patch_input_ranges_for_input(
-            input_file.data(),
-            input.path.as_str(),
-            input_fdes
-                .into_iter()
-                .flat_map(|records| records.iter().copied()),
-        )?;
-        let patch = patch_fingerprint_with_extra_ranges(
-            input_file.data(),
-            input.path.as_str(),
-            patch_sections.iter().cloned(),
-            dynamic_relocation_patches
-                .iter()
-                .filter_map(|patch| patch.input_range.clone())
-                .chain(relocation_addend_ranges)
-                .chain(relocation_target_ranges)
-                .chain(fde_relocation_ranges),
-        )?
-        .map(|fingerprint| FilePatchState {
-            fingerprint,
-            sections: patch_sections
-                .iter()
-                .map(|section| FilePatchSectionState {
-                    input: section.input.clone(),
-                    section_index: section.section_index,
-                    section_name: section.section_name.clone(),
-                    input_size: section.input_size,
-                    output_offset: section.output_offset,
-                    output_size: section.output_size,
-                    data_hash: section.data_hash.clone(),
-                })
-                .collect(),
-            raw_sections: None,
-        });
         if patch.is_some() && input.content.hash.is_empty() {
             input.content.hash = hash_bytes(input_file.data());
         }
@@ -4127,6 +4601,119 @@ where
     Ok(())
 }
 
+fn current_patch_state(
+    bytes: &[u8],
+    input_file_path: &str,
+    output: &[u8],
+    sections: &[&SectionRecord],
+    dynamic_relocations: &[&DynamicRelocationRecord],
+    relocations: &[&RelocationRecord],
+    relocation_targets: &[&RelocationRecord],
+    fdes: &[&FdeRecord],
+) -> Result<Option<FilePatchState>> {
+    let patch_sections = direct_copy_patch_sections(
+        bytes,
+        input_file_path,
+        output,
+        sections,
+        dynamic_relocations.iter().copied(),
+    )?;
+    let dynamic_relocation_patches = dynamic_relocation_patches_for_current_records(
+        bytes,
+        input_file_path,
+        dynamic_relocations.iter().copied(),
+    )?;
+    let relocation_addend_ranges = relocation_addend_ranges_for_current_records(
+        bytes,
+        input_file_path,
+        relocations.iter().copied(),
+    )?;
+    let relocation_target_ranges = relocation_target_ranges_for_current_records(
+        bytes,
+        input_file_path,
+        relocation_targets.iter().copied(),
+    )?;
+    let fde_relocation_ranges =
+        fde_patch_input_ranges_for_current_records(bytes, input_file_path, fdes.iter().copied())?;
+    Ok(patch_fingerprint_for_current_records_with_extra_ranges(
+        bytes,
+        input_file_path,
+        patch_sections.iter().cloned(),
+        dynamic_relocation_patches
+            .iter()
+            .filter_map(|patch| patch.input_range.clone())
+            .chain(relocation_addend_ranges)
+            .chain(relocation_target_ranges)
+            .chain(fde_relocation_ranges),
+    )?
+    .map(|fingerprint| FilePatchState {
+        fingerprint,
+        sections: patch_sections
+            .iter()
+            .map(|section| FilePatchSectionState {
+                input: section.input.clone(),
+                section_index: section.section_index,
+                section_name: section.section_name.clone(),
+                input_size: section.input_size,
+                output_offset: section.output_offset,
+                output_size: section.output_size,
+                data_hash: section.data_hash.clone(),
+            })
+            .collect(),
+        raw_sections: None,
+    }))
+}
+
+fn current_patch_state_from_snapshot(
+    state_dir: &Path,
+    input: &FileState,
+    output: &[u8],
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+) -> Result<Option<FilePatchState>> {
+    let Some(bytes) = read_verified_input_snapshot(state_dir, input)? else {
+        return Ok(None);
+    };
+    let sections = sections
+        .iter()
+        .filter(|section| section.input_file == input.path)
+        .collect::<Vec<_>>();
+    let dynamic_relocations = dynamic_relocations
+        .iter()
+        .filter(|relocation| relocation.input_file == input.path)
+        .collect::<Vec<_>>();
+    let input_relocations = relocations
+        .iter()
+        .filter(|relocation| relocation.input_file == input.path)
+        .collect::<Vec<_>>();
+    let relocation_targets = relocations
+        .iter()
+        .filter(|relocation| {
+            relocation
+                .target
+                .as_ref()
+                .is_some_and(|target| target.input_file == input.path)
+        })
+        .collect::<Vec<_>>();
+    let fdes = fdes
+        .iter()
+        .filter(|record| record.input_file == input.path)
+        .collect::<Vec<_>>();
+    current_patch_state(
+        &bytes,
+        input.path.as_str(),
+        output,
+        &sections,
+        &dynamic_relocations,
+        &input_relocations,
+        &relocation_targets,
+        &fdes,
+    )
+}
+
+#[cfg(test)]
 fn patch_state_matches_section_records(
     patch: &FilePatchState,
     sections: &[&SectionRecord],
@@ -4185,7 +4772,13 @@ fn direct_copy_patch_sections<'a>(
     }
 
     for (input_ref, records) in sections_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) = patch_input_bytes_with_lookup(
+            bytes,
+            input_file_path,
+            input_ref,
+            PatchInputLookup::CurrentRecordedRange,
+        )?
+        else {
             continue;
         };
         let file = object::File::parse(input_bytes.bytes)
@@ -4365,6 +4958,20 @@ fn patch_input_bytes<'data>(
     input_file_path: &str,
     input_ref: &str,
 ) -> Result<Option<PatchInputBytes<'data>>> {
+    patch_input_bytes_with_lookup(
+        bytes,
+        input_file_path,
+        input_ref,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn patch_input_bytes_with_lookup<'data>(
+    bytes: &'data [u8],
+    input_file_path: &str,
+    input_ref: &str,
+    lookup: PatchInputLookup,
+) -> Result<Option<PatchInputBytes<'data>>> {
     let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)? else {
         return Ok(Some(PatchInputBytes {
             bytes,
@@ -4373,6 +4980,16 @@ fn patch_input_bytes<'data>(
     };
     if parsed.range.is_empty() {
         return Ok(None);
+    }
+
+    if matches!(lookup, PatchInputLookup::CurrentRecordedRange) {
+        let Some(input_bytes) = bytes.get(parsed.range.clone()) else {
+            return Ok(None);
+        };
+        return Ok(Some(PatchInputBytes {
+            bytes: input_bytes,
+            file_offset: parsed.range.start,
+        }));
     }
 
     match patch_archive_member_bytes(bytes, &parsed.identifier)? {
@@ -4533,7 +5150,39 @@ fn patch_fingerprint_with_extra_ranges(
     sections: impl IntoIterator<Item = PatchSection>,
     extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
 ) -> Result<Option<String>> {
-    let Some(mut ranges) = patch_ranges(bytes, input_file_path, sections)? else {
+    patch_fingerprint_with_lookup(
+        bytes,
+        input_file_path,
+        sections,
+        extra_ranges,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn patch_fingerprint_for_current_records_with_extra_ranges(
+    bytes: &[u8],
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+) -> Result<Option<String>> {
+    patch_fingerprint_with_lookup(
+        bytes,
+        input_file_path,
+        sections,
+        extra_ranges,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn patch_fingerprint_with_lookup(
+    bytes: &[u8],
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    lookup: PatchInputLookup,
+) -> Result<Option<String>> {
+    let Some(mut ranges) = patch_ranges_with_lookup(bytes, input_file_path, sections, lookup)?
+    else {
         return Ok(None);
     };
     ranges.extend(extra_ranges);
@@ -5005,6 +5654,33 @@ fn dynamic_relocation_patches_for_input<'a>(
     input_file_path: &str,
     records: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
 ) -> Result<Vec<DynamicRelocationPatch>> {
+    dynamic_relocation_patches_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn dynamic_relocation_patches_for_current_records<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+) -> Result<Vec<DynamicRelocationPatch>> {
+    dynamic_relocation_patches_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn dynamic_relocation_patches_for_input_with_lookup<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+    lookup: PatchInputLookup,
+) -> Result<Vec<DynamicRelocationPatch>> {
     let records = records.into_iter().collect::<Vec<_>>();
     let mut patches = Vec::new();
     let mut records_by_input = HashMap::<&str, Vec<&DynamicRelocationRecord>>::new();
@@ -5016,7 +5692,9 @@ fn dynamic_relocation_patches_for_input<'a>(
     }
 
     for (input_ref, records) in records_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
+        else {
             continue;
         };
         patches.extend(dynamic_relocation_patches_for_input_bytes(
@@ -5320,10 +5998,38 @@ fn relocation_addend_patches_for_input(
     }))
 }
 
+#[cfg(test)]
 fn relocation_addend_ranges_for_input<'a>(
     bytes: &[u8],
     input_file_path: &str,
     records: impl IntoIterator<Item = &'a RelocationRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    relocation_addend_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn relocation_addend_ranges_for_current_records<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a RelocationRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    relocation_addend_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn relocation_addend_ranges_for_input_with_lookup<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a RelocationRecord>,
+    lookup: PatchInputLookup,
 ) -> Result<Vec<std::ops::Range<usize>>> {
     let mut ranges = Vec::new();
     let mut records_by_input = HashMap::<&str, Vec<&RelocationRecord>>::new();
@@ -5335,7 +6041,9 @@ fn relocation_addend_ranges_for_input<'a>(
     }
 
     for (input_ref, records) in records_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
+        else {
             continue;
         };
         let Some(section_headers) = elf_section_headers(input_bytes.bytes) else {
@@ -5370,10 +6078,24 @@ fn relocation_addend_ranges_for_input<'a>(
     Ok(ranges)
 }
 
-fn relocation_target_ranges_for_input<'a>(
+fn relocation_target_ranges_for_current_records<'a>(
     bytes: &[u8],
     input_file_path: &str,
     records: impl IntoIterator<Item = &'a RelocationRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    relocation_target_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn relocation_target_ranges_for_input_with_lookup<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a RelocationRecord>,
+    lookup: PatchInputLookup,
 ) -> Result<Vec<std::ops::Range<usize>>> {
     let mut ranges = Vec::new();
     let mut records_by_input = HashMap::<&str, Vec<&RelocationRecord>>::new();
@@ -5388,7 +6110,9 @@ fn relocation_target_ranges_for_input<'a>(
     }
 
     for (input_ref, records) in records_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
+        else {
             continue;
         };
         let file = object::File::parse(input_bytes.bytes)
@@ -5894,10 +6618,38 @@ fn section_name_is_metadata_for_fde_removal(name: &str) -> bool {
         )
 }
 
+#[cfg(test)]
 fn fde_patch_input_ranges_for_input<'a>(
     bytes: &[u8],
     input_file_path: &str,
     records: impl IntoIterator<Item = &'a FdeRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    fde_patch_input_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn fde_patch_input_ranges_for_current_records<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a FdeRecord>,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    fde_patch_input_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        records,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn fde_patch_input_ranges_for_input_with_lookup<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    records: impl IntoIterator<Item = &'a FdeRecord>,
+    lookup: PatchInputLookup,
 ) -> Result<Vec<std::ops::Range<usize>>> {
     let mut ranges = Vec::new();
     let mut records_by_input = HashMap::<&str, Vec<&FdeRecord>>::new();
@@ -5909,7 +6661,9 @@ fn fde_patch_input_ranges_for_input<'a>(
     }
 
     for (input_ref, records) in records_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
+        else {
             continue;
         };
         ranges.extend(fde_patch_input_ranges_for_input_bytes(
@@ -7454,10 +8208,25 @@ fn elf_symbol_value_field_range(
     None
 }
 
+#[cfg(test)]
 fn patch_ranges(
     bytes: &[u8],
     input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
+) -> Result<Option<Vec<std::ops::Range<usize>>>> {
+    patch_ranges_with_lookup(
+        bytes,
+        input_file_path,
+        sections,
+        PatchInputLookup::MatchArchiveMember,
+    )
+}
+
+fn patch_ranges_with_lookup(
+    bytes: &[u8],
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    lookup: PatchInputLookup,
 ) -> Result<Option<Vec<std::ops::Range<usize>>>> {
     let mut ranges = Vec::new();
     let sections = sections.into_iter().collect::<Vec<_>>();
@@ -7470,7 +8239,9 @@ fn patch_ranges(
     }
 
     for (input_ref, sections) in sections_by_input {
-        let Some(input_bytes) = patch_input_bytes(bytes, input_file_path, input_ref)? else {
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
+        else {
             return Ok(None);
         };
         let file = object::File::parse(input_bytes.bytes)
@@ -8047,6 +8818,31 @@ fn fingerprint_loaded_files(
     files
 }
 
+fn record_patchable_input_hashes(
+    input_files: &mut [FileState],
+    file_loader: &FileLoader<'_>,
+    sections: &[SectionRecord],
+) {
+    let patchable_inputs = sections
+        .iter()
+        .map(|section| section.input_file.as_str())
+        .collect::<HashSet<_>>();
+    let loaded_by_path = file_loader
+        .loaded_files
+        .iter()
+        .map(|file| (encode_path(&file.filename), *file))
+        .collect::<HashMap<_, _>>();
+    for input in input_files {
+        input.patch = None;
+        if input.content.hash.is_empty()
+            && patchable_inputs.contains(input.path.as_str())
+            && let Some(input_file) = loaded_by_path.get(&input.path)
+        {
+            input.content.hash = hash_bytes(input_file.data());
+        }
+    }
+}
+
 fn parse_prefixed_line<'a>(line: Option<&'a str>, expected_prefix: &str) -> Result<&'a str> {
     let line = line.context("Missing incremental state line")?;
     let (prefix, rest) = line
@@ -8116,12 +8912,52 @@ fn parse_build_id_hash_line(line: Option<&str>) -> Result<Option<BuildIdHashStat
     }))
 }
 
+fn parse_patch_record_location_line(line: Option<&str>) -> Result<PatchRecordLocation> {
+    let rest = parse_prefixed_line(line, "patch-record")?;
+    let mut parts = rest.split('\t');
+    let input_file = parts
+        .next()
+        .context("Malformed incremental patch record input")?
+        .to_owned();
+    let offset = parts
+        .next()
+        .context("Malformed incremental patch record offset")?
+        .parse()
+        .context("Invalid incremental patch record offset")?;
+    let len = parts
+        .next()
+        .context("Malformed incremental patch record length")?
+        .parse()
+        .context("Invalid incremental patch record length")?;
+    let hash = parts
+        .next()
+        .context("Malformed incremental patch record hash")?
+        .to_owned();
+    if parts.next().is_some() {
+        return Err(crate::error!("Malformed incremental patch record location"));
+    }
+    Ok(PatchRecordLocation {
+        input_file,
+        offset,
+        len,
+        hash,
+    })
+}
+
 #[derive(Default)]
 struct CompactRecords {
     sections: Vec<SectionRecord>,
     relocations: Vec<RelocationRecord>,
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
+}
+
+#[derive(Default)]
+struct CompactRecordRefs<'a> {
+    sections: Vec<&'a SectionRecord>,
+    relocations: Vec<&'a RelocationRecord>,
+    fdes: Vec<&'a FdeRecord>,
+    dynamic_relocations: Vec<&'a DynamicRelocationRecord>,
 }
 
 fn parse_compact_records_block<'a>(
@@ -8223,6 +9059,11 @@ fn parse_compact_records_block_for_input_files<'a>(
             .context("Missing incremental section input record")?;
         section_inputs.push(parse_section_input_line(line)?);
     }
+    let matched_section_input_ids = section_inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (input_file, _))| input_files.contains(input_file).then_some(index))
+        .collect::<HashSet<_>>();
 
     let section_count: usize = parse_prefixed_line(lines.next(), "sections")?
         .parse()
@@ -8230,7 +9071,12 @@ fn parse_compact_records_block_for_input_files<'a>(
     let mut sections = Vec::new();
     for _ in 0..section_count {
         let line = lines.next().context("Missing incremental section record")?;
-        if compact_record_matches_input(line, "section", &section_inputs, input_files)? {
+        if compact_record_matches_input(
+            line,
+            "section",
+            &matched_section_input_ids,
+            section_inputs.len(),
+        )? {
             sections.push(parse_compact_section_line(line, &section_inputs)?);
         }
     }
@@ -8249,7 +9095,12 @@ fn parse_compact_records_block_for_input_files<'a>(
             let line = lines
                 .next()
                 .context("Missing incremental relocation record")?;
-            if compact_relocation_record_matches_input(line, &section_inputs, input_files)? {
+            if compact_relocation_record_matches_input(
+                line,
+                &matched_section_input_ids,
+                input_files,
+                section_inputs.len(),
+            )? {
                 relocations.push(parse_compact_relocation_line(line, &section_inputs)?);
             }
         }
@@ -8263,7 +9114,12 @@ fn parse_compact_records_block_for_input_files<'a>(
             .context("Invalid incremental FDE count")?;
         for _ in 0..fde_count {
             let line = lines.next().context("Missing incremental FDE record")?;
-            if compact_record_matches_input(line, "fde", &section_inputs, input_files)? {
+            if compact_record_matches_input(
+                line,
+                "fde",
+                &matched_section_input_ids,
+                section_inputs.len(),
+            )? {
                 fdes.push(parse_compact_fde_line(line, &section_inputs)?);
             }
         }
@@ -8279,7 +9135,12 @@ fn parse_compact_records_block_for_input_files<'a>(
             let line = lines
                 .next()
                 .context("Missing incremental dynamic relocation record")?;
-            if compact_record_matches_input(line, "dynrel", &section_inputs, input_files)? {
+            if compact_record_matches_input(
+                line,
+                "dynrel",
+                &matched_section_input_ids,
+                section_inputs.len(),
+            )? {
                 dynamic_relocations.push(parse_compact_dynamic_relocation_line(
                     line,
                     &section_inputs,
@@ -8304,27 +9165,33 @@ fn parse_compact_records_block_for_input_files<'a>(
 fn compact_record_matches_input(
     line: &str,
     prefix: &str,
-    section_inputs: &[(String, String)],
-    input_files: &HashSet<String>,
+    matched_section_input_ids: &HashSet<usize>,
+    section_input_count: usize,
 ) -> Result<bool> {
     let rest = parse_prefixed_line(Some(line), prefix)?;
     let section_input_id = compact_record_section_input_id(rest, prefix)?;
-    let Some((input_file, _)) = section_inputs.get(section_input_id) else {
+    if section_input_id >= section_input_count {
         return Err(crate::error!(
             "Incremental {prefix} input index out of bounds"
         ));
-    };
-    Ok(input_files.contains(input_file))
+    }
+    Ok(matched_section_input_ids.contains(&section_input_id))
 }
 
 fn compact_relocation_record_matches_input(
     line: &str,
-    section_inputs: &[(String, String)],
+    matched_section_input_ids: &HashSet<usize>,
     input_files: &HashSet<String>,
+    section_input_count: usize,
 ) -> Result<bool> {
     if line.starts_with("reloc2\t") {
         let rest = parse_prefixed_line(Some(line), "reloc2")?;
-        if compact_record_matches_input(line, "reloc2", section_inputs, input_files)? {
+        if compact_record_matches_input(
+            line,
+            "reloc2",
+            matched_section_input_ids,
+            section_input_count,
+        )? {
             return Ok(true);
         }
         let parts = rest.split('\t').collect::<Vec<_>>();
@@ -8334,15 +9201,20 @@ fn compact_relocation_record_matches_input(
         let target_section_input_id: usize = parts[11]
             .parse()
             .context("Invalid incremental relocation target input index")?;
-        let Some((target_input_file, _)) = section_inputs.get(target_section_input_id) else {
+        if target_section_input_id >= section_input_count {
             return Err(crate::error!(
                 "Incremental relocation target input index out of bounds"
             ));
-        };
-        return Ok(input_files.contains(target_input_file));
+        }
+        return Ok(matched_section_input_ids.contains(&target_section_input_id));
     }
 
-    if compact_record_matches_input(line, "reloc", section_inputs, input_files)? {
+    if compact_record_matches_input(
+        line,
+        "reloc",
+        matched_section_input_ids,
+        section_input_count,
+    )? {
         return Ok(true);
     }
     Ok(input_files
@@ -9187,7 +10059,25 @@ fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
     unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) == 0 }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "linux")]
+fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    let Ok(source) = std::fs::File::open(source) else {
+        return false;
+    };
+    let Ok(output) = OpenOptions::new().create_new(true).write(true).open(target) else {
+        return false;
+    };
+    if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+        return true;
+    }
+    drop(output);
+    let _ = std::fs::remove_file(target);
+    false
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 fn clone_snapshot_bytes(_source: &Path, _target: &Path) -> bool {
     false
 }
@@ -9483,6 +10373,8 @@ mod tests {
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
+            patch_records_file: None,
+            patch_record_locations: Vec::new(),
         }
     }
 
@@ -12600,6 +13492,45 @@ mod tests {
     }
 
     #[test]
+    fn current_recorded_range_selects_an_ambiguous_archive_member() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 5),
+                b"first".as_slice(),
+            )
+            .unwrap();
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 6),
+                b"second".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let start = archive
+            .windows(b"second".len())
+            .rposition(|window| window == b"second")
+            .unwrap();
+        let input_file = hex::encode("libarchive.a");
+        let input_ref = hex::encode(format!(
+            "libarchive.a\0member.o\0{start}:{}",
+            start + b"second".len()
+        ));
+
+        let member = patch_input_bytes_with_lookup(
+            &archive,
+            &input_file,
+            &input_ref,
+            PatchInputLookup::CurrentRecordedRange,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(member.bytes, b"second");
+        assert_eq!(member.file_offset, start);
+    }
+
+    #[test]
     fn archive_member_identifiers_track_member_set() {
         let mut builder = ar::Builder::new(Vec::new());
         builder
@@ -13252,6 +14183,25 @@ mod tests {
     }
 
     #[test]
+    fn record_patchable_input_hashes_drops_inherited_eager_patch_metadata() {
+        let arena = colosseum::sync::Arena::new();
+        let file_loader = FileLoader::new(&arena);
+        let mut input_files = vec![FileState {
+            path: hex::encode("a.o"),
+            content: FileContentState::from_bytes(b"a"),
+            patch: Some(FilePatchState {
+                fingerprint: "legacy-patch-hash".to_owned(),
+                sections: Vec::new(),
+                raw_sections: None,
+            }),
+        }];
+
+        record_patchable_input_hashes(&mut input_files, &file_loader, &[]);
+
+        assert!(input_files[0].patch.is_none());
+    }
+
+    #[test]
     fn v10_patch_metadata_without_section_names_is_accepted() {
         let line = format!(
             "input\t{}\t1\t{}\t-\tpatch-hash\t1:4:100:4,3:8:112:12",
@@ -13482,6 +14432,8 @@ mod tests {
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
+            patch_records_file: None,
+            patch_record_locations: Vec::new(),
         };
 
         let result = patch_changed_inputs(
@@ -13499,6 +14451,43 @@ mod tests {
             panic!("changed input was unexpectedly patched");
         };
         assert!(reason.contains("missing patch metadata"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn changed_input_derives_missing_patch_metadata_from_snapshot() {
+        let bytes = growable_data_elf();
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, &bytes).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let previous = FileState {
+            path: encode_path(&input),
+            content: content_hash_with_path_identity(&input, &bytes),
+            patch: None,
+        };
+        let sections = vec![section_record(input.to_str().unwrap(), 1, 64, 8)];
+        let mut output = vec![0; 72];
+        output[64..68].copy_from_slice(&bytes[0x40..0x44]);
+
+        let patch = current_patch_state_from_snapshot(
+            &state_dir,
+            &previous,
+            &output,
+            &sections,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patch.sections.len(), 1);
+        assert_eq!(patch.sections[0].section_name.as_deref(), Some(".data"));
+        assert_eq!(patch.sections[0].input_size, 4);
+        assert_eq!(patch.sections[0].output_offset, 64);
+        assert_eq!(patch.sections[0].output_size, 8);
     }
 
     #[test]
@@ -13574,6 +14563,23 @@ mod tests {
         let second = interner.intern("same-input".to_owned());
 
         assert!(Arc::ptr_eq(&first.0, &second.0));
+    }
+
+    #[test]
+    fn record_text_interner_caches_input_texts() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("a.o");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let interner = RecordTextInterner::default();
+
+        let first = interner.intern_input(input);
+        let second = interner.intern_input(input);
+
+        assert!(Arc::ptr_eq(&first.0.0, &second.0.0));
+        assert!(Arc::ptr_eq(&first.1.0, &second.1.0));
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -13834,6 +14840,120 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn read_records_for_input_files_reads_canonical_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(section_record("b.o", 1, 200, 8));
+        state.write(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert_eq!(metadata.sections_file, metadata.patch_records_file);
+        let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
+
+        metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap();
+
+        assert_eq!(metadata.sections, vec![state.sections[0].clone()]);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn canonical_index_aliases_incoming_relocations_without_duplicate_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(section_record("b.o", 1, 200, 8));
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("b.o", 1, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        ));
+        state.write(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let sections_file = metadata.sections_file.clone().unwrap();
+        let sidecar = std::fs::read_to_string(dir.path().join(sections_file)).unwrap();
+        assert_eq!(
+            sidecar
+                .lines()
+                .filter(|line| line.starts_with("reloc2\t"))
+                .count(),
+            1
+        );
+        let input_files = [hex::encode("b.o")].into_iter().collect::<HashSet<_>>();
+
+        metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap();
+
+        assert_eq!(metadata.sections, vec![state.sections[1].clone()]);
+        assert_eq!(metadata.relocations, state.relocations);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn canonical_index_reconstructs_all_record_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(SectionRecord {
+            input_file: GENERATED_SECTION_INPUT_FILE.into(),
+            input: GENERATED_RELA_DYN_GENERAL.into(),
+            section_index: 0,
+            output_offset: 300,
+            size: 24,
+        });
+        state.fdes.push(fde_record("a.o", 1, 2, 0, 400, 24));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 0, 500, 24));
+        state.write(dir.path()).unwrap();
+
+        let restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        let mut expected_sections = state.sections.clone();
+        expected_sections.sort();
+        assert_eq!(restored.sections, expected_sections);
+        assert_eq!(restored.fdes, state.fdes);
+        assert_eq!(restored.dynamic_relocations, state.dynamic_relocations);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn read_records_for_input_files_validates_indexed_sidecar_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let patch_records_file = metadata.patch_records_file.clone().unwrap();
+        let patch_records_path = dir.path().join(patch_records_file);
+        let mut contents = std::fs::read(&patch_records_path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&patch_records_path, contents).unwrap();
+        let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
+
+        let error = metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("do not match their content hash")
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn read_records_for_input_files_validates_sections_sidecar_hash() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a")]);
@@ -13844,11 +14964,10 @@ mod tests {
             .unwrap()
             .sections_file
             .unwrap();
-        std::fs::write(
-            dir.path().join(&sections_file),
-            "section-inputs\t0\nsections\t0\n",
-        )
-        .unwrap();
+        let path = dir.path().join(&sections_file);
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&path, contents).unwrap();
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
 
@@ -13875,11 +14994,10 @@ mod tests {
             .unwrap()
             .sections_file
             .unwrap();
-        std::fs::write(
-            dir.path().join(&sections_file),
-            "section-inputs\t0\nsections\t0\n",
-        )
-        .unwrap();
+        let path = dir.path().join(&sections_file);
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&path, contents).unwrap();
 
         let error = PersistedState::read(dir.path()).unwrap_err();
 
@@ -13932,10 +15050,15 @@ mod tests {
 
         state.write_metadata_update(dir.path()).unwrap();
 
-        let sections_file = section_sidecar_file_name(&state.render_sections());
+        let sections_file = PersistedState::read_metadata(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        assert!(sections_file.starts_with(SECTIONS_FILE_PREFIX));
         assert!(dir.path().join(&sections_file).exists());
         let index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
-        assert!(index.contains(&format!("\nsections-file\t{sections_file}\n")));
+        assert!(index.contains(&format!("\nindexed-sections-file\t{sections_file}\n")));
         assert_eq!(
             PersistedState::read(dir.path()).unwrap().unwrap().sections,
             state.sections
@@ -14740,10 +15863,10 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
@@ -14751,7 +15874,7 @@ mod tests {
         assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true, true));
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 80, 16, true, true));
         assert_eq!(state.reused_sections.load(Ordering::Relaxed), 1);
-        assert_eq!(state.current_sections.lock().unwrap().len(), 2);
+        assert_eq!(state.current_sections.take_all().len(), 2);
     }
 
     #[test]
@@ -14781,16 +15904,16 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
 
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, false, true));
-        assert!(state.current_sections.lock().unwrap().is_empty());
+        assert!(state.current_sections.take_all().is_empty());
     }
 
     #[test]
@@ -14814,10 +15937,10 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
@@ -14826,7 +15949,7 @@ mod tests {
         state.record_generated_section("generated:.relr.dyn", 512, 0);
 
         assert_eq!(
-            *state.current_sections.lock().unwrap(),
+            state.current_sections.take_all(),
             vec![generated_section_record(
                 "generated:.rela.dyn.general",
                 256,
@@ -14862,10 +15985,10 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
@@ -14888,7 +16011,7 @@ mod tests {
         );
 
         assert_eq!(
-            *state.current_fdes.lock().unwrap(),
+            state.current_fdes.take_all(),
             vec![FdeRecord::new(
                 input,
                 object::SectionIndex(3),
@@ -14927,10 +16050,10 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
@@ -14965,7 +16088,7 @@ mod tests {
         );
 
         assert_eq!(
-            *state.current_relocations.lock().unwrap(),
+            state.current_relocations.take_all(),
             vec![RelocationRecord::new(
                 input,
                 object::SectionIndex(3),
@@ -15010,10 +16133,10 @@ mod tests {
             previous_relocations: Vec::new(),
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
-            current_sections: Mutex::new(Vec::new()),
-            current_relocations: Mutex::new(Vec::new()),
-            current_fdes: Mutex::new(Vec::new()),
-            current_dynamic_relocations: Mutex::new(Vec::new()),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
         };
@@ -15036,7 +16159,7 @@ mod tests {
         );
 
         assert_eq!(
-            *state.current_dynamic_relocations.lock().unwrap(),
+            state.current_dynamic_relocations.take_all(),
             vec![DynamicRelocationRecord::new(
                 input,
                 object::SectionIndex(3),
