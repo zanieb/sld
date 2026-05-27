@@ -223,9 +223,15 @@ impl<T> RecordBuffers<T> {
     }
 
     fn take_all(&self) -> Vec<T> {
-        let mut records = Vec::new();
-        for shard in &self.values {
-            records.append(&mut *shard.lock().unwrap());
+        let mut shards = self
+            .values
+            .iter()
+            .map(|shard| std::mem::take(&mut *shard.lock().unwrap()))
+            .collect::<Vec<_>>();
+        let total_len = shards.iter().map(Vec::len).sum::<usize>();
+        let mut records = Vec::with_capacity(total_len);
+        for shard in &mut shards {
+            records.append(shard);
         }
         records
     }
