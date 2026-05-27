@@ -596,6 +596,9 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     for (index, input) in previous.input_files.iter().enumerate() {
         let path = decode_path(&input.path)?;
         if input.content.identity_matches_path(&path)? {
+            if input_identity_is_anchored_by_snapshot(input) {
+                continue;
+            }
             if !input
                 .content
                 .identity_is_ambiguous_since(previous.link_start.as_ref())
@@ -778,6 +781,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
     append_log(&state_dir, "reused existing output before loading inputs")?;
     Ok(true)
+}
+
+fn input_identity_is_anchored_by_snapshot(input: &FileState) -> bool {
+    input
+        .snapshot_identity
+        .as_ref()
+        .zip(input.content.identity.as_ref())
+        .is_some_and(|(snapshot, content)| snapshot == content)
 }
 
 fn metadata_update_indices_for_inputs(
@@ -9976,7 +9987,9 @@ fn input_content_matches_previous(
     }
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
     if let Some(expected_identity) = previous_input.snapshot_identity.as_ref()
-        && FileIdentity::from_path(&snapshot)?.as_ref() != Some(expected_identity)
+        && !FileIdentity::from_path(&snapshot)?
+            .as_ref()
+            .is_some_and(|current| expected_identity.matches_snapshot_identity(current))
     {
         return Ok(false);
     }
@@ -10026,7 +10039,9 @@ fn snapshot_bytes_match_previous_content(
         return Ok(previous.hash == hash_bytes(bytes));
     }
     if let Some(expected_identity) = previous_input.snapshot_identity.as_ref() {
-        return Ok(FileIdentity::from_path(snapshot)?.as_ref() == Some(expected_identity));
+        return Ok(FileIdentity::from_path(snapshot)?
+            .as_ref()
+            .is_some_and(|current| expected_identity.matches_snapshot_identity(current)));
     }
     previous.identity_matches_snapshot_path(snapshot)
 }
@@ -10256,7 +10271,7 @@ fn snapshot_loaded_input_file(
     ));
     let _ = std::fs::remove_file(&tmp);
 
-    if clone_snapshot_bytes(path, &tmp) {
+    if clone_snapshot_bytes(path, &tmp) || hardlink_rust_snapshot_bytes(path, &tmp) {
         let _ = std::fs::remove_file(&target);
         std::fs::rename(&tmp, &target).with_context(|| {
             format!(
@@ -10292,7 +10307,7 @@ fn snapshot_loaded_input_file(
 }
 
 fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
-    if clone_snapshot_bytes(source, target) {
+    if clone_snapshot_bytes(source, target) || hardlink_rust_snapshot_bytes(source, target) {
         return Ok(());
     }
 
@@ -10354,6 +10369,24 @@ fn hash_loaded_input_bytes(bytes: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update_rayon(bytes);
     hasher.finalize().to_hex().to_string()
+}
+
+fn hardlink_rust_snapshot_bytes(source: &Path, target: &Path) -> bool {
+    if !is_atomic_replacement_rust_input(source) {
+        return false;
+    }
+    // rustc installs these outputs by replacement, preserving the linked inode as old input bytes.
+    // If a producer mutates one in place instead, snapshot identity validation rejects reuse.
+    std::fs::hard_link(source, target).is_ok()
+}
+
+fn is_atomic_replacement_rust_input(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "rlib")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".rcgu.o"))
 }
 
 #[cfg(target_vendor = "apple")]
@@ -11484,6 +11517,87 @@ mod tests {
         assert_eq!(
             snapshot_input_paths(&state_dir, [input.as_path(), input.as_path()]).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn rust_snapshot_hardlinks_only_atomic_replacement_artifacts() {
+        assert!(is_atomic_replacement_rust_input(Path::new("libcrate.rlib")));
+        assert!(is_atomic_replacement_rust_input(Path::new(
+            "crate.0123456789abcdef.rcgu.o"
+        )));
+        assert!(!is_atomic_replacement_rust_input(Path::new("member.o")));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn rust_hardlink_snapshot_survives_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        let snapshot = dir.path().join("snapshot");
+        std::fs::write(&input, b"object").unwrap();
+
+        assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
+        assert_eq!(std::fs::read(&input).unwrap(), b"changed");
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn replaced_rust_hardlink_snapshot_matches_previous_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        std::fs::write(&input, b"object").unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
+            patch: None,
+        };
+
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"object").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert!(input_content_matches_previous(&state_dir, &previous, &input).unwrap());
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &previous).unwrap(),
+            Some(b"object".to_vec())
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn mutated_rust_hardlink_snapshot_cannot_match_previous_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        std::fs::write(&input, b"object").unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
+            patch: None,
+        };
+
+        std::fs::write(&input, b"damage").unwrap();
+
+        assert!(!input_content_matches_previous(&state_dir, &previous, &input).unwrap());
+        assert!(
+            read_verified_input_snapshot(&state_dir, &previous)
+                .unwrap()
+                .is_none()
         );
     }
 
