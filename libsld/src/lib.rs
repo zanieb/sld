@@ -178,7 +178,7 @@ pub struct LinkerOutput<'layout_inputs> {
     /// the background.
     layout: Option<Box<dyn Drop + 'layout_inputs>>,
     #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
-    pending_incremental_state: Option<incremental::PendingStateWrite>,
+    pending_incremental_state: Option<incremental::PendingStateWrite<'layout_inputs>>,
 }
 
 impl Linker {
@@ -399,7 +399,7 @@ impl Linker {
         let pending_incremental_state = if defer_incremental_state {
             finish_incremental_update_after_input_check(
                 || file_loader.verify_inputs_unchanged(),
-                || incremental_state.prepare_finish(args, file_loader, state_lock),
+                || incremental_state.prepare_finish(args, file_loader, state_lock, true),
             )?
         } else {
             finish_incremental_update_after_input_check(

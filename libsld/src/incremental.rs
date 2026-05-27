@@ -3,6 +3,7 @@ use crate::archive::ArchiveIterator;
 use crate::error::Context as _;
 use crate::error::Result;
 use crate::input_data::FileLoader;
+use crate::input_data::InputFile;
 use crate::input_data::InputRef;
 use crate::platform;
 use crate::timing_phase;
@@ -318,11 +319,12 @@ pub(crate) struct PreparedState {
     prepared_fast_build_id_state: Mutex<Option<BuildIdHashStateAndTree>>,
 }
 
-pub(crate) struct PendingStateWrite {
+pub(crate) struct PendingStateWrite<'data> {
     state_dir: PathBuf,
     state: PersistedState,
     relocation_shards: Vec<Vec<RelocationRecord>>,
     build_id_tree: Option<Vec<[u8; blake3::OUT_LEN]>>,
+    deferred_hash_inputs: Option<Vec<&'data InputFile>>,
     reused_sections: usize,
     _lock: Option<IncrementalStateLock>,
 }
@@ -2591,18 +2593,19 @@ impl PreparedState {
         lock: Option<IncrementalStateLock>,
     ) -> Result {
         timing_phase!("Write incremental state");
-        if let Some(pending) = self.prepare_finish(args, file_loader, lock)? {
+        if let Some(pending) = self.prepare_finish(args, file_loader, lock, false)? {
             pending.publish()?;
         }
         Ok(())
     }
 
-    pub(crate) fn prepare_finish(
+    pub(crate) fn prepare_finish<'data>(
         &self,
         args: &impl platform::Args,
-        file_loader: &FileLoader<'_>,
+        file_loader: &FileLoader<'data>,
         lock: Option<IncrementalStateLock>,
-    ) -> Result<Option<PendingStateWrite>> {
+        defer_input_hashing: bool,
+    ) -> Result<Option<PendingStateWrite<'data>>> {
         if self.mode == IncrementalMode::Disabled {
             return Ok(None);
         }
@@ -2666,19 +2669,36 @@ impl PreparedState {
         };
 
         let mut input_files = self.current.input_files.clone();
-        {
+        let deferred_hash_inputs = if defer_input_hashing {
+            // Install snapshots while they still name the inputs that produced this output.
+            // Hashing uses the retained mapped bytes and can be deferred into publication.
             timing_phase!("Snapshot incremental inputs");
-            snapshot_loaded_files(
+            snapshot_loaded_input_files(
                 &self.current.state_dir,
-                file_loader,
+                &file_loader.loaded_files,
                 &mut input_files,
                 &sections,
+                false,
             )?;
-        }
-        {
             timing_phase!("Refresh incremental input identities");
             refresh_input_file_identities(&mut input_files);
-        }
+            Some(file_loader.loaded_files.clone())
+        } else {
+            {
+                timing_phase!("Snapshot incremental inputs");
+                snapshot_loaded_files(
+                    &self.current.state_dir,
+                    file_loader,
+                    &mut input_files,
+                    &sections,
+                )?;
+            }
+            {
+                timing_phase!("Refresh incremental input identities");
+                refresh_input_file_identities(&mut input_files);
+            }
+            None
+        };
 
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
@@ -2703,15 +2723,20 @@ impl PreparedState {
             state,
             relocation_shards,
             build_id_tree,
+            deferred_hash_inputs,
             reused_sections: self.reused_sections.load(Ordering::Relaxed),
             _lock: lock,
         }))
     }
 }
 
-impl PendingStateWrite {
+impl PendingStateWrite<'_> {
     pub(crate) fn publish(mut self) -> Result {
         timing_phase!("Persist prepared incremental state");
+        if let Some(loaded_files) = self.deferred_hash_inputs.take() {
+            timing_phase!("Hash incremental inputs");
+            hash_loaded_input_files(&loaded_files, &mut self.state.input_files);
+        }
         let total_relocations = self.relocation_shards.iter().map(Vec::len).sum::<usize>();
         self.state.relocations.reserve(total_relocations);
         for shard in &mut self.relocation_shards {
@@ -10068,6 +10093,22 @@ fn snapshot_loaded_files(
     input_files: &mut [FileState],
     sections: &[SectionRecord],
 ) -> Result<usize> {
+    snapshot_loaded_input_files(
+        state_dir,
+        &file_loader.loaded_files,
+        input_files,
+        sections,
+        true,
+    )
+}
+
+fn snapshot_loaded_input_files(
+    state_dir: &Path,
+    loaded_files: &[&InputFile],
+    input_files: &mut [FileState],
+    sections: &[SectionRecord],
+    hash_inputs: bool,
+) -> Result<usize> {
     let patchable_inputs = sections
         .iter()
         .map(|section| section.input_file.as_str())
@@ -10083,7 +10124,7 @@ fn snapshot_loaded_files(
 
     let mut seen = HashSet::new();
     let mut tasks = Vec::new();
-    for input_file in &file_loader.loaded_files {
+    for input_file in loaded_files {
         let path = encode_path(&input_file.filename);
         if !seen.insert(path.clone()) {
             continue;
@@ -10103,6 +10144,7 @@ fn snapshot_loaded_files(
     let results = tasks
         .into_par_iter()
         .map(|(index, input_file, is_patchable, should_hash)| {
+            let should_hash = should_hash && hash_inputs;
             if !is_patchable {
                 return Ok((
                     index,
@@ -10132,6 +10174,37 @@ fn snapshot_loaded_files(
         input_files[index].snapshot_identity = snapshot_identity;
     }
     Ok(snapshotted)
+}
+
+fn hash_loaded_input_files(loaded_files: &[&InputFile], input_files: &mut [FileState]) {
+    let input_indices = input_files
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (input.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let tasks = loaded_files
+        .iter()
+        .filter_map(|input_file| {
+            let path = encode_path(&input_file.filename);
+            if !seen.insert(path.clone()) {
+                return None;
+            }
+            let index = input_indices.get(&path).copied()?;
+            input_files[index]
+                .content
+                .hash
+                .is_empty()
+                .then_some((index, *input_file))
+        })
+        .collect::<Vec<_>>();
+    let hashes = tasks
+        .into_par_iter()
+        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.data())))
+        .collect::<Vec<_>>();
+    for (index, hash) in hashes {
+        input_files[index].content.hash = hash;
+    }
 }
 
 fn input_content_matches_previous(
@@ -11701,6 +11774,53 @@ mod tests {
 
         assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
         assert_eq!(std::fs::read(&input).unwrap(), b"changed");
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn deferred_hashing_uses_bytes_from_installed_rust_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        std::fs::write(&input, b"object").unwrap();
+        let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
+        let mut input_files = vec![FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
+            patch: None,
+        }];
+        let sections = vec![SectionRecord {
+            input_file: encode_path(&input).into(),
+            input: encode_path(&input).into(),
+            section_index: 1,
+            output_offset: 0,
+            size: 6,
+        }];
+
+        assert_eq!(
+            snapshot_loaded_input_files(
+                &state_dir,
+                &[&input_file],
+                &mut input_files,
+                &sections,
+                false,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(input_files[0].content.hash.is_empty());
+
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        hash_loaded_input_files(&[&input_file], &mut input_files);
+
+        assert_eq!(input_files[0].content.hash, hash_bytes(b"object"));
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &input_files[0]).unwrap(),
+            Some(b"object".to_vec())
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]

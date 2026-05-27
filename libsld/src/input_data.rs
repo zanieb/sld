@@ -146,6 +146,16 @@ impl InputFile {
             data: None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_path_for_testing(path: &Path) -> Self {
+        Self {
+            filename: path.to_owned(),
+            original_filename: path.to_owned(),
+            modifiers: crate::args::Modifiers::default(),
+            data: Some(FileData::new(path, false).unwrap()),
+        }
+    }
 }
 
 #[derive(Debug)]
