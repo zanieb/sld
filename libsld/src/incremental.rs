@@ -10883,7 +10883,7 @@ fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409;
 
     let Ok(source) = std::fs::File::open(source) else {
         return false;
