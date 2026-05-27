@@ -362,7 +362,7 @@ impl platform::Platform for Elf {
     fn write_output_file<'data, A: Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &layout::Layout<'data, Self>,
-        incremental: &crate::incremental::PreparedState,
+        incremental: &crate::incremental::PreparedState<'data>,
     ) -> Result {
         output.write(layout, |sized_output, layout| {
             elf_writer::write::<A>(sized_output, layout, incremental)

@@ -253,13 +253,14 @@ impl RecordTextInterner {
     }
 }
 
-struct RecordBuffers<T> {
-    values: [Mutex<Vec<T>>; RECORD_BUFFER_SHARDS],
+#[derive(Clone, Copy)]
+struct DeferredRecordedRelocationTarget<'data> {
+    target_name: Option<&'data [u8]>,
+    target: Option<(InputRef<'data>, object::SectionIndex, u64)>,
 }
 
-pub(crate) struct RecordInputTexts {
-    input_file: SharedText,
-    input: SharedText,
+struct RecordBuffers<T> {
+    values: [Mutex<Vec<T>>; RECORD_BUFFER_SHARDS],
 }
 
 impl<T> Default for RecordBuffers<T> {
@@ -302,7 +303,7 @@ impl<T> RecordBuffers<T> {
     }
 }
 
-pub(crate) struct PreparedState {
+pub(crate) struct PreparedState<'data> {
     mode: IncrementalMode,
     current: CurrentState,
     reusable_inputs: HashSet<String>,
@@ -311,7 +312,7 @@ pub(crate) struct PreparedState {
     previous_fdes: Vec<FdeRecord>,
     previous_dynamic_relocations: Vec<DynamicRelocationRecord>,
     current_sections: RecordBuffers<SectionRecord>,
-    current_relocations: RecordBuffers<RelocationRecord>,
+    current_relocations: RecordBuffers<DeferredRelocationRecord<'data>>,
     current_fdes: RecordBuffers<FdeRecord>,
     current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
     record_texts: RecordTextInterner,
@@ -322,7 +323,7 @@ pub(crate) struct PreparedState {
 pub(crate) struct PendingStateWrite<'data> {
     state_dir: PathBuf,
     state: PersistedState,
-    relocation_shards: Vec<Vec<RelocationRecord>>,
+    relocation_shards: Vec<Vec<DeferredRelocationRecord<'data>>>,
     build_id_tree: Option<Vec<[u8; blake3::OUT_LEN]>>,
     deferred_hash_inputs: Option<Vec<&'data InputFile>>,
     reused_sections: usize,
@@ -480,6 +481,20 @@ pub(crate) struct RelocationRecord {
     addend: i64,
 }
 
+pub(crate) struct DeferredRelocationRecord<'data> {
+    target_symbol_id: u32,
+    written_value: u64,
+    target_value: u64,
+    target: DeferredRecordedRelocationTarget<'data>,
+    input: InputRef<'data>,
+    section_index: object::SectionIndex,
+    relocation_offset: u64,
+    output_offset: u64,
+    size: u64,
+    kind: u32,
+    addend: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationTargetRecord {
     input_file: SharedText,
@@ -511,10 +526,10 @@ pub(crate) struct DynamicRelocationRecord {
     output_r_info: Option<u64>,
 }
 
-pub(crate) fn maybe_prepare(
+pub(crate) fn maybe_prepare<'data>(
     args: &impl platform::Args,
-    file_loader: &FileLoader<'_>,
-) -> Result<PreparedState> {
+    file_loader: &FileLoader<'data>,
+) -> Result<PreparedState<'data>> {
     if !args.common().incremental {
         return Ok(PreparedState {
             mode: IncrementalMode::Disabled,
@@ -2372,7 +2387,7 @@ fn update_matched_patch_current_sections(
     }
 }
 
-impl PreparedState {
+impl<'data> PreparedState<'data> {
     pub(crate) fn compute_fast_build_id_and_prepare_state(
         &self,
         output: &[u8],
@@ -2435,11 +2450,6 @@ impl PreparedState {
 
     pub(crate) fn records_relocations(&self) -> bool {
         self.mode != IncrementalMode::Disabled
-    }
-
-    pub(crate) fn relocation_input_texts(&self, input: InputRef<'_>) -> RecordInputTexts {
-        let (input_file, input) = self.intern_input_texts(input);
-        RecordInputTexts { input_file, input }
     }
 
     pub(crate) fn try_reuse_section(
@@ -2517,9 +2527,9 @@ impl PreparedState {
         ));
     }
 
-    pub(crate) fn relocation_record_with_input_texts<'data>(
+    pub(crate) fn deferred_relocation_record(
         &self,
-        input_texts: &RecordInputTexts,
+        input: InputRef<'data>,
         section_index: object::SectionIndex,
         target_symbol_id: u32,
         relocation_offset: u64,
@@ -2530,34 +2540,34 @@ impl PreparedState {
         written_value: u64,
         target_value: u64,
         target_metadata: impl FnOnce() -> Result<(
-            Option<String>,
+            Option<&'data [u8]>,
             Option<(InputRef<'data>, object::SectionIndex, u64)>,
         )>,
-    ) -> Result<Option<RelocationRecord>> {
+    ) -> Result<Option<DeferredRelocationRecord<'data>>> {
         if size == 0 {
             return Ok(None);
         }
-        let target = self
-            .record_texts
-            .intern_relocation_target(target_symbol_id, target_metadata)?;
-        Ok(Some(RelocationRecord::new_with_texts(
-            input_texts.input_file.clone(),
-            input_texts.input.clone(),
-            section_index,
+        let (target_name, target) = target_metadata()?;
+        let target = DeferredRecordedRelocationTarget {
+            target_name,
+            target,
+        };
+        Ok(Some(DeferredRelocationRecord {
             target_symbol_id,
+            written_value,
+            target_value,
+            target,
+            input,
+            section_index,
             relocation_offset,
             output_offset,
             size,
             kind,
             addend,
-            written_value,
-            target_value,
-            target.target_name,
-            target.target,
-        )))
+        }))
     }
 
-    pub(crate) fn record_relocations(&self, records: Vec<RelocationRecord>) {
+    pub(crate) fn record_relocations(&self, records: Vec<DeferredRelocationRecord<'data>>) {
         self.current_relocations.extend(records);
     }
 
@@ -2589,7 +2599,7 @@ impl PreparedState {
     pub(crate) fn finish(
         &self,
         args: &impl platform::Args,
-        file_loader: &FileLoader<'_>,
+        file_loader: &FileLoader<'data>,
         lock: Option<IncrementalStateLock>,
     ) -> Result {
         timing_phase!("Write incremental state");
@@ -2599,7 +2609,7 @@ impl PreparedState {
         Ok(())
     }
 
-    pub(crate) fn prepare_finish<'data>(
+    pub(crate) fn prepare_finish(
         &self,
         args: &impl platform::Args,
         file_loader: &FileLoader<'data>,
@@ -2739,9 +2749,23 @@ impl PendingStateWrite<'_> {
         }
         let total_relocations = self.relocation_shards.iter().map(Vec::len).sum::<usize>();
         self.state.relocations.reserve(total_relocations);
-        for shard in &mut self.relocation_shards {
+        let record_texts = RecordTextInterner::default();
+        let mut relocation_shards = std::mem::take(&mut self.relocation_shards)
+            .into_par_iter()
+            .map(|shard| {
+                shard
+                    .into_iter()
+                    .map(|record| record.materialize(&record_texts))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for shard in &mut relocation_shards {
             self.state.relocations.append(shard);
         }
+        // Release publication-only allocations before advertising the state as ready. Otherwise
+        // an immediate incremental reuse contends with the background publisher tearing them down.
+        drop(relocation_shards);
+        drop(record_texts);
         {
             timing_phase!("Persist incremental build ID state");
             write_build_id_hash_tree(&self.state_dir, self.build_id_tree.as_deref())?;
@@ -4375,6 +4399,30 @@ impl RelocationRecord {
             kind,
             addend,
         }
+    }
+}
+
+impl DeferredRelocationRecord<'_> {
+    fn materialize(self, record_texts: &RecordTextInterner) -> Result<RelocationRecord> {
+        let (input_file, input) = record_texts.intern_input(self.input);
+        let target = record_texts.intern_relocation_target(self.target_symbol_id, || {
+            Ok((self.target.target_name.map(hex::encode), self.target.target))
+        })?;
+        Ok(RelocationRecord::new_with_texts(
+            input_file,
+            input,
+            self.section_index,
+            self.target_symbol_id,
+            self.relocation_offset,
+            self.output_offset,
+            self.size,
+            self.kind,
+            self.addend,
+            self.written_value,
+            self.target_value,
+            target.target_name,
+            target.target,
+        ))
     }
 }
 
@@ -17041,7 +17089,7 @@ mod tests {
     }
 
     #[test]
-    fn record_relocation_records_non_empty_ranges() {
+    fn deferred_relocation_records_materialize_non_empty_ranges() {
         let mut input_file = crate::input_data::InputFile::for_testing();
         input_file.filename = PathBuf::from("a.o");
         let input = InputRef {
@@ -17076,12 +17124,11 @@ mod tests {
             prepared_fast_build_id_state: Mutex::new(None),
         };
 
-        let input_texts = state.relocation_input_texts(input);
         let target_metadata_calls = AtomicUsize::new(0);
         let records = [
             state
-                .relocation_record_with_input_texts(
-                    &input_texts,
+                .deferred_relocation_record(
+                    input,
                     object::SectionIndex(3),
                     42,
                     8,
@@ -17094,15 +17141,15 @@ mod tests {
                     || {
                         target_metadata_calls.fetch_add(1, Ordering::Relaxed);
                         Ok((
-                            Some(hex::encode("target")),
+                            Some(b"target".as_slice()),
                             Some((input, object::SectionIndex(7), 32)),
                         ))
                     },
                 )
                 .unwrap(),
             state
-                .relocation_record_with_input_texts(
-                    &input_texts,
+                .deferred_relocation_record(
+                    input,
                     object::SectionIndex(3),
                     42,
                     12,
@@ -17114,13 +17161,16 @@ mod tests {
                     0x1234,
                     || {
                         target_metadata_calls.fetch_add(1, Ordering::Relaxed);
-                        Ok((Some(hex::encode("not-used")), None))
+                        Ok((
+                            Some(b"target".as_slice()),
+                            Some((input, object::SectionIndex(7), 32)),
+                        ))
                     },
                 )
                 .unwrap(),
             state
-                .relocation_record_with_input_texts(
-                    &input_texts,
+                .deferred_relocation_record(
+                    input,
                     object::SectionIndex(3),
                     43,
                     16,
@@ -17139,9 +17189,16 @@ mod tests {
         .collect();
         state.record_relocations(records);
 
-        assert_eq!(target_metadata_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target_metadata_calls.load(Ordering::Relaxed), 2);
+        let record_texts = RecordTextInterner::default();
+        let records = state
+            .current_relocations
+            .take_all()
+            .into_iter()
+            .map(|record| record.materialize(&record_texts).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            state.current_relocations.take_all(),
+            records,
             vec![
                 RelocationRecord::new(
                     input,

@@ -802,7 +802,7 @@ impl platform::Platform for Wasm {
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
         _output: &crate::file_writer::Output,
         _layout: &crate::layout::Layout<'data, Self>,
-        _incremental: &crate::incremental::PreparedState,
+        _incremental: &crate::incremental::PreparedState<'data>,
     ) -> crate::error::Result {
         todo!()
     }
