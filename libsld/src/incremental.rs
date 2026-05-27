@@ -19,7 +19,6 @@ use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::ParallelIterator as _;
-use rayon::slice::ParallelSliceMut as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 #[cfg(unix)]
@@ -2480,25 +2479,21 @@ impl PreparedState {
             if sections.is_empty() && self.mode == IncrementalMode::Reuse {
                 sections.extend(self.previous_sections.iter().cloned());
             }
-            sections.par_sort_unstable();
 
             let mut relocations = self.current_relocations.take_all();
             if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
                 relocations.extend(self.previous_relocations.iter().cloned());
             }
-            relocations.par_sort_unstable();
 
             let mut fdes = self.current_fdes.take_all();
             if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
                 fdes.extend(self.previous_fdes.iter().cloned());
             }
-            fdes.par_sort_unstable();
 
             let mut dynamic_relocations = self.current_dynamic_relocations.take_all();
             if dynamic_relocations.is_empty() && self.mode == IncrementalMode::Reuse {
                 dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
             }
-            dynamic_relocations.par_sort_unstable();
 
             (sections, relocations, fdes, dynamic_relocations)
         };
@@ -3853,26 +3848,30 @@ fn write_indexed_records_streaming(
         .into_par_iter()
         .map(|input_file| {
             let records = &records_by_input[input_file];
-            let sections = records
+            let mut sections = records
                 .sections
                 .iter()
                 .map(|record| (*record).clone())
                 .collect::<Vec<_>>();
-            let relocations = records
+            sections.sort_unstable();
+            let mut relocations = records
                 .relocations
                 .iter()
                 .map(|record| (*record).clone())
                 .collect::<Vec<_>>();
-            let fdes = records
+            relocations.sort_unstable();
+            let mut fdes = records
                 .fdes
                 .iter()
                 .map(|record| (*record).clone())
                 .collect::<Vec<_>>();
-            let dynamic_relocations = records
+            fdes.sort_unstable();
+            let mut dynamic_relocations = records
                 .dynamic_relocations
                 .iter()
                 .map(|record| (*record).clone())
                 .collect::<Vec<_>>();
+            dynamic_relocations.sort_unstable();
             let mut block = String::new();
             write_rendered_records(
                 &mut block,
@@ -15497,6 +15496,71 @@ mod tests {
         assert_eq!(restored.sections, expected_sections);
         assert_eq!(restored.fdes, state.fdes);
         assert_eq!(restored.dynamic_relocations, state.dynamic_relocations);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn canonical_index_is_stable_for_differently_ordered_records() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let mut first = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        first.sections.push(section_record("b.o", 2, 200, 8));
+        first.sections.push(section_record("a.o", 1, 100, 8));
+        first.relocations.push(relocation_record(
+            "b.o",
+            2,
+            4,
+            Some(0x2000),
+            0x1000,
+            Some("target"),
+            Some(("a.o", 1, 0)),
+            0,
+            200,
+            8,
+            1,
+            0,
+        ));
+        first.relocations.push(relocation_record(
+            "a.o",
+            1,
+            3,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("b.o", 2, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        ));
+        first.fdes.push(fde_record("b.o", 2, 4, 0, 240, 24));
+        first.fdes.push(fde_record("a.o", 1, 3, 0, 140, 24));
+        first
+            .dynamic_relocations
+            .push(dynamic_relocation_record("b.o", 2, 0, 280, 24));
+        first
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 0, 180, 24));
+
+        let mut second = first.clone();
+        second.sections.reverse();
+        second.relocations.reverse();
+        second.fdes.reverse();
+        second.dynamic_relocations.reverse();
+
+        first.write(first_dir.path()).unwrap();
+        second.write(second_dir.path()).unwrap();
+
+        let first = PersistedState::read_metadata(first_dir.path())
+            .unwrap()
+            .unwrap();
+        let second = PersistedState::read_metadata(second_dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sections_file, second.sections_file);
+        assert_eq!(first.patch_records_file, second.patch_records_file);
+        assert_eq!(first.patch_record_locations, second.patch_record_locations);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
