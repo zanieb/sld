@@ -19,6 +19,7 @@ use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::ParallelIterator as _;
+use rayon::slice::ParallelSliceMut as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 #[cfg(unix)]
@@ -96,6 +97,7 @@ const SECTIONS_COMPRESSION_LEVEL: i32 = 1;
 const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
+const BUILD_ID_HASH_PARALLEL_THRESHOLD: usize = BUILD_ID_HASH_GROUP_LEN * 8;
 const ABSENT_FIELD: &str = "-";
 const RECORD_TEXT_INTERNER_SHARDS: usize = 64;
 const RECORD_BUFFER_SHARDS: usize = 64;
@@ -2451,35 +2453,44 @@ impl PreparedState {
             })?;
         let output_path = args.output().to_owned();
         let mut output_bytes = LazyOutputBytes::new(|| read_output_bytes(&output_path));
-        let (build_id_hashes, build_id_tree) = if args.has_incremental_fast_build_id() {
-            build_id_hash_state_from_output(output_bytes.get()?)?
-        } else {
-            (None, None)
+        let (build_id_hashes, build_id_tree) = {
+            timing_phase!("Compute incremental build ID state");
+            if args.has_incremental_fast_build_id() {
+                build_id_hash_state_from_output(output_bytes.get()?)?
+            } else {
+                (None, None)
+            }
         };
 
-        let mut sections = self.current_sections.take_all();
-        if sections.is_empty() && self.mode == IncrementalMode::Reuse {
-            sections.extend(self.previous_sections.iter().cloned());
-        }
-        sections.sort();
+        let (sections, relocations, fdes, dynamic_relocations) = {
+            timing_phase!("Collect incremental records");
 
-        let mut relocations = self.current_relocations.take_all();
-        if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
-            relocations.extend(self.previous_relocations.iter().cloned());
-        }
-        relocations.sort();
+            let mut sections = self.current_sections.take_all();
+            if sections.is_empty() && self.mode == IncrementalMode::Reuse {
+                sections.extend(self.previous_sections.iter().cloned());
+            }
+            sections.par_sort_unstable();
 
-        let mut fdes = self.current_fdes.take_all();
-        if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
-            fdes.extend(self.previous_fdes.iter().cloned());
-        }
-        fdes.sort();
+            let mut relocations = self.current_relocations.take_all();
+            if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
+                relocations.extend(self.previous_relocations.iter().cloned());
+            }
+            relocations.par_sort_unstable();
 
-        let mut dynamic_relocations = self.current_dynamic_relocations.take_all();
-        if dynamic_relocations.is_empty() && self.mode == IncrementalMode::Reuse {
-            dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
-        }
-        dynamic_relocations.sort();
+            let mut fdes = self.current_fdes.take_all();
+            if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
+                fdes.extend(self.previous_fdes.iter().cloned());
+            }
+            fdes.par_sort_unstable();
+
+            let mut dynamic_relocations = self.current_dynamic_relocations.take_all();
+            if dynamic_relocations.is_empty() && self.mode == IncrementalMode::Reuse {
+                dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
+            }
+            dynamic_relocations.par_sort_unstable();
+
+            (sections, relocations, fdes, dynamic_relocations)
+        };
 
         let mut input_files = self.current.input_files.clone();
         {
@@ -2491,7 +2502,10 @@ impl PreparedState {
                 &sections,
             )?;
         }
-        refresh_input_file_identities(&mut input_files);
+        {
+            timing_phase!("Refresh incremental input identities");
+            refresh_input_file_identities(&mut input_files);
+        }
 
         let state = PersistedState {
             args_hash: self.current.args_hash.clone(),
@@ -2511,7 +2525,10 @@ impl PreparedState {
             patch_record_locations: Vec::new(),
         };
 
-        write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
+        {
+            timing_phase!("Persist incremental build ID state");
+            write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
+        }
         {
             timing_phase!("Persist incremental index and sections");
             state.write(&self.current.state_dir)?;
@@ -8528,14 +8545,10 @@ fn build_id_hash_state_from_output(bytes: &[u8]) -> Result<BuildIdHashStateAndTr
         return Ok((None, None));
     };
     validate_fast_build_id_range(&range)?;
-    let Some(nodes) = build_id_hash_node_count(bytes.len()) else {
+    let Some(tree) = build_id_hash_tree(bytes, &range) else {
         return Ok((None, None));
     };
-    let mut tree = Vec::with_capacity(nodes);
-    let left_len = blake3::hazmat::left_subtree_len(bytes.len() as u64) as usize;
-    build_id_subtree_hash(bytes, 0, left_len, &range, &mut tree);
-    build_id_subtree_hash(bytes, left_len, bytes.len() - left_len, &range, &mut tree);
-    debug_assert_eq!(tree.len(), nodes);
+    let nodes = tree.len();
     Ok((
         Some(BuildIdHashState {
             output_len: bytes.len() as u64,
@@ -8554,6 +8567,30 @@ fn build_id_hash_node_count(len: usize) -> Option<usize> {
     Some(build_id_subtree_node_count(left_len) + build_id_subtree_node_count(len - left_len))
 }
 
+fn build_id_hash_tree(
+    bytes: &[u8],
+    zero_range: &std::ops::Range<usize>,
+) -> Option<Vec<[u8; blake3::OUT_LEN]>> {
+    let nodes = build_id_hash_node_count(bytes.len())?;
+    let mut tree = vec![[0; blake3::OUT_LEN]; nodes];
+    let left_len = blake3::hazmat::left_subtree_len(bytes.len() as u64) as usize;
+    let left_nodes = build_id_subtree_node_count(left_len);
+    let (left_tree, right_tree) = tree.split_at_mut(left_nodes);
+    rayon::join(
+        || build_id_subtree_hash(bytes, 0, left_len, zero_range, left_tree),
+        || {
+            build_id_subtree_hash(
+                bytes,
+                left_len,
+                bytes.len() - left_len,
+                zero_range,
+                right_tree,
+            )
+        },
+    );
+    Some(tree)
+}
+
 fn build_id_subtree_node_count(len: usize) -> usize {
     2 * len.div_ceil(BUILD_ID_HASH_GROUP_LEN) - 1
 }
@@ -8563,20 +8600,38 @@ fn build_id_subtree_hash(
     start: usize,
     len: usize,
     zero_range: &std::ops::Range<usize>,
-    tree: &mut Vec<[u8; blake3::OUT_LEN]>,
+    tree: &mut [[u8; blake3::OUT_LEN]],
 ) -> [u8; blake3::OUT_LEN] {
-    let index = tree.len();
-    tree.push([0; blake3::OUT_LEN]);
+    debug_assert_eq!(tree.len(), build_id_subtree_node_count(len));
     let hash = if len <= BUILD_ID_HASH_GROUP_LEN {
         build_id_leaf_hash(bytes, start, len, zero_range)
     } else {
         let left_len = blake3::hazmat::left_subtree_len(len as u64) as usize;
-        let left = build_id_subtree_hash(bytes, start, left_len, zero_range, tree);
-        let right =
-            build_id_subtree_hash(bytes, start + left_len, len - left_len, zero_range, tree);
-        blake3::hazmat::merge_subtrees_non_root(&left, &right, blake3::hazmat::Mode::Hash)
+        let left_nodes = build_id_subtree_node_count(left_len);
+        let (root, children) = tree.split_first_mut().unwrap();
+        let (left_tree, right_tree) = children.split_at_mut(left_nodes);
+        let mut compute_left =
+            || build_id_subtree_hash(bytes, start, left_len, zero_range, left_tree);
+        let mut compute_right = || {
+            build_id_subtree_hash(
+                bytes,
+                start + left_len,
+                len - left_len,
+                zero_range,
+                right_tree,
+            )
+        };
+        let (left, right) = if len >= BUILD_ID_HASH_PARALLEL_THRESHOLD {
+            rayon::join(compute_left, compute_right)
+        } else {
+            (compute_left(), compute_right())
+        };
+        let hash =
+            blake3::hazmat::merge_subtrees_non_root(&left, &right, blake3::hazmat::Mode::Hash);
+        *root = hash;
+        return hash;
     };
-    tree[index] = hash;
+    tree[0] = hash;
     hash
 }
 
@@ -9920,6 +9975,11 @@ fn input_content_matches_previous(
             && previous_input.content.hash == hash_bytes(&bytes));
     }
     let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
+    if let Some(expected_identity) = previous_input.snapshot_identity.as_ref()
+        && FileIdentity::from_path(&snapshot)?.as_ref() != Some(expected_identity)
+    {
+        return Ok(false);
+    }
     files_equal(&snapshot, current_path)
 }
 
@@ -16197,16 +16257,7 @@ mod tests {
             let output = (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>();
             let build_id_range = 100..148;
             let nodes = build_id_hash_node_count(output.len()).unwrap();
-            let mut tree = Vec::with_capacity(nodes);
-            let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
-            build_id_subtree_hash(&output, 0, left_len, &build_id_range, &mut tree);
-            build_id_subtree_hash(
-                &output,
-                left_len,
-                output.len() - left_len,
-                &build_id_range,
-                &mut tree,
-            );
+            let tree = build_id_hash_tree(&output, &build_id_range).unwrap();
             let state = BuildIdHashState {
                 output_len: output.len() as u64,
                 nodes,
@@ -16230,16 +16281,7 @@ mod tests {
             .collect::<Vec<_>>();
         let build_id_range = 1500..1548;
         let nodes = build_id_hash_node_count(output.len()).unwrap();
-        let mut tree = Vec::with_capacity(nodes);
-        let left_len = blake3::hazmat::left_subtree_len(output.len() as u64) as usize;
-        build_id_subtree_hash(&output, 0, left_len, &build_id_range, &mut tree);
-        build_id_subtree_hash(
-            &output,
-            left_len,
-            output.len() - left_len,
-            &build_id_range,
-            &mut tree,
-        );
+        let mut tree = build_id_hash_tree(&output, &build_id_range).unwrap();
         let mut state = BuildIdHashState {
             output_len: output.len() as u64,
             nodes,
