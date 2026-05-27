@@ -3886,22 +3886,16 @@ fn write_rendered_records(
     for relocation in relocations {
         let section_input_id =
             section_input_ids[&(relocation.input_file.as_str(), relocation.input.as_str())];
-        let (target_section_input_id, target_section_index, target_section_offset) =
-            relocation.target.as_ref().map_or(
+        let (target_section_input_id, target_section_index, target_section_offset) = relocation
+            .target
+            .as_ref()
+            .map_or((None, None, None), |target| {
                 (
-                    ABSENT_FIELD.to_owned(),
-                    ABSENT_FIELD.to_owned(),
-                    ABSENT_FIELD.to_owned(),
-                ),
-                |target| {
-                    (
-                        section_input_ids[&(target.input_file.as_str(), target.input.as_str())]
-                            .to_string(),
-                        target.section_index.to_string(),
-                        target.section_offset.to_string(),
-                    )
-                },
-            );
+                    Some(section_input_ids[&(target.input_file.as_str(), target.input.as_str())]),
+                    Some(target.section_index),
+                    Some(target.section_offset),
+                )
+            });
         writeln!(
             &mut out,
             "reloc2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -3913,14 +3907,12 @@ fn write_rendered_records(
             relocation.size,
             relocation.kind,
             relocation.addend,
-            relocation
-                .written_value
-                .map_or_else(|| ABSENT_FIELD.to_owned(), |value| value.to_string()),
+            OptionalRecordField(relocation.written_value),
             relocation.target_value,
             relocation.target_name.as_deref().unwrap_or(ABSENT_FIELD),
-            target_section_input_id,
-            target_section_index,
-            target_section_offset
+            OptionalRecordField(target_section_input_id),
+            OptionalRecordField(target_section_index),
+            OptionalRecordField(target_section_offset)
         )?;
     }
     writeln!(&mut out, "fdes\t{}", fdes.len())?;
@@ -3968,6 +3960,17 @@ fn write_rendered_records(
         }
     }
     Ok(())
+}
+
+struct OptionalRecordField<T>(Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for OptionalRecordField<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(value) => value.fmt(formatter),
+            None => ABSENT_FIELD.fmt(formatter),
+        }
+    }
 }
 
 fn write_indexed_records_streaming(
