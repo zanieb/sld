@@ -41,6 +41,7 @@ use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
 use crate::incremental::PreparedState;
+use crate::incremental::RecordInputTexts;
 use crate::layout::DynamicLayout;
 use crate::layout::EpilogueLayout;
 use crate::layout::FileLayout;
@@ -2558,6 +2559,12 @@ fn apply_relocations<
     let mut relocation_cache = RelocationCache::<R>::default();
     let relax_deltas = object.section_relax_deltas.get(section_index.0);
     let mut relax_cursor = relax_deltas.map(|deltas| deltas.cursor());
+    let mut incremental_input_texts = None;
+    let mut incremental_relocations = if incremental.records_relocations() {
+        Vec::with_capacity(relocations.size_hint().0)
+    } else {
+        Vec::new()
+    };
 
     while let Some(rel) = relocations.next() {
         let rel = rel?;
@@ -2598,6 +2605,8 @@ fn apply_relocations<
             table_writer,
             trace,
             incremental,
+            &mut incremental_input_texts,
+            &mut incremental_relocations,
             &relocation_cache,
             &relocations,
             relax_deltas,
@@ -2610,6 +2619,7 @@ fn apply_relocations<
         })?;
         relocation_cache.previous = Some(rel);
     }
+    incremental.record_relocations(incremental_relocations);
 
     layout
         .relocation_statistics
@@ -2737,7 +2747,8 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     let mut output_pos = 0;
     let frame_info_ptr_base = table_writer.eh_frame_start_address;
     let eh_frame_hdr_address = layout.mem_address_of_built_in(output_section_id::EH_FRAME_HDR);
-
+    let mut incremental_input_texts = None;
+    let mut incremental_relocations = Vec::new();
     // Map from input offset to output offset of each CIE.
     let mut cies_offset_conversion: HashMap<u32, u32> = HashMap::new();
 
@@ -2868,6 +2879,8 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
                     table_writer,
                     trace,
                     incremental,
+                    &mut incremental_input_texts,
+                    &mut incremental_relocations,
                     &RelocationCache::default(),
                     &iter::empty(),
                     None,
@@ -3199,6 +3212,8 @@ fn apply_relocation<
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
     incremental: &PreparedState,
+    incremental_input_texts: &mut Option<RecordInputTexts>,
+    incremental_relocations: &mut Vec<crate::incremental::RelocationRecord>,
     relocation_cache: &RelocationCache<R>,
     relocation_iterator: &I,
     relax_deltas: Option<&SectionRelaxDeltas>,
@@ -3656,18 +3671,16 @@ fn apply_relocation<
         value = thunked_value;
     };
 
-    if let Some(source_section_index) = section_info.source_section_index {
-        let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
-        let target_name = layout
-            .symbol_db
-            .symbol_name(target_symbol_id)
-            .ok()
-            .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
-        let target = relocation_target_owner(layout, target_symbol_id)?;
-        let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
+    if let Some(source_section_index) = section_info.source_section_index
+        && incremental.records_relocations()
+    {
+        let input_texts = incremental_input_texts
+            .get_or_insert_with(|| incremental.relocation_input_texts(object_layout.input));
+        let target_symbol = layout.symbol_db.definition(local_symbol_id);
+        let target_symbol_id = u32::try_from(target_symbol.as_usize())
             .context("Incremental relocation target symbol ID overflow")?;
-        incremental.record_relocation(
-            object_layout.input,
+        if let Some(record) = incremental.relocation_record_with_input_texts(
+            input_texts,
             source_section_index,
             target_symbol_id,
             rel.offset(),
@@ -3677,9 +3690,21 @@ fn apply_relocation<
             addend,
             value,
             resolution.raw_value,
-            target_name,
-            target,
-        );
+            || {
+                Ok((
+                    layout
+                        .symbol_db
+                        .symbol_name(target_symbol)
+                        .ok()
+                        .and_then(|name| {
+                            (!name.bytes().is_empty()).then(|| hex::encode(name.bytes()))
+                        }),
+                    relocation_target_owner(layout, target_symbol)?,
+                ))
+            },
+        )? {
+            incremental_relocations.push(record);
+        }
     }
 
     rel_info.write_to_buffer(value, &mut out[offset_in_section..])?;

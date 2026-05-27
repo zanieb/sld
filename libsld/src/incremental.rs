@@ -155,6 +155,13 @@ struct RecordTextInterner {
     values: [Mutex<HashMap<String, SharedText>>; RECORD_TEXT_INTERNER_SHARDS],
     inputs: [Mutex<HashMap<(usize, Option<(usize, usize)>), (SharedText, SharedText)>>;
         RECORD_TEXT_INTERNER_SHARDS],
+    targets: [Mutex<HashMap<u32, RecordedRelocationTarget>>; RECORD_TEXT_INTERNER_SHARDS],
+}
+
+#[derive(Clone)]
+struct RecordedRelocationTarget {
+    target_name: Option<SharedText>,
+    target: Option<(SharedText, SharedText, object::SectionIndex, u64)>,
 }
 
 impl Default for RecordTextInterner {
@@ -162,6 +169,7 @@ impl Default for RecordTextInterner {
         Self {
             values: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             inputs: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            targets: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }
     }
 }
@@ -204,10 +212,53 @@ impl RecordTextInterner {
             .or_insert_with(|| texts.clone())
             .clone()
     }
+
+    fn intern_relocation_target<'data>(
+        &self,
+        target_symbol_id: u32,
+        metadata: impl FnOnce() -> Result<(
+            Option<String>,
+            Option<(InputRef<'data>, object::SectionIndex, u64)>,
+        )>,
+    ) -> Result<RecordedRelocationTarget> {
+        let shard = target_symbol_id as usize % RECORD_TEXT_INTERNER_SHARDS;
+        if let Some(existing) = self.targets[shard]
+            .lock()
+            .unwrap()
+            .get(&target_symbol_id)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        let (target_name, target) = metadata()?;
+        let metadata = RecordedRelocationTarget {
+            target_name: target_name.map(|name| self.intern(name)),
+            target: target.map(|(target_input, target_section_index, section_offset)| {
+                let (target_input_file, target_input_text) = self.intern_input(target_input);
+                (
+                    target_input_file,
+                    target_input_text,
+                    target_section_index,
+                    section_offset,
+                )
+            }),
+        };
+        Ok(self.targets[shard]
+            .lock()
+            .unwrap()
+            .entry(target_symbol_id)
+            .or_insert_with(|| metadata.clone())
+            .clone())
+    }
 }
 
 struct RecordBuffers<T> {
     values: [Mutex<Vec<T>>; RECORD_BUFFER_SHARDS],
+}
+
+pub(crate) struct RecordInputTexts {
+    input_file: SharedText,
+    input: SharedText,
 }
 
 impl<T> Default for RecordBuffers<T> {
@@ -222,6 +273,14 @@ impl<T> RecordBuffers<T> {
     fn push(&self, value: T) {
         let shard = rayon::current_thread_index().unwrap_or(0) % RECORD_BUFFER_SHARDS;
         self.values[shard].lock().unwrap().push(value);
+    }
+
+    fn extend(&self, values: Vec<T>) {
+        if values.is_empty() {
+            return;
+        }
+        let shard = rayon::current_thread_index().unwrap_or(0) % RECORD_BUFFER_SHARDS;
+        self.values[shard].lock().unwrap().extend(values);
     }
 
     fn take_all(&self) -> Vec<T> {
@@ -403,7 +462,7 @@ pub(crate) struct RelocationRecord {
     target_symbol_id: u32,
     written_value: Option<u64>,
     target_value: u64,
-    target_name: Option<String>,
+    target_name: Option<SharedText>,
     target: Option<RelocationTargetRecord>,
     input_file: SharedText,
     input: SharedText,
@@ -2368,6 +2427,15 @@ impl PreparedState {
         self.record_texts.intern_input(input)
     }
 
+    pub(crate) fn records_relocations(&self) -> bool {
+        self.mode != IncrementalMode::Disabled
+    }
+
+    pub(crate) fn relocation_input_texts(&self, input: InputRef<'_>) -> RecordInputTexts {
+        let (input_file, input) = self.intern_input_texts(input);
+        RecordInputTexts { input_file, input }
+    }
+
     pub(crate) fn try_reuse_section(
         &self,
         input: InputRef<'_>,
@@ -2443,9 +2511,9 @@ impl PreparedState {
         ));
     }
 
-    pub(crate) fn record_relocation(
+    pub(crate) fn relocation_record_with_input_texts<'data>(
         &self,
-        input: InputRef<'_>,
+        input_texts: &RecordInputTexts,
         section_index: object::SectionIndex,
         target_symbol_id: u32,
         relocation_offset: u64,
@@ -2455,38 +2523,36 @@ impl PreparedState {
         addend: i64,
         written_value: u64,
         target_value: u64,
-        target_name: Option<String>,
-        target: Option<(InputRef<'_>, object::SectionIndex, u64)>,
-    ) {
-        if self.mode == IncrementalMode::Disabled || size == 0 {
-            return;
+        target_metadata: impl FnOnce() -> Result<(
+            Option<String>,
+            Option<(InputRef<'data>, object::SectionIndex, u64)>,
+        )>,
+    ) -> Result<Option<RelocationRecord>> {
+        if size == 0 {
+            return Ok(None);
         }
-        let (input_file, input_text) = self.intern_input_texts(input);
-        let target = target.map(|(target_input, target_section_index, section_offset)| {
-            let (target_input_file, target_input_text) = self.intern_input_texts(target_input);
-            (
-                target_input_file,
-                target_input_text,
-                target_section_index,
-                section_offset,
-            )
-        });
-        self.current_relocations
-            .push(RelocationRecord::new_with_texts(
-                input_file,
-                input_text,
-                section_index,
-                target_symbol_id,
-                relocation_offset,
-                output_offset,
-                size,
-                kind,
-                addend,
-                written_value,
-                target_value,
-                target_name,
-                target,
-            ));
+        let target = self
+            .record_texts
+            .intern_relocation_target(target_symbol_id, target_metadata)?;
+        Ok(Some(RelocationRecord::new_with_texts(
+            input_texts.input_file.clone(),
+            input_texts.input.clone(),
+            section_index,
+            target_symbol_id,
+            relocation_offset,
+            output_offset,
+            size,
+            kind,
+            addend,
+            written_value,
+            target_value,
+            target.target_name,
+            target.target,
+        )))
+    }
+
+    pub(crate) fn record_relocations(&self, records: Vec<RelocationRecord>) {
+        self.current_relocations.extend(records);
     }
 
     pub(crate) fn record_dynamic_relocation_with_output_info(
@@ -4217,7 +4283,7 @@ impl RelocationRecord {
             addend,
             written_value,
             target_value,
-            target_name,
+            target_name.map(Into::into),
             target.map(|(target_input, target_section_index, section_offset)| {
                 (
                     encode_path(&target_input.file.filename).into(),
@@ -4241,7 +4307,7 @@ impl RelocationRecord {
         addend: i64,
         written_value: u64,
         target_value: u64,
-        target_name: Option<String>,
+        target_name: Option<SharedText>,
         target: Option<(SharedText, SharedText, object::SectionIndex, u64)>,
     ) -> Self {
         Self {
@@ -9833,7 +9899,7 @@ fn parse_compact_relocation_line(
         target_symbol_id,
         written_value,
         target_value,
-        target_name,
+        target_name: target_name.map(Into::into),
         target,
         input_file: input_file.clone().into(),
         input: input.clone().into(),
@@ -11285,7 +11351,7 @@ mod tests {
             target_symbol_id,
             written_value,
             target_value,
-            target_name: target_name.map(hex::encode),
+            target_name: target_name.map(|name| hex::encode(name).into()),
             target: target.map(
                 |(input, section_index, section_offset)| RelocationTargetRecord {
                     input_file: hex::encode(input).into(),
@@ -14385,7 +14451,7 @@ mod tests {
         assert_eq!(parsed.relocations[0].target_value, 0x1234);
         assert_eq!(
             parsed.relocations[0].target_name,
-            Some(hex::encode("target"))
+            Some(SharedText::from(hex::encode("target")))
         );
         assert_eq!(
             parsed.relocations[0].target,
@@ -14432,7 +14498,7 @@ mod tests {
         assert_eq!(parsed.relocations[0].target_value, 0x1234);
         assert_eq!(
             parsed.relocations[0].target_name,
-            Some(hex::encode("target"))
+            Some(SharedText::from(hex::encode("target")))
         );
         assert_eq!(parsed.relocations[0].target, None);
     }
@@ -16867,51 +16933,102 @@ mod tests {
             prepared_fast_build_id_state: Mutex::new(None),
         };
 
-        state.record_relocation(
-            input,
-            object::SectionIndex(3),
-            42,
-            8,
-            256,
-            4,
-            2,
-            -16,
-            0x5678,
-            0x1234,
-            Some(hex::encode("target")),
-            Some((input, object::SectionIndex(7), 32)),
-        );
-        state.record_relocation(
-            input,
-            object::SectionIndex(3),
-            43,
-            16,
-            280,
-            0,
-            2,
-            0,
-            0,
-            0x5678,
-            None,
-            None,
-        );
+        let input_texts = state.relocation_input_texts(input);
+        let target_metadata_calls = AtomicUsize::new(0);
+        let records = [
+            state
+                .relocation_record_with_input_texts(
+                    &input_texts,
+                    object::SectionIndex(3),
+                    42,
+                    8,
+                    256,
+                    4,
+                    2,
+                    -16,
+                    0x5678,
+                    0x1234,
+                    || {
+                        target_metadata_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok((
+                            Some(hex::encode("target")),
+                            Some((input, object::SectionIndex(7), 32)),
+                        ))
+                    },
+                )
+                .unwrap(),
+            state
+                .relocation_record_with_input_texts(
+                    &input_texts,
+                    object::SectionIndex(3),
+                    42,
+                    12,
+                    268,
+                    4,
+                    2,
+                    -8,
+                    0x5680,
+                    0x1234,
+                    || {
+                        target_metadata_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok((Some(hex::encode("not-used")), None))
+                    },
+                )
+                .unwrap(),
+            state
+                .relocation_record_with_input_texts(
+                    &input_texts,
+                    object::SectionIndex(3),
+                    43,
+                    16,
+                    280,
+                    0,
+                    2,
+                    0,
+                    0,
+                    0x5678,
+                    || Ok((None, None)),
+                )
+                .unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        state.record_relocations(records);
 
+        assert_eq!(target_metadata_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             state.current_relocations.take_all(),
-            vec![RelocationRecord::new(
-                input,
-                object::SectionIndex(3),
-                42,
-                8,
-                256,
-                4,
-                2,
-                -16,
-                0x5678,
-                0x1234,
-                Some(hex::encode("target")),
-                Some((input, object::SectionIndex(7), 32))
-            )]
+            vec![
+                RelocationRecord::new(
+                    input,
+                    object::SectionIndex(3),
+                    42,
+                    8,
+                    256,
+                    4,
+                    2,
+                    -16,
+                    0x5678,
+                    0x1234,
+                    Some(hex::encode("target")),
+                    Some((input, object::SectionIndex(7), 32))
+                ),
+                RelocationRecord::new(
+                    input,
+                    object::SectionIndex(3),
+                    42,
+                    12,
+                    268,
+                    4,
+                    2,
+                    -8,
+                    0x5680,
+                    0x1234,
+                    Some(hex::encode("target")),
+                    Some((input, object::SectionIndex(7), 32))
+                ),
+            ]
         );
     }
 
