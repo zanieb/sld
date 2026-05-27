@@ -212,3 +212,17 @@ completion on the normal path. It may be worth prototyping for first-edit availa
 synchronous profile attributes `763.70-805.42 ms` to persisting the incremental index and section
 sidecar, but only if more detailed profiling shows representation or compression work dominating
 that phase and the versioned compatibility cost remains justified.
+
+Temporary diagnostic spans on the Linux `uv` fixture further separated first-edit readiness from an
+established edit loop. A corrected immediate-after-forked-seed trace still patched successfully, but
+spent `291.11 ms` checking all incremental input identities while state publication and cold fixture
+paths were in play; metadata reads contributed `18.16 ms` plus `9.74 ms`, and selective indexed
+record loading contributed `12.61 ms`. That sample is directional rather than a stable benchmark
+claim, since the profiler and concurrent publisher change the execution conditions.
+
+Once the same output had completed one changed-input patch, four alternating log-asserted edits
+completed in `40.86-42.56 ms`. In those warm steady-state edits, input identity checks fell to
+`2.04-2.70 ms`, while reading incremental metadata remained `16.82-17.72 ms` and the patch body
+remained `19.33-20.97 ms`. This sharpens a possible future encoding experiment: a smaller hot
+metadata representation or binary deserialization format could improve repeated post-seed patches,
+but it should be evaluated as a recurring hydration optimization, not as a direct seed-time fix.
