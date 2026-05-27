@@ -169,6 +169,17 @@ an already-established changed-input state patched in `163.09 ms`. A directional
 probe reduced concurrent no-change reuse, but lengthened publication completion, so simply
 throttling background publication would make the first real edit wait longer.
 
+Parallel grouping of persisted sidecar records reduced the Linux `uv` median
+`Persist incremental index and sections` span from `860.18 ms` to `758.84 ms` in a disk-bounded,
+six-pair fresh-seed run, while leaving the `59,119,521` byte sidecar size unchanged. That win did
+not carry cleanly through the whole publication window (`1241.65 ms` versus `1286.05 ms` for
+`Persist prepared incremental state`), which is the window an immediate edit can wait behind.
+Immediate changed-input samples were also unstable for both sides: an initial run recorded
+`426.88 ms` and `7682.11 ms` for the retained baseline, and `2412.17 ms` and `7947.93 ms` for the
+candidate. In a disk-cleaned confirmation, the first retained-baseline sample was `2538.04 ms`,
+then the candidate failed the required changed-input patch-log assertion and fell back to a full
+relink. The grouping prototype is therefore not retained.
+
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
 mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
