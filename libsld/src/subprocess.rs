@@ -42,10 +42,18 @@ fn subprocess_result(mut args: Args) -> Result<i32> {
 
             crate::setup_tracing(&args)?;
             let thread_pool = args.common_mut().activate_thread_pool()?;
-            let linker = crate::Linker::new();
-            let _outputs = linker.run(&args, &thread_pool)?;
-            crate::timing::finalise_perfetto_trace()?;
-            inform_parent_done(&fds);
+            let linker = crate::Linker::new_with_deferred_incremental_state_persistence();
+            let mut outputs = linker.run(&args, &thread_pool)?;
+            if outputs.has_pending_incremental_state() {
+                inform_parent_done(&fds);
+                // State publication is cache maintenance after output success. If it fails, the
+                // retained update marker makes the next incremental invocation recover safely.
+                outputs.publish_pending_incremental_state();
+                crate::timing::finalise_perfetto_trace()?;
+            } else {
+                crate::timing::finalise_perfetto_trace()?;
+                inform_parent_done(&fds);
+            }
             Ok(0)
         }
         -1 => {

@@ -167,6 +167,8 @@ pub struct Linker {
     /// A timing scope that exists for the whole time we're linking.
     #[allow(dyn_drop)]
     _link_scope: Vec<Box<dyn Drop>>,
+
+    defer_incremental_state_persistence: bool,
 }
 
 pub struct LinkerOutput<'layout_inputs> {
@@ -175,10 +177,16 @@ pub struct LinkerOutput<'layout_inputs> {
     /// it takes to drop and (b) if we forked, signal our parent that we're done, then drop it in
     /// the background.
     layout: Option<Box<dyn Drop + 'layout_inputs>>,
+    #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
+    pending_incremental_state: Option<incremental::PendingStateWrite>,
 }
 
 impl Linker {
     pub fn new() -> Self {
+        Self::new_with_incremental_state_persistence(false)
+    }
+
+    fn new_with_incremental_state_persistence(defer_incremental_state_persistence: bool) -> Self {
         let (guard_a, guard_b) = timing_guard!("Link");
 
         Self {
@@ -187,7 +195,13 @@ impl Linker {
             herd: Default::default(),
             shutdown_scope: Default::default(),
             _link_scope: vec![Box::new(guard_a), Box::new(guard_b)],
+            defer_incremental_state_persistence,
         }
+    }
+
+    #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
+    pub(crate) fn new_with_deferred_incremental_state_persistence() -> Self {
+        Self::new_with_incremental_state_persistence(true)
     }
 
     /// Runs the linker. The returned value isn't useful for anything, but is somewhat expensive to
@@ -206,7 +220,10 @@ impl Linker {
             args::VersionMode::ExitAfterPrint => {
                 let mut stdout = std::io::stdout().lock();
                 writeln!(stdout, "{identity}")?;
-                return Ok(LinkerOutput { layout: None });
+                return Ok(LinkerOutput {
+                    layout: None,
+                    pending_incremental_state: None,
+                });
             }
             args::VersionMode::Verbose => {
                 let mut stdout = std::io::stdout().lock();
@@ -267,7 +284,10 @@ impl Linker {
         args: &'data P::Args,
     ) -> error::Result<LinkerOutput<'data>> {
         if incremental::maybe_reuse_output_before_loading(args)? {
-            return Ok(LinkerOutput { layout: None });
+            return Ok(LinkerOutput {
+                layout: None,
+                pending_incremental_state: None,
+            });
         }
 
         let mut plugin = P::maybe_init_linker_plugin(args, &self.linker_plugin_arena, &self.herd)?;
@@ -283,11 +303,14 @@ impl Linker {
             finish_incremental_update_after_input_check(
                 || file_loader.verify_inputs_unchanged(),
                 || {
-                    incremental_state.begin_update()?;
-                    incremental_state.finish(args, file_loader)
+                    let lock = incremental_state.begin_update()?;
+                    incremental_state.finish(args, file_loader, lock)
                 },
             )?;
-            return Ok(LinkerOutput { layout: None });
+            return Ok(LinkerOutput {
+                layout: None,
+                pending_incremental_state: None,
+            });
         }
 
         let output_kind = OutputKind::new(args, file_loader);
@@ -365,13 +388,26 @@ impl Linker {
             &mut output,
         )?;
 
-        incremental_state.begin_update()?;
+        let state_lock = incremental_state.begin_update()?;
         P::write_output_file::<A>(&output, &layout, &incremental_state)?;
         diff::maybe_diff()?;
-        finish_incremental_update_after_input_check(
-            || file_loader.verify_inputs_unchanged(),
-            || incremental_state.finish(args, file_loader),
-        )?;
+        let defer_incremental_state = self.defer_incremental_state_persistence
+            && args.common().time_phase_options.is_none()
+            && !args.should_write_trace_file()
+            && !args.common().save_dir.is_active()
+            && incremental_state.can_publish_in_background();
+        let pending_incremental_state = if defer_incremental_state {
+            finish_incremental_update_after_input_check(
+                || file_loader.verify_inputs_unchanged(),
+                || incremental_state.prepare_finish(args, file_loader, state_lock),
+            )?
+        } else {
+            finish_incremental_update_after_input_check(
+                || file_loader.verify_inputs_unchanged(),
+                || incremental_state.finish(args, file_loader, state_lock),
+            )?;
+            None
+        };
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
         let (g1, g2) = timing_guard!("Shutdown");
@@ -379,15 +415,16 @@ impl Linker {
 
         Ok(LinkerOutput {
             layout: Some(Box::new(layout)),
+            pending_incremental_state,
         })
     }
 }
 
 #[inline]
-fn finish_incremental_update_after_input_check(
+fn finish_incremental_update_after_input_check<T>(
     verify_inputs_unchanged: impl FnOnce() -> error::Result<()>,
-    finish_incremental_update: impl FnOnce() -> error::Result<()>,
-) -> error::Result<()> {
+    finish_incremental_update: impl FnOnce() -> error::Result<T>,
+) -> error::Result<T> {
     verify_inputs_unchanged()?;
     finish_incremental_update()
 }
@@ -425,6 +462,20 @@ impl Drop for Linker {
         timing_phase!("Drop inputs");
         self.inputs_arena = Arena::new();
         self.herd = Default::default();
+    }
+}
+
+impl LinkerOutput<'_> {
+    #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
+    pub(crate) fn has_pending_incremental_state(&self) -> bool {
+        self.pending_incremental_state.is_some()
+    }
+
+    #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
+    pub(crate) fn publish_pending_incremental_state(&mut self) {
+        if let Some(pending) = self.pending_incremental_state.take() {
+            pending.publish_in_background();
+        }
     }
 }
 

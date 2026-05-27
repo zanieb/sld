@@ -34,7 +34,7 @@ use std::io::Write as _;
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -88,6 +88,7 @@ const COMPRESSED_INPUT_SNAPSHOT_SUFFIX: &str = ".zstd";
 const INPUT_SNAPSHOT_COMPRESSION_LEVEL: i32 = 1;
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
+const STATE_LOCK_FILE: &str = "state.lock";
 const LINK_START_FILE: &str = "link-start";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
@@ -244,6 +245,18 @@ pub(crate) struct PreparedState {
     current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
     record_texts: RecordTextInterner,
     reused_sections: AtomicUsize,
+}
+
+pub(crate) struct PendingStateWrite {
+    state_dir: PathBuf,
+    state: PersistedState,
+    build_id_tree: Option<Vec<[u8; blake3::OUT_LEN]>>,
+    reused_sections: usize,
+    _lock: Option<IncrementalStateLock>,
+}
+
+pub(crate) struct IncrementalStateLock {
+    _file: std::fs::File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +565,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     let state_dir = state_dir_for_output(args.output());
+    let _state_lock = acquire_incremental_state_lock(&state_dir)?;
     let current_link_start = write_link_start_marker(&state_dir)?;
 
     if args.should_write_trace_file() || args.common().save_dir.is_active() {
@@ -2272,11 +2286,13 @@ fn update_matched_patch_current_sections(
 }
 
 impl PreparedState {
-    pub(crate) fn begin_update(&self) -> Result {
+    pub(crate) fn begin_update(&self) -> Result<Option<IncrementalStateLock>> {
         if self.mode == IncrementalMode::Disabled {
-            return Ok(());
+            return Ok(None);
         }
-        mark_incremental_update_started(&self.current.state_dir, "link output")
+        let lock = acquire_incremental_state_lock(&self.current.state_dir)?;
+        mark_incremental_update_started(&self.current.state_dir, "link output")?;
+        Ok(Some(lock))
     }
 
     pub(crate) fn can_reuse_output(&self) -> bool {
@@ -2290,6 +2306,15 @@ impl PreparedState {
                 can_reuse_unchanged_sections: true,
                 ..
             }
+        )
+    }
+
+    pub(crate) fn can_publish_in_background(&self) -> bool {
+        !matches!(
+            &self.mode,
+            IncrementalMode::Relink { reason, .. }
+                if reason == "previous incremental update did not complete"
+                    || reason.starts_with("previous incremental update status could not be checked:")
         )
     }
 
@@ -2447,12 +2472,24 @@ impl PreparedState {
         &self,
         args: &impl platform::Args,
         file_loader: &FileLoader<'_>,
+        lock: Option<IncrementalStateLock>,
     ) -> Result {
-        if self.mode == IncrementalMode::Disabled {
-            return Ok(());
-        }
-
         timing_phase!("Write incremental state");
+        if let Some(pending) = self.prepare_finish(args, file_loader, lock)? {
+            pending.publish()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_finish(
+        &self,
+        args: &impl platform::Args,
+        file_loader: &FileLoader<'_>,
+        lock: Option<IncrementalStateLock>,
+    ) -> Result<Option<PendingStateWrite>> {
+        if self.mode == IncrementalMode::Disabled {
+            return Ok(None);
+        }
 
         let output =
             FileContentState::from_path_identity_only(args.output()).with_context(|| {
@@ -2531,23 +2568,45 @@ impl PreparedState {
             patch_record_locations: Vec::new(),
         };
 
+        Ok(Some(PendingStateWrite {
+            state_dir: self.current.state_dir.clone(),
+            state,
+            build_id_tree,
+            reused_sections: self.reused_sections.load(Ordering::Relaxed),
+            _lock: lock,
+        }))
+    }
+}
+
+impl PendingStateWrite {
+    pub(crate) fn publish(self) -> Result {
+        timing_phase!("Persist prepared incremental state");
         {
             timing_phase!("Persist incremental build ID state");
-            write_build_id_hash_tree(&self.current.state_dir, build_id_tree.as_deref())?;
+            write_build_id_hash_tree(&self.state_dir, self.build_id_tree.as_deref())?;
         }
         {
             timing_phase!("Persist incremental index and sections");
-            state.write(&self.current.state_dir)?;
+            self.state.write(&self.state_dir)?;
         }
-        clear_incremental_update_marker(&self.current.state_dir)?;
-        let reused = self.reused_sections.load(Ordering::Relaxed);
-        if reused > 0 {
+        clear_incremental_update_marker(&self.state_dir)?;
+        if self.reused_sections > 0 {
             append_log(
-                &self.current.state_dir,
-                &format!("reused {reused} unchanged input sections"),
+                &self.state_dir,
+                &format!("reused {} unchanged input sections", self.reused_sections),
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) fn publish_in_background(self) {
+        let state_dir = self.state_dir.clone();
+        if let Err(error) = self.publish() {
+            let _ = append_log(
+                &state_dir,
+                &format!("background incremental state publication failed: {error:?}"),
+            );
+        }
     }
 }
 
@@ -10405,6 +10464,25 @@ fn interrupted_update_relink_reason(state_dir: &Path) -> Option<String> {
     }
 }
 
+fn acquire_incremental_state_lock(state_dir: &Path) -> Result<IncrementalStateLock> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join(STATE_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open incremental state lock `{}`", path.display()))?;
+    #[cfg(unix)]
+    // A child may keep publishing state after its parent has reported a usable output.
+    // Serialize state readers and writers so a following link cannot observe partial state.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to lock incremental state `{}`", path.display()));
+    }
+    Ok(IncrementalStateLock { _file: file })
+}
+
 fn mark_incremental_update_started(state_dir: &Path, operation: &str) -> Result {
     std::fs::create_dir_all(state_dir)?;
     let path = update_marker_path(state_dir);
@@ -15994,6 +16072,30 @@ mod tests {
 
         let state_dir = state_dir_for_output(&args.output);
         assert!(link_start_marker_identity(&state_dir).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incremental_state_lock_serializes_state_publication() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_incremental_state_lock(dir.path()).unwrap();
+        let state_dir = dir.path().to_owned();
+        let (attempting_tx, attempting_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            let _second = acquire_incremental_state_lock(&state_dir).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempting_rx.recv().unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
