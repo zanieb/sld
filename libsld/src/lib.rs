@@ -182,6 +182,7 @@ pub struct LinkerOutput<'layout_inputs> {
 }
 
 impl Linker {
+    #[must_use]
     pub fn new() -> Self {
         Self::new_with_incremental_state_persistence(false)
     }

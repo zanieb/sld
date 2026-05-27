@@ -153,10 +153,12 @@ impl PartialEq<&str> for SharedText {
     }
 }
 
+type InternedInputKey = (usize, Option<(usize, usize)>);
+type InternedInputTexts = (SharedText, SharedText);
+
 struct RecordTextInterner {
     values: [Mutex<HashMap<String, SharedText>>; RECORD_TEXT_INTERNER_SHARDS],
-    inputs: [Mutex<HashMap<(usize, Option<(usize, usize)>), (SharedText, SharedText)>>;
-        RECORD_TEXT_INTERNER_SHARDS],
+    inputs: [Mutex<HashMap<InternedInputKey, InternedInputTexts>>; RECORD_TEXT_INTERNER_SHARDS],
     targets: [Mutex<HashMap<u32, RecordedRelocationTarget>>; RECORD_TEXT_INTERNER_SHARDS],
 }
 
@@ -2605,7 +2607,6 @@ impl<'data> PreparedState<'data> {
     }
 
     pub(crate) fn deferred_relocation_record(
-        &self,
         input: InputRef<'data>,
         section_index: object::SectionIndex,
         target_symbol_id: u32,
@@ -3191,7 +3192,7 @@ impl PersistedState {
             left.offset == right.offset && left.len == right.len && left.hash == right.hash
         });
         let mut records =
-            self.read_indexed_records_at_locations(state_dir, patch_records_file, locations)?;
+            Self::read_indexed_records_at_locations(state_dir, patch_records_file, locations)?;
         records
             .sections
             .retain(|record| input_files.contains(record.input_file.as_str()));
@@ -3220,11 +3221,10 @@ impl PersistedState {
         locations.dedup_by(|left, right| {
             left.offset == right.offset && left.len == right.len && left.hash == right.hash
         });
-        self.read_indexed_records_at_locations(state_dir, patch_records_file, locations)
+        Self::read_indexed_records_at_locations(state_dir, patch_records_file, locations)
     }
 
     fn read_indexed_records_at_locations(
-        &self,
         state_dir: &Path,
         patch_records_file: &str,
         locations: Vec<&PatchRecordLocation>,
@@ -10510,25 +10510,21 @@ fn read_verified_input_snapshot(
         }
         Err(error) => return Err(error.into()),
     };
-    if !snapshot_bytes_match_previous_content(previous_input, &snapshot, &bytes)? {
+    if !snapshot_bytes_match_previous_content(previous_input, &bytes) {
         return Ok(None);
     }
     Ok(Some(bytes))
 }
 
-fn snapshot_bytes_match_previous_content(
-    previous_input: &FileState,
-    _snapshot: &Path,
-    bytes: &[u8],
-) -> Result<bool> {
+fn snapshot_bytes_match_previous_content(previous_input: &FileState, bytes: &[u8]) -> bool {
     let previous = &previous_input.content;
     if previous.len != bytes.len() as u64 {
-        return Ok(false);
+        return false;
     }
     if previous.hash.is_empty() {
-        return Ok(false);
+        return false;
     }
-    Ok(previous.hash == hash_bytes(bytes))
+    previous.hash == hash_bytes(bytes)
 }
 
 fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileContentState)>> {
@@ -10950,6 +10946,7 @@ fn acquire_incremental_state_lock(state_dir: &Path) -> Result<IncrementalStateLo
     let path = state_dir.join(STATE_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -17584,63 +17581,60 @@ mod tests {
 
         let target_metadata_calls = AtomicUsize::new(0);
         let records = [
-            state
-                .deferred_relocation_record(
-                    input,
-                    object::SectionIndex(3),
-                    42,
-                    8,
-                    256,
-                    4,
-                    2,
-                    -16,
-                    0x5678,
-                    0x1234,
-                    || {
-                        target_metadata_calls.fetch_add(1, Ordering::Relaxed);
-                        Ok((
-                            Some(b"target".as_slice()),
-                            Some((input, object::SectionIndex(7), 32)),
-                        ))
-                    },
-                )
-                .unwrap(),
-            state
-                .deferred_relocation_record(
-                    input,
-                    object::SectionIndex(3),
-                    42,
-                    12,
-                    268,
-                    4,
-                    2,
-                    -8,
-                    0x5680,
-                    0x1234,
-                    || {
-                        target_metadata_calls.fetch_add(1, Ordering::Relaxed);
-                        Ok((
-                            Some(b"target".as_slice()),
-                            Some((input, object::SectionIndex(7), 32)),
-                        ))
-                    },
-                )
-                .unwrap(),
-            state
-                .deferred_relocation_record(
-                    input,
-                    object::SectionIndex(3),
-                    43,
-                    16,
-                    280,
-                    0,
-                    2,
-                    0,
-                    0,
-                    0x5678,
-                    || Ok((None, None)),
-                )
-                .unwrap(),
+            PreparedState::deferred_relocation_record(
+                input,
+                object::SectionIndex(3),
+                42,
+                8,
+                256,
+                4,
+                2,
+                -16,
+                0x5678,
+                0x1234,
+                || {
+                    target_metadata_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok((
+                        Some(b"target".as_slice()),
+                        Some((input, object::SectionIndex(7), 32)),
+                    ))
+                },
+            )
+            .unwrap(),
+            PreparedState::deferred_relocation_record(
+                input,
+                object::SectionIndex(3),
+                42,
+                12,
+                268,
+                4,
+                2,
+                -8,
+                0x5680,
+                0x1234,
+                || {
+                    target_metadata_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok((
+                        Some(b"target".as_slice()),
+                        Some((input, object::SectionIndex(7), 32)),
+                    ))
+                },
+            )
+            .unwrap(),
+            PreparedState::deferred_relocation_record(
+                input,
+                object::SectionIndex(3),
+                43,
+                16,
+                280,
+                0,
+                2,
+                0,
+                0,
+                0x5678,
+                || Ok((None, None)),
+            )
+            .unwrap(),
         ]
         .into_iter()
         .flatten()

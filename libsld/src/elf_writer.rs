@@ -3671,7 +3671,7 @@ fn apply_relocation<
         let target_symbol = layout.symbol_db.definition(local_symbol_id);
         let target_symbol_id = u32::try_from(target_symbol.as_usize())
             .context("Incremental relocation target symbol ID overflow")?;
-        if let Some(record) = incremental.deferred_relocation_record(
+        if let Some(record) = crate::incremental::PreparedState::deferred_relocation_record(
             object_layout.input,
             source_section_index,
             target_symbol_id,
