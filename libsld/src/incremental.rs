@@ -4346,17 +4346,6 @@ impl FileContentState {
             .is_some_and(|(identity, link_start)| identity.may_have_changed_since(link_start))
     }
 
-    fn identity_matches_snapshot_path(&self, path: &Path) -> Result<bool> {
-        let Some(previous) = self.identity.as_ref() else {
-            return Ok(false);
-        };
-        // Hard-link snapshots can have ctime changes from link-count updates while still being the
-        // saved snapshot content.
-        Ok(FileIdentity::from_path(path)?
-            .as_ref()
-            .is_some_and(|current| previous.matches_snapshot_identity(current)))
-    }
-
     fn render_identity(&self) -> String {
         self.identity
             .as_ref()
@@ -4377,14 +4366,6 @@ impl FileIdentity {
             lower_bound.modified_sec,
             lower_bound.modified_nsec,
         )
-    }
-
-    fn matches_snapshot_identity(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self.dev == other.dev
-            && self.ino == other.ino
-            && self.modified_sec == other.modified_sec
-            && self.modified_nsec == other.modified_nsec
     }
 
     fn from_path(path: &Path) -> Result<Option<Self>> {
@@ -9953,28 +9934,22 @@ fn snapshot_loaded_files(
 }
 
 fn input_content_matches_previous(
-    state_dir: &Path,
+    _state_dir: &Path,
     previous_input: &FileState,
     current_path: &Path,
 ) -> Result<bool> {
-    if !previous_input.content.hash.is_empty() {
-        let bytes = match std::fs::read(current_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        return Ok(previous_input.content.len == bytes.len() as u64
-            && previous_input.content.hash == hash_bytes(&bytes));
-    }
-    let snapshot = input_snapshot_path_for_encoded_path(state_dir, &previous_input.path);
-    if let Some(expected_identity) = previous_input.snapshot_identity.as_ref()
-        && !FileIdentity::from_path(&snapshot)?
-            .as_ref()
-            .is_some_and(|current| expected_identity.matches_snapshot_identity(current))
-    {
+    if previous_input.content.hash.is_empty() {
+        // Filesystem timestamps cannot reliably distinguish a rapid same-size in-place mutation
+        // of a snapshot or a hardlinked source. Legacy hashless states must relink once.
         return Ok(false);
     }
-    files_equal(&snapshot, current_path)
+    let bytes = match std::fs::read(current_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(previous_input.content.len == bytes.len() as u64
+        && previous_input.content.hash == hash_bytes(&bytes))
 }
 
 fn read_verified_input_snapshot(
@@ -10009,36 +9984,17 @@ fn read_verified_input_snapshot(
 
 fn snapshot_bytes_match_previous_content(
     previous_input: &FileState,
-    snapshot: &Path,
+    _snapshot: &Path,
     bytes: &[u8],
 ) -> Result<bool> {
     let previous = &previous_input.content;
     if previous.len != bytes.len() as u64 {
         return Ok(false);
     }
-    if !previous.hash.is_empty() {
-        return Ok(previous.hash == hash_bytes(bytes));
+    if previous.hash.is_empty() {
+        return Ok(false);
     }
-    if let Some(expected_identity) = previous_input.snapshot_identity.as_ref() {
-        return Ok(FileIdentity::from_path(snapshot)?
-            .as_ref()
-            .is_some_and(|current| expected_identity.matches_snapshot_identity(current)));
-    }
-    previous.identity_matches_snapshot_path(snapshot)
-}
-
-fn files_equal(left: &Path, right: &Path) -> Result<bool> {
-    let left = match std::fs::read(left) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let right = match std::fs::read(right) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(left == right)
+    Ok(previous.hash == hash_bytes(bytes))
 }
 
 fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileContentState)>> {
@@ -10252,39 +10208,41 @@ fn snapshot_loaded_input_file(
     ));
     let _ = std::fs::remove_file(&tmp);
 
-    if clone_snapshot_bytes(path, &tmp) || hardlink_rust_snapshot_bytes(path, &tmp) {
-        let _ = std::fs::remove_file(&target);
-        std::fs::rename(&tmp, &target).with_context(|| {
+    if !(clone_snapshot_bytes(path, &tmp) || hardlink_rust_snapshot_bytes(path, &tmp)) {
+        let compressed_target = compressed_input_snapshot_path(state_dir, path);
+        let compressed_tmp = compressed_target.with_file_name(format!(
+            "{}.{}.tmp",
+            compressed_target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("input.zstd"),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&compressed_tmp);
+        let hash = write_compressed_loaded_snapshot(bytes, &compressed_tmp, should_hash)?;
+        let _ = std::fs::remove_file(&compressed_target);
+        std::fs::rename(&compressed_tmp, &compressed_target).with_context(|| {
             format!(
-                "Failed to install incremental input snapshot `{}`",
-                target.display()
+                "Failed to install compressed incremental input snapshot `{}`",
+                compressed_target.display()
             )
         })?;
-        let _ = std::fs::remove_file(compressed_input_snapshot_path(state_dir, path));
-        let snapshot_identity = FileIdentity::from_path(&target)?;
-        return Ok((true, None, snapshot_identity));
+        let _ = std::fs::remove_file(&target);
+        return Ok((true, hash, None));
     }
-
-    let compressed_target = compressed_input_snapshot_path(state_dir, path);
-    let compressed_tmp = compressed_target.with_file_name(format!(
-        "{}.{}.tmp",
-        compressed_target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("input.zstd"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&compressed_tmp);
-    let hash = write_compressed_loaded_snapshot(bytes, &compressed_tmp, should_hash)?;
-    let _ = std::fs::remove_file(&compressed_target);
-    std::fs::rename(&compressed_tmp, &compressed_target).with_context(|| {
+    let _ = std::fs::remove_file(&target);
+    std::fs::rename(&tmp, &target).with_context(|| {
         format!(
-            "Failed to install compressed incremental input snapshot `{}`",
-            compressed_target.display()
+            "Failed to install incremental input snapshot `{}`",
+            target.display()
         )
     })?;
-    let _ = std::fs::remove_file(&target);
-    Ok((true, hash, None))
+    let _ = std::fs::remove_file(compressed_input_snapshot_path(state_dir, path));
+    let snapshot_identity = FileIdentity::from_path(&target)?;
+    // Filesystem identities cannot reliably detect rapid same-size writes. Snapshot-backed
+    // states must keep a content hash even when the bytes are cloned or hardlinked.
+    let hash = should_hash.then(|| hash_loaded_input_bytes(bytes));
+    Ok((true, hash, snapshot_identity))
 }
 
 fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
@@ -10357,7 +10315,7 @@ fn hardlink_rust_snapshot_bytes(source: &Path, target: &Path) -> bool {
         return false;
     }
     // rustc installs these outputs by replacement, preserving the linked inode as old input bytes.
-    // If a producer mutates one in place instead, snapshot identity validation rejects reuse.
+    // If a producer mutates one in place instead, the saved content hash rejects reuse.
     std::fs::hard_link(source, target).is_ok()
 }
 
@@ -11539,7 +11497,7 @@ mod tests {
         assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            content: content_hash_with_path_identity(&input, b"object"),
             snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
             patch: None,
         };
@@ -11567,7 +11525,7 @@ mod tests {
         assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
         let previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            content: content_hash_with_path_identity(&input, b"object"),
             snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
             patch: None,
         };
@@ -11678,7 +11636,7 @@ mod tests {
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
         let mut previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            content: content_hash_with_path_identity(&input, b"object"),
             snapshot_identity: None,
             patch: None,
         };
@@ -11703,7 +11661,7 @@ mod tests {
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
         let mut previous = FileState {
             path: encode_path(&input),
-            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            content: content_hash_with_path_identity(&input, b"object"),
             snapshot_identity: None,
             patch: None,
         };
@@ -11718,7 +11676,7 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
-    fn snapshot_identity_verifies_hashless_snapshot_until_snapshot_changes() {
+    fn hashless_snapshot_is_not_trusted_for_reuse_or_patching() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
         let input = dir.path().join("input.o");
@@ -11732,6 +11690,29 @@ mod tests {
                 hash: String::new(),
                 identity: None,
             },
+            snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
+            patch: None,
+        };
+
+        assert!(!input_content_matches_previous(&state_dir, &previous, &input).unwrap());
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &previous).unwrap(),
+            None
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn content_hash_verifies_snapshot_until_snapshot_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let previous = FileState {
+            path: encode_path(&input),
+            content: content_hash_with_path_identity(&input, b"object"),
             snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
             patch: None,
         };
