@@ -79,12 +79,14 @@ save-dir. A string entry appends one zero byte to the listed file before every t
 entry with `path` and `section` flips the first byte of that ELF section instead, which is useful
 when the benchmark should prove that changed inputs also change the linked output. A table entry
 with `grow` increases the ELF section size by that many bytes, provided there is padding before the
-next object structure. To let the linked output absorb grown sections instead of relying only on
-alignment padding, pass `--incremental-padding-percent=N` in `sld_extra_flags`. The warmup run is
-not mutated, so it seeds the initial incremental state; each timed run then measures a real
-changed-input relink. Use `expect_output_change = true` with section mutations when you want the
-runner to assert that the benchmarked mutation changes the linked output, not just the input file
-metadata. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
+next object structure. Mutations replace their input file atomically, matching how Rust build
+artifacts are published and preserving hardlinked prior-input snapshots used by incremental sld.
+To let the linked output absorb grown sections instead of relying only on alignment padding, pass
+`--incremental-padding-percent=N` in `sld_extra_flags`. The warmup run is not mutated, so it seeds
+the initial incremental state; each timed run then measures a real changed-input relink. Use
+`expect_output_change = true` with section mutations when you want the runner to assert that the
+benchmarked mutation changes the linked output, not just the input file metadata. Use a scratch
+copy of the save-dir, since this intentionally mutates inputs.
 When a table entry has `section` but no `path`, the runner finds the first relocatable ELF input
 with a matching section at runtime. A trailing `*` makes the section name a prefix match, which is
 useful for Rust objects with names like `.text._ZN...`.

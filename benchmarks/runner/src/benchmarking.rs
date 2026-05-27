@@ -23,8 +23,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use wait4::Wait4 as _;
+
+static MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn run_bench(args: &BenchArgs, config: &Config) -> Result {
     if !args.allow_non_tmpfs {
@@ -333,13 +337,10 @@ fn section_selector_matches(selector: &str, section_name: &str) -> bool {
 }
 
 fn append_zero(path: &Path) -> Result {
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("Failed to open mutation input `{}`", path.display()))?;
-    file.write_all(&[0])
-        .with_context(|| format!("Failed to mutate input `{}`", path.display()))?;
-    Ok(())
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    bytes.push(0);
+    install_mutated_input(path, &bytes)
 }
 
 fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
@@ -369,9 +370,7 @@ fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
         .get_mut(start as usize)
         .with_context(|| format!("Mutation section `{section_name}` starts past end of file"))?;
     *byte = byte.wrapping_add(1);
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
-    Ok(())
+    install_mutated_input(path, &bytes)
 }
 
 fn grow_elf_section(path: &Path, section_name: &str, growth: u64) -> Result {
@@ -432,9 +431,57 @@ fn grow_elf_section(path: &Path, section_name: &str, growth: u64) -> Result {
     }
     size_field.write(&mut bytes, new_size)?;
 
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
-    Ok(())
+    install_mutated_input(path, &bytes)
+}
+
+fn install_mutated_input(path: &Path, bytes: &[u8]) -> Result {
+    let permissions = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat mutation input `{}`", path.display()))?
+        .permissions();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("input");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.benchmark-mutation.{}.{}.tmp",
+        std::process::id(),
+        MUTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create replacement mutation input `{}`",
+                    temp_path.display()
+                )
+            })?;
+        temp.write_all(bytes).with_context(|| {
+            format!(
+                "Failed to write replacement mutation input `{}`",
+                temp_path.display()
+            )
+        })?;
+        temp.set_permissions(permissions).with_context(|| {
+            format!(
+                "Failed to set replacement mutation permissions `{}`",
+                temp_path.display()
+            )
+        })?;
+        drop(temp);
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to install replacement mutation input `{}`",
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -986,6 +1033,22 @@ mod tests {
             object.section_by_name(".data").unwrap().data().unwrap(),
             &[3, 2, 3, 4]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elf_section_byte_mutation_preserves_existing_hardlink_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.rcgu.o");
+        let snapshot = dir.path().join("snapshot.rcgu.o");
+        let original = growable_data_elf();
+        std::fs::write(&path, &original).unwrap();
+        std::fs::hard_link(&path, &snapshot).unwrap();
+
+        mutate_elf_section_byte(&path, ".data").unwrap();
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
