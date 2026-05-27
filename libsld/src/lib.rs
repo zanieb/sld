@@ -477,6 +477,13 @@ impl LinkerOutput<'_> {
             pending.publish_in_background();
         }
     }
+
+    #[cfg_attr(not(all(feature = "fork", unix)), allow(dead_code))]
+    pub(crate) fn publish_pending_incremental_reuse_metadata(&mut self) {
+        if let Some(pending) = self.pending_incremental_state.as_mut() {
+            pending.publish_reuse_metadata_in_background();
+        }
+    }
 }
 
 impl Drop for LinkerOutput<'_> {

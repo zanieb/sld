@@ -96,6 +96,7 @@ const LINK_START_FILE: &str = "link-start";
 const SECTIONS_FILE: &str = "sections";
 const SECTIONS_FILE_PREFIX: &str = "sections-";
 const COMPRESSED_SECTIONS_FILE_PREFIX: &str = "sections-zstd-";
+const PUBLISHING_SECTIONS_FILE: &str = "sections-publishing";
 const SECTIONS_COMPRESSION_LEVEL: i32 = 1;
 const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
@@ -656,6 +657,9 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     let state_dir = state_dir_for_output(args.output());
+    if maybe_reuse_output_during_publication(args, &state_dir)? {
+        return Ok(true);
+    }
     let _state_lock = acquire_incremental_state_lock(&state_dir)?;
     let current_link_start = write_link_start_marker(&state_dir)?;
 
@@ -895,6 +899,61 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         )?;
     }
     append_log(&state_dir, "reused existing output before loading inputs")?;
+    Ok(true)
+}
+
+fn maybe_reuse_output_during_publication(
+    args: &impl platform::Args,
+    state_dir: &Path,
+) -> Result<bool> {
+    if !update_marker_path(state_dir).try_exists().unwrap_or(false)
+        || args.should_write_trace_file()
+        || args.common().save_dir.is_active()
+        || args
+            .dependency_file()
+            .is_some_and(|dependency_file| !dependency_file.exists())
+    {
+        return Ok(false);
+    }
+    let Some(previous) = PersistedState::read_metadata(state_dir).unwrap_or_default() else {
+        return Ok(false);
+    };
+    if previous.sections_file.as_deref() != Some(PUBLISHING_SECTIONS_FILE)
+        || previous.patch_records_file.is_some()
+        || previous.args_hash != args_hash(args)
+        || sld_version_relink_reason(previous.sld_version.as_deref(), &sld_version(args)).is_some()
+        || !previous.output.identity_matches_path(args.output())?
+    {
+        return Ok(false);
+    }
+    let inputs_match = previous
+        .input_files
+        .par_iter()
+        .map(|input| -> Result<bool> {
+            let path = decode_path(&input.path)?;
+            if !input.content.identity_matches_path(&path)? {
+                return Ok(false);
+            }
+            if input_identity_is_anchored_by_snapshot(input)
+                || !input
+                    .content
+                    .identity_is_ambiguous_since(previous.link_start.as_ref())
+            {
+                return Ok(true);
+            }
+            input_content_matches_previous(state_dir, input, &path)
+        })
+        .try_reduce(|| true, |left, right| Ok(left && right))?;
+    if !inputs_match {
+        return Ok(false);
+    }
+    if input_identity_mismatch_reason(&previous.input_files)?.is_some() {
+        return Ok(false);
+    }
+    append_log(
+        state_dir,
+        "reused existing output before loading inputs while incremental state publication was pending",
+    )?;
     Ok(true)
 }
 
@@ -2417,6 +2476,9 @@ impl<'data> PreparedState<'data> {
             return Ok(None);
         }
         let lock = acquire_incremental_state_lock(&self.current.state_dir)?;
+        if !self.can_publish_in_background() {
+            remove_incremental_index(&self.current.state_dir)?;
+        }
         mark_incremental_update_started(&self.current.state_dir, "link output")?;
         Ok(Some(lock))
     }
@@ -2741,6 +2803,22 @@ impl<'data> PreparedState<'data> {
 }
 
 impl PendingStateWrite<'_> {
+    pub(crate) fn publish_reuse_metadata_in_background(&mut self) {
+        if let Some(loaded_files) = self.deferred_hash_inputs.as_ref() {
+            hash_pending_reuse_input_files(
+                loaded_files,
+                &mut self.state.input_files,
+                self.state.link_start.as_ref(),
+            );
+        }
+        if let Err(error) = self.state.write_publishing_index(&self.state_dir) {
+            let _ = append_log(
+                &self.state_dir,
+                &format!("background incremental reuse metadata publication failed: {error:?}"),
+            );
+        }
+    }
+
     pub(crate) fn publish(mut self) -> Result {
         timing_phase!("Persist prepared incremental state");
         if let Some(loaded_files) = self.deferred_hash_inputs.take() {
@@ -3557,6 +3635,10 @@ impl PersistedState {
             Some(&sections_file),
             &locations,
         )
+    }
+
+    fn write_publishing_index(&self, state_dir: &Path) -> Result {
+        self.write_index_with_sections_files(state_dir, PUBLISHING_SECTIONS_FILE, None, &[])
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -10255,6 +10337,41 @@ fn hash_loaded_input_files(loaded_files: &[&InputFile], input_files: &mut [FileS
     }
 }
 
+fn hash_pending_reuse_input_files(
+    loaded_files: &[&InputFile],
+    input_files: &mut [FileState],
+    link_start: Option<&FileIdentity>,
+) {
+    let input_indices = input_files
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (input.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let tasks = loaded_files
+        .iter()
+        .filter_map(|input_file| {
+            let path = encode_path(&input_file.filename);
+            if !seen.insert(path.clone()) {
+                return None;
+            }
+            let index = input_indices.get(&path).copied()?;
+            let input = &input_files[index];
+            (input.content.hash.is_empty()
+                && !input_identity_is_anchored_by_snapshot(input)
+                && input.content.identity_is_ambiguous_since(link_start))
+            .then_some((index, *input_file))
+        })
+        .collect::<Vec<_>>();
+    let hashes = tasks
+        .into_par_iter()
+        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.data())))
+        .collect::<Vec<_>>();
+    for (index, hash) in hashes {
+        input_files[index].content.hash = hash;
+    }
+}
+
 fn input_content_matches_previous(
     _state_dir: &Path,
     previous_input: &FileState,
@@ -10763,6 +10880,20 @@ fn clear_incremental_update_marker(state_dir: &Path) -> Result {
         Err(error) => Err(error).with_context(|| {
             format!(
                 "Failed to remove incremental update marker `{}`",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn remove_incremental_index(state_dir: &Path) -> Result {
+    let path = state_dir.join(INDEX_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to remove interrupted incremental state `{}`",
                 path.display()
             )
         }),
@@ -11869,6 +12000,26 @@ mod tests {
             read_verified_input_snapshot(&state_dir, &input_files[0]).unwrap(),
             Some(b"object".to_vec())
         );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn pending_reuse_hashes_ambiguous_unsnapshotted_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.o");
+        std::fs::write(&input, b"object").unwrap();
+        let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
+        let mut input_files = vec![FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
+            patch: None,
+        }];
+        let link_start = FileIdentity::from_path(&input).unwrap();
+
+        hash_pending_reuse_input_files(&[&input_file], &mut input_files, link_start.as_ref());
+
+        assert_eq!(input_files[0].content.hash, hash_bytes(b"object"));
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -16391,6 +16542,83 @@ mod tests {
 
         let state_dir = state_dir_for_output(&args.output);
         assert!(link_start_marker_identity(&state_dir).is_some());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn publishing_metadata_allows_exact_no_change_reuse_while_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("input.o");
+        let state_dir = state_dir_for_output(&output);
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state = publishing_metadata_state(&args, &output, &input);
+        state.write_publishing_index(&state_dir).unwrap();
+        mark_incremental_update_started(&state_dir, "publishing").unwrap();
+        let _lock = acquire_incremental_state_lock(&state_dir).unwrap();
+
+        assert!(maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
+        let metadata = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        assert_eq!(
+            metadata.sections_file.as_deref(),
+            Some(PUBLISHING_SECTIONS_FILE)
+        );
+        assert!(metadata.patch_records_file.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn publishing_metadata_rejects_changed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("input.o");
+        let state_dir = state_dir_for_output(&output);
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state = publishing_metadata_state(&args, &output, &input);
+        state.write_publishing_index(&state_dir).unwrap();
+        mark_incremental_update_started(&state_dir, "publishing").unwrap();
+        std::fs::write(&input, b"changed").unwrap();
+
+        assert!(!maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
+    }
+
+    fn publishing_metadata_state(
+        args: &crate::args::elf::ElfArgs,
+        output: &Path,
+        input: &Path,
+    ) -> PersistedState {
+        PersistedState {
+            args_hash: args_hash(args),
+            link_options_hash: Some(link_options_hash(args)),
+            input_order_hash: Some(String::new()),
+            sld_version: Some(sld_version(args)),
+            link_start: FileIdentity::from_path(input).unwrap(),
+            output: FileContentState::from_path_identity_only(output).unwrap(),
+            build_id_hashes: None,
+            input_files: vec![FileState {
+                path: encode_path(input),
+                content: FileContentState::from_path(input).unwrap(),
+                snapshot_identity: None,
+                patch: None,
+            }],
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            fdes: Vec::new(),
+            dynamic_relocations: Vec::new(),
+            sections_file: None,
+            patch_records_file: None,
+            patch_record_locations: Vec::new(),
+        }
     }
 
     #[cfg(unix)]

@@ -45,6 +45,7 @@ fn subprocess_result(mut args: Args) -> Result<i32> {
             let linker = crate::Linker::new_with_deferred_incremental_state_persistence();
             let mut outputs = linker.run(&args, &thread_pool)?;
             if outputs.has_pending_incremental_state() {
+                outputs.publish_pending_incremental_reuse_metadata();
                 inform_parent_done(&fds);
                 // State publication is cache maintenance after output success. If it fails, the
                 // retained update marker makes the next incremental invocation recover safely.
