@@ -169,16 +169,19 @@ an already-established changed-input state patched in `163.09 ms`. A directional
 probe reduced concurrent no-change reuse, but lengthened publication completion, so simply
 throttling background publication would make the first real edit wait longer.
 
-Parallel grouping of persisted sidecar records reduced the Linux `uv` median
-`Persist incremental index and sections` span from `860.18 ms` to `758.84 ms` in a disk-bounded,
-six-pair fresh-seed run, while leaving the `59,119,521` byte sidecar size unchanged. That win did
-not carry cleanly through the whole publication window (`1241.65 ms` versus `1286.05 ms` for
-`Persist prepared incremental state`), which is the window an immediate edit can wait behind.
-Immediate changed-input samples were also unstable for both sides: an initial run recorded
-`426.88 ms` and `7682.11 ms` for the retained baseline, and `2412.17 ms` and `7947.93 ms` for the
-candidate. In a disk-cleaned confirmation, the first retained-baseline sample was `2538.04 ms`,
-then the candidate failed the required changed-input patch-log assertion and fell back to a full
-relink. The grouping prototype is therefore not retained.
+Parallel grouping of persisted sidecar records was rerun after moving generated outputs to `/tmp`,
+because concurrent remote runs had filled `/home` and caused a baseline `SIGBUS`. In four
+alternating fresh-seed `uv` pairs, it reduced median `Persist incremental index and sections` from
+`992.02 ms` to `887.60 ms` and synchronous `Link` from `3523.88 ms` to `3402.31 ms`. The
+foreground result did not hold: first changed-input patches initially moved from `167.23 ms` to
+`147.43 ms`, but a twelve-round confirmation moved from `154.58 ms` to `157.30 ms`, with asserted
+patch logs in every measured run. The grouping prototype is therefore not retained.
+
+Using zstd fast level `-3` instead of level `1` for the indexed sidecar was also rejected. In six
+alternating fresh-seed `uv` pairs under `/tmp`, median `Persist incremental index and sections`
+regressed from `792.15 ms` to `861.72 ms`, synchronous `Link` regressed from `3370.78 ms` to
+`3386.35 ms`, and the sidecar grew from `59,119,521` bytes to `93,608,892` bytes. Since the seed
+path was already slower, no post-seed patch lane was warranted for that prototype.
 
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
