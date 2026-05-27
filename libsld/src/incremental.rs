@@ -373,6 +373,7 @@ struct PersistedState {
     sections_file: Option<String>,
     patch_records_file: Option<String>,
     patch_record_locations: Vec<PatchRecordLocation>,
+    raw_patch_record_locations: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1980,6 +1981,7 @@ fn patch_changed_inputs(
         sections_file: previous.sections_file,
         patch_records_file: previous.patch_records_file,
         patch_record_locations: previous.patch_record_locations,
+        raw_patch_record_locations: previous.raw_patch_record_locations,
     }
     .write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
     clear_incremental_update_marker(state_dir)?;
@@ -2788,6 +2790,7 @@ impl<'data> PreparedState<'data> {
             sections_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
+            raw_patch_record_locations: None,
         };
 
         Ok(Some(PendingStateWrite {
@@ -3025,17 +3028,18 @@ impl CurrentState {
 
 impl PersistedState {
     fn read(state_dir: &Path) -> Result<Option<Self>> {
-        Self::read_impl(state_dir, true, PatchSectionReadMode::Parse)
+        Self::read_impl(state_dir, true, PatchSectionReadMode::Parse, true)
     }
 
     fn read_metadata(state_dir: &Path) -> Result<Option<Self>> {
-        Self::read_impl(state_dir, false, PatchSectionReadMode::PreserveRaw)
+        Self::read_impl(state_dir, false, PatchSectionReadMode::PreserveRaw, false)
     }
 
     fn read_impl(
         state_dir: &Path,
         load_sections: bool,
         patch_section_mode: PatchSectionReadMode,
+        parse_patch_record_locations: bool,
     ) -> Result<Option<Self>> {
         let path = state_dir.join(INDEX_FILE);
         let contents = match std::fs::read_to_string(&path) {
@@ -3044,13 +3048,17 @@ impl PersistedState {
             Err(error) => return Err(error.into()),
         };
 
-        let mut state =
-            Self::parse_with_section_loader(&contents, patch_section_mode, |sections_file| {
+        let mut state = Self::parse_with_section_loader(
+            &contents,
+            patch_section_mode,
+            parse_patch_record_locations,
+            |sections_file| {
                 if !load_sections {
                     return Ok(None);
                 }
                 read_sections_sidecar(state_dir, sections_file).map(Some)
-            })?;
+            },
+        )?;
         if load_sections
             && state.sections_file == state.patch_records_file
             && state.patch_records_file.is_some()
@@ -3070,6 +3078,7 @@ impl PersistedState {
         state_dir: &Path,
         input_files: &HashSet<String>,
     ) -> Result {
+        self.materialize_patch_record_locations()?;
         if let Some(patch_records_file) = self.patch_records_file.as_deref() {
             let canonical_index = self.sections_file.as_deref() == Some(patch_records_file);
             if let Some(records) =
@@ -3117,6 +3126,22 @@ impl PersistedState {
         self.relocations = records.relocations;
         self.fdes = records.fdes;
         self.dynamic_relocations = records.dynamic_relocations;
+        Ok(())
+    }
+
+    fn materialize_patch_record_locations(&mut self) -> Result {
+        let Some(raw) = self.raw_patch_record_locations.as_deref() else {
+            return Ok(());
+        };
+        let mut lines = raw.lines();
+        let (locations, deferred) = parse_patch_record_location_table(&mut lines, true)?;
+        if deferred.is_some() || lines.next().is_some() {
+            return Err(crate::error!(
+                "Unexpected trailing incremental patch record location data"
+            ));
+        }
+        self.patch_record_locations = locations;
+        self.raw_patch_record_locations = None;
         Ok(())
     }
 
@@ -3367,12 +3392,13 @@ impl PersistedState {
 
     #[cfg(test)]
     fn parse(contents: &str) -> Result<Self> {
-        Self::parse_with_section_loader(contents, PatchSectionReadMode::Parse, |_| Ok(None))
+        Self::parse_with_section_loader(contents, PatchSectionReadMode::Parse, true, |_| Ok(None))
     }
 
     fn parse_with_section_loader(
         contents: &str,
         patch_section_mode: PatchSectionReadMode,
+        parse_patch_record_locations: bool,
         mut load_sections: impl FnMut(&str) -> Result<Option<String>>,
     ) -> Result<Self> {
         let mut lines = contents.lines().peekable();
@@ -3484,6 +3510,7 @@ impl PersistedState {
         let mut sections_file = None;
         let mut patch_records_file = None;
         let mut patch_record_locations = Vec::new();
+        let mut raw_patch_record_locations = None;
         let mut relocations = Vec::new();
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
@@ -3533,12 +3560,8 @@ impl PersistedState {
                 validate_sections_file_name(&file)?;
                 sections_file = Some(file.clone());
                 patch_records_file = Some(file);
-                let location_count: usize = parse_prefixed_line(lines.next(), "patch-records")?
-                    .parse()
-                    .context("Invalid incremental patch record location count")?;
-                for _ in 0..location_count {
-                    patch_record_locations.push(parse_patch_record_location_line(lines.next())?);
-                }
+                (patch_record_locations, raw_patch_record_locations) =
+                    parse_patch_record_location_table(&mut lines, parse_patch_record_locations)?;
                 Vec::new()
             } else if first_line.starts_with("sections-file\t") {
                 let file = parse_prefixed_line(Some(first_line), "sections-file")?.to_owned();
@@ -3559,14 +3582,11 @@ impl PersistedState {
                         .peek()
                         .is_some_and(|line| line.starts_with("patch-records\t"))
                     {
-                        let location_count: usize =
-                            parse_prefixed_line(lines.next(), "patch-records")?
-                                .parse()
-                                .context("Invalid incremental patch record location count")?;
-                        for _ in 0..location_count {
-                            patch_record_locations
-                                .push(parse_patch_record_location_line(lines.next())?);
-                        }
+                        (patch_record_locations, raw_patch_record_locations) =
+                            parse_patch_record_location_table(
+                                &mut lines,
+                                parse_patch_record_locations,
+                            )?;
                     }
                 }
                 relocations = records.relocations;
@@ -3618,6 +3638,7 @@ impl PersistedState {
             sections_file,
             patch_records_file,
             patch_record_locations,
+            raw_patch_record_locations,
         })
     }
 
@@ -3634,11 +3655,12 @@ impl PersistedState {
             &sections_file,
             Some(&sections_file),
             &locations,
+            None,
         )
     }
 
     fn write_publishing_index(&self, state_dir: &Path) -> Result {
-        self.write_index_with_sections_files(state_dir, PUBLISHING_SECTIONS_FILE, None, &[])
+        self.write_index_with_sections_files(state_dir, PUBLISHING_SECTIONS_FILE, None, &[], None)
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -3691,6 +3713,7 @@ impl PersistedState {
             sections_file,
             self.patch_records_file.as_deref(),
             &self.patch_record_locations,
+            self.raw_patch_record_locations.as_deref(),
         )
     }
 
@@ -3700,6 +3723,7 @@ impl PersistedState {
         sections_file: &str,
         patch_records_file: Option<&str>,
         patch_record_locations: &[PatchRecordLocation],
+        raw_patch_record_locations: Option<&str>,
     ) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
@@ -3712,7 +3736,12 @@ impl PersistedState {
         let tmp_path = state_dir.join(format!("{INDEX_FILE}.tmp"));
         std::fs::write(
             &tmp_path,
-            self.render_index(sections_file, patch_records_file, patch_record_locations),
+            self.render_index(
+                sections_file,
+                patch_records_file,
+                patch_record_locations,
+                raw_patch_record_locations,
+            ),
         )
         .with_context(|| format!("Failed to write incremental state `{}`", tmp_path.display()))?;
         let _ = std::fs::remove_file(&path);
@@ -3754,19 +3783,16 @@ impl PersistedState {
         sections_file: &str,
         patch_records_file: Option<&str>,
         patch_record_locations: &[PatchRecordLocation],
+        raw_patch_record_locations: Option<&str>,
     ) -> String {
         let mut out = self.render_header_and_inputs();
         if patch_records_file == Some(sections_file) {
             writeln!(&mut out, "indexed-sections-file\t{sections_file}").unwrap();
-            writeln!(&mut out, "patch-records\t{}", patch_record_locations.len()).unwrap();
-            for location in patch_record_locations {
-                writeln!(
-                    &mut out,
-                    "patch-record\t{}\t{}\t{}\t{}",
-                    location.input_file, location.offset, location.len, location.hash
-                )
-                .unwrap();
-            }
+            render_patch_record_location_table(
+                &mut out,
+                patch_record_locations,
+                raw_patch_record_locations,
+            );
         } else {
             writeln!(&mut out, "sections-file\t{sections_file}").unwrap();
         }
@@ -3774,15 +3800,11 @@ impl PersistedState {
             && patch_records_file != sections_file
         {
             writeln!(&mut out, "patch-records-file\t{patch_records_file}").unwrap();
-            writeln!(&mut out, "patch-records\t{}", patch_record_locations.len()).unwrap();
-            for location in patch_record_locations {
-                writeln!(
-                    &mut out,
-                    "patch-record\t{}\t{}\t{}\t{}",
-                    location.input_file, location.offset, location.len, location.hash
-                )
-                .unwrap();
-            }
+            render_patch_record_location_table(
+                &mut out,
+                patch_record_locations,
+                raw_patch_record_locations,
+            );
         }
         out
     }
@@ -9358,6 +9380,55 @@ fn parse_patch_record_location_line(line: Option<&str>) -> Result<PatchRecordLoc
     })
 }
 
+fn parse_patch_record_location_table<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    parse_locations: bool,
+) -> Result<(Vec<PatchRecordLocation>, Option<String>)> {
+    let count_line = lines
+        .next()
+        .context("Missing incremental patch record location count")?;
+    let location_count: usize = parse_prefixed_line(Some(count_line), "patch-records")?
+        .parse()
+        .context("Invalid incremental patch record location count")?;
+    if parse_locations {
+        let mut locations = Vec::with_capacity(location_count);
+        for _ in 0..location_count {
+            locations.push(parse_patch_record_location_line(lines.next())?);
+        }
+        return Ok((locations, None));
+    }
+
+    let mut raw = String::new();
+    writeln!(&mut raw, "{count_line}").unwrap();
+    for _ in 0..location_count {
+        let line = lines
+            .next()
+            .context("Missing incremental patch record location")?;
+        writeln!(&mut raw, "{line}").unwrap();
+    }
+    Ok((Vec::new(), Some(raw)))
+}
+
+fn render_patch_record_location_table(
+    out: &mut String,
+    patch_record_locations: &[PatchRecordLocation],
+    raw_patch_record_locations: Option<&str>,
+) {
+    if let Some(raw) = raw_patch_record_locations {
+        out.push_str(raw);
+        return;
+    }
+    writeln!(out, "patch-records\t{}", patch_record_locations.len()).unwrap();
+    for location in patch_record_locations {
+        writeln!(
+            out,
+            "patch-record\t{}\t{}\t{}\t{}",
+            location.input_file, location.offset, location.len, location.hash
+        )
+        .unwrap();
+    }
+}
+
 #[derive(Default)]
 struct CompactRecords {
     sections: Vec<SectionRecord>,
@@ -11165,6 +11236,7 @@ mod tests {
             sections_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
+            raw_patch_record_locations: None,
         }
     }
 
@@ -15542,6 +15614,7 @@ mod tests {
             sections_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
+            raw_patch_record_locations: None,
         };
 
         let result = patch_changed_inputs(
@@ -15707,6 +15780,8 @@ mod tests {
 
         let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert!(metadata.sections.is_empty());
+        assert!(metadata.patch_record_locations.is_empty());
+        assert!(metadata.raw_patch_record_locations.is_some());
         assert!(PersistedState::read(dir.path()).is_err());
     }
 
@@ -15738,6 +15813,8 @@ mod tests {
         assert!(metadata.sections.is_empty());
         assert!(patch.sections.is_empty());
         assert_eq!(patch.raw_sections.as_deref(), Some(raw_sections.as_str()));
+        assert!(metadata.patch_record_locations.is_empty());
+        assert!(metadata.raw_patch_record_locations.is_some());
         assert!(metadata.render().contains(&raw_sections));
 
         let full = PersistedState::read(dir.path()).unwrap().unwrap();
@@ -15816,6 +15893,10 @@ mod tests {
 
         metadata.write_index(dir.path()).unwrap();
         assert!(!metadata_update_path(dir.path()).exists());
+        assert_eq!(
+            PersistedState::read(dir.path()).unwrap().unwrap().sections,
+            state.sections
+        );
     }
 
     #[test]
@@ -15957,6 +16038,8 @@ mod tests {
         state.write(dir.path()).unwrap();
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert_eq!(metadata.sections_file, metadata.patch_records_file);
+        assert!(metadata.patch_record_locations.is_empty());
+        assert!(metadata.raw_patch_record_locations.is_some());
         let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
 
         metadata
@@ -15964,6 +16047,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(metadata.sections, vec![state.sections[0].clone()]);
+        assert!(!metadata.patch_record_locations.is_empty());
+        assert!(metadata.raw_patch_record_locations.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn read_metadata_preserves_deferred_separate_patch_record_table_on_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state("args", b"output", &[("a.o", b"a")]);
+        let location = PatchRecordLocation {
+            input_file: hex::encode("a.o"),
+            offset: 3,
+            len: 5,
+            hash: "record-hash".to_owned(),
+        };
+        let index = state.render_index(
+            "sections-records",
+            Some("sections-patches"),
+            std::slice::from_ref(&location),
+            None,
+        );
+        std::fs::write(dir.path().join(INDEX_FILE), &index).unwrap();
+
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert!(metadata.patch_record_locations.is_empty());
+        assert!(metadata.raw_patch_record_locations.is_some());
+
+        metadata.write_index(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap(),
+            index
+        );
+
+        metadata.materialize_patch_record_locations().unwrap();
+        assert_eq!(metadata.patch_record_locations, vec![location]);
+        assert!(metadata.raw_patch_record_locations.is_none());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -16105,7 +16224,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.sections_file, second.sections_file);
         assert_eq!(first.patch_records_file, second.patch_records_file);
-        assert_eq!(first.patch_record_locations, second.patch_record_locations);
+        assert_eq!(
+            first.raw_patch_record_locations,
+            second.raw_patch_record_locations
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -16126,7 +16248,7 @@ mod tests {
             hash: hash_bytes(sidecar.as_bytes()),
         };
         let index = state
-            .render_index(&file_name, Some(&file_name), &[location])
+            .render_index(&file_name, Some(&file_name), &[location], None)
             .replacen(STATE_VERSION, STATE_VERSION_V30, 1);
         std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
 
@@ -16652,6 +16774,7 @@ mod tests {
             sections_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
+            raw_patch_record_locations: None,
         }
     }
 

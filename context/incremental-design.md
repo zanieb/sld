@@ -226,3 +226,34 @@ completed in `40.86-42.56 ms`. In those warm steady-state edits, input identity 
 remained `19.33-20.97 ms`. This sharpens a possible future encoding experiment: a smaller hot
 metadata representation or binary deserialization format could improve repeated post-seed patches,
 but it should be evaluated as a recurring hydration optimization, not as a direct seed-time fix.
+
+Deferring patch-record location parsing on metadata-only reads implements a smaller version of that
+hot-path optimization without changing the persisted format. The canonical index still retains the
+exact raw `patch-records` table, and metadata-only index rewrites emit that table unchanged; it is
+parsed into locations only when a newly changed input actually needs indexed sidecar records.
+
+On the same captured Linux `uv` link invocation, a controlled fixed-size `.rodata` byte edit was
+used to compare the prior retained binary with this change. Three alternating fresh lanes per binary
+measured a seed, an exact no-change reuse, a first changed-input patch, and four established edit
+toggles. Each measured edit lane logged changed-input patching. `zsh` `%M` peak-memory values were
+interpreted as MiB after a `256 MiB` calibration allocation reported `265`.
+
+| Phase | Previous median `Link` | Deferred-location median `Link` | Difference | Previous / deferred peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh synchronous seed | `3118.82 ms` | `3155.23 ms` | `+1.2%` | `4027 / 4029 MiB` |
+| Exact no-change reuse | `60.69 ms` | `47.81 ms` | `-21.2%` | `51 / 47 MiB` |
+| First changed-input patch | `82.61 ms` | `83.21 ms` | `+0.7%` | `43 / 40 MiB` |
+| Established changed-input patch, 12 toggles | `43.03 ms` | `36.24 ms` | `-15.8%` | `28 / 26 MiB` |
+
+The candidate is retained: seed and first-edit costs are effectively flat in this sample, while
+recurring reuse and established edits are materially faster. Relative to the previously measured
+`uv` full `sld` link of `855.20 ms`, this warmed diagnostic lane is `23.6x` faster, but it remains a
+focused saved-link measurement rather than a replacement for the checked-in multi-project benchmark
+matrix.
+
+An audit of the sibling `rust-toolchain` experiments found that Cargo-native cache plus incremental
+SLD composition was already tested and rejected for the measured edit loops. Clone or guarded
+hardlink artifact materialization remains a planned but unexecuted experiment there, and no
+completed `rkyv`-style metadata hydration experiment was found. Deferring the ELF patch-location
+table is therefore complementary to those producer/cache questions rather than a repetition of
+them.
