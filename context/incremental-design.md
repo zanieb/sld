@@ -183,6 +183,12 @@ regressed from `792.15 ms` to `861.72 ms`, synchronous `Link` regressed from `33
 `3386.35 ms`, and the sidecar grew from `59,119,521` bytes to `93,608,892` bytes. Since the seed
 path was already slower, no post-seed patch lane was warranted for that prototype.
 
+Computing each compressed block's location hash in the existing parallel block-build loop instead
+of during serial sidecar assembly was likewise rejected. In six alternating fresh-seed `uv` pairs
+under `/tmp`, median `Persist incremental index and sections` regressed from `773.80 ms` to
+`796.95 ms`, synchronous `Link` regressed from `3346.87 ms` to `3374.71 ms`, and sidecar size
+remained exactly `59,119,521` bytes. No post-seed lane was warranted for a slower seed path.
+
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
 mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
