@@ -251,6 +251,7 @@ pub(crate) struct PreparedState {
     current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
     record_texts: RecordTextInterner,
     reused_sections: AtomicUsize,
+    prepared_fast_build_id_state: Mutex<Option<BuildIdHashStateAndTree>>,
 }
 
 pub(crate) struct PendingStateWrite {
@@ -470,6 +471,7 @@ pub(crate) fn maybe_prepare(
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         });
     }
 
@@ -551,6 +553,7 @@ pub(crate) fn maybe_prepare(
         current_dynamic_relocations: RecordBuffers::default(),
         record_texts: RecordTextInterner::default(),
         reused_sections: AtomicUsize::new(0),
+        prepared_fast_build_id_state: Mutex::new(None),
     })
 }
 
@@ -2292,6 +2295,30 @@ fn update_matched_patch_current_sections(
 }
 
 impl PreparedState {
+    pub(crate) fn compute_fast_build_id_and_prepare_state(
+        &self,
+        output: &[u8],
+    ) -> Result<Option<blake3::Hash>> {
+        if self.mode == IncrementalMode::Disabled {
+            return Ok(None);
+        }
+        let Some(range) = build_id_note_range(output)? else {
+            return Ok(None);
+        };
+        validate_fast_build_id_range(&range)?;
+        let Some(tree) = build_id_hash_tree(output, &range) else {
+            return Ok(None);
+        };
+        let state = BuildIdHashState {
+            output_len: output.len() as u64,
+            nodes: tree.len(),
+            tree_hash: Some(build_id_hash_tree_hash(&tree)),
+        };
+        let build_id = build_id_from_hash_tree(&state, &tree)?;
+        *self.prepared_fast_build_id_state.lock().unwrap() = Some((Some(state), Some(tree)));
+        Ok(Some(build_id))
+    }
+
     pub(crate) fn begin_update(&self) -> Result<Option<IncrementalStateLock>> {
         if self.mode == IncrementalMode::Disabled {
             return Ok(None);
@@ -2509,7 +2536,11 @@ impl PreparedState {
         let (build_id_hashes, build_id_tree) = {
             timing_phase!("Compute incremental build ID state");
             if args.has_incremental_fast_build_id() {
-                build_id_hash_state_from_output(output_bytes.get()?)?
+                if let Some(prepared) = self.prepared_fast_build_id_state.lock().unwrap().take() {
+                    prepared
+                } else {
+                    build_id_hash_state_from_output(output_bytes.get()?)?
+                }
             } else {
                 (None, None)
             }
@@ -16617,6 +16648,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true, true));
@@ -16658,6 +16690,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, false, true));
@@ -16691,6 +16724,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         state.record_generated_section("generated:.rela.dyn.general", 256, 24);
@@ -16739,6 +16773,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         state.record_eh_frame_fde(
@@ -16804,6 +16839,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         state.record_relocation(
@@ -16887,6 +16923,7 @@ mod tests {
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
         };
 
         state.record_dynamic_relocation_with_output_info(

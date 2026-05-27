@@ -191,7 +191,7 @@ pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
 
     write_sframe_section(section_buffers.get_mut(output_section_id::SFRAME), layout)?;
 
-    write_gnu_build_id_note(sized_output, &layout.args().build_id, layout)?;
+    write_gnu_build_id_note(sized_output, &layout.args().build_id, layout, incremental)?;
     Ok(())
 }
 
@@ -199,12 +199,13 @@ fn write_gnu_build_id_note(
     sized_output: &mut SizedOutput,
     build_id_option: &BuildIdOption,
     layout: &ElfLayout,
+    incremental: &PreparedState,
 ) -> Result {
     let hash_placeholder;
     let uuid_placeholder;
     let build_id = match build_id_option {
         BuildIdOption::Fast => {
-            hash_placeholder = compute_hash(sized_output);
+            hash_placeholder = compute_hash(sized_output, incremental)?;
             hash_placeholder.as_bytes()
         }
         BuildIdOption::Hex(hex) => hex.as_slice(),
@@ -232,11 +233,19 @@ fn write_gnu_build_id_note(
     Ok(())
 }
 
-fn compute_hash(sized_output: &SizedOutput) -> blake3::Hash {
+fn compute_hash(sized_output: &SizedOutput, incremental: &PreparedState) -> Result<blake3::Hash> {
     timing_phase!("Compute build ID");
-    blake3::Hasher::new()
-        .update_rayon(&sized_output.out)
-        .finalize()
+    Ok(
+        if let Some(hash) =
+            incremental.compute_fast_build_id_and_prepare_state(&sized_output.out)?
+        {
+            hash
+        } else {
+            blake3::Hasher::new()
+                .update_rayon(&sized_output.out)
+                .finalize()
+        },
+    )
 }
 
 fn write_file_contents<'data, A: Arch<Platform = Elf>>(
