@@ -10240,9 +10240,15 @@ fn snapshot_loaded_input_files(
     hash_inputs: bool,
 ) -> Result<usize> {
     let patchable_inputs = sections
-        .iter()
-        .map(|section| section.input_file.as_str())
-        .collect::<HashSet<_>>();
+        .par_iter()
+        .fold(HashSet::new, |mut inputs, section| {
+            inputs.insert(section.input_file.as_str());
+            inputs
+        })
+        .reduce(HashSet::new, |mut inputs, shard| {
+            inputs.extend(shard);
+            inputs
+        });
     let input_indices = input_files
         .iter()
         .enumerate()

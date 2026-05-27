@@ -152,6 +152,14 @@ here. Balanced first-position RSS measurements for changed-input patching were e
 (`1516.40 MiB` before versus `1516.31 MiB` after). Keep monitoring the timing drift, but it is not
 evidence that the fresh-seed hardlink shortcut executes on post-seed patches.
 
+Parallelizing construction of the patchable-input set during seed snapshot preparation reduced the
+same captured Linux `uv` `Snapshot incremental inputs` median from `104.86 ms` to `86.37 ms`.
+In a separately cooled default-fork run, visible seed-return latency fell from `972.68 ms` to
+`930.58 ms`, while immediate no-change reuse remained flat (`98.10 ms` versus `96.58 ms`) and
+logged reuse while state publication was pending. Fresh-seed peak RSS also remained flat-to-lower
+in the alternating sample (`4,133,086 KiB` versus `4,111,380 KiB`). A log-asserted candidate proof
+retained both the no-change reuse and changed-input patch fast paths.
+
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
 mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
