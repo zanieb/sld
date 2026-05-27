@@ -134,3 +134,27 @@ Recent work reduced the memory cost of the initial incremental seed path by:
 Those optimizations do not change the high-level design, but they do matter operationally. The seed
 link has to stay affordable, or users will avoid enabling incrementality even if the patch path is
 excellent.
+
+## Remaining Seed Cost And Cache Ownership
+
+On a Linux `uv` saved link measured on 2026-05-27, the synchronous snapshot-retention step still
+installed 651 patchable input snapshots, including 645 hardlinked Rust artifacts retaining about
+2.4 GB of logical input bytes. Avoiding temporary-name installation for fresh Rust hardlinks reduced
+the median `Snapshot incremental inputs` phase from `114.40 ms` to `105.58 ms`. This is useful for
+such a small change, but also indicates diminishing returns from linker-local syscall reductions.
+
+`uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
+files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
+mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
+subsequent replacement so changed-input diffing remains correct. Wild already takes the applicable
+part of that approach by hardlinking atomically replaced `.rlib` and `.rcgu.o` files.
+
+A larger seed win would require a producer-side contract: for example, Cargo or rustc could provide
+immutable, content-addressed prior input objects, or eventually provide the section diff directly.
+That direction matches the original design note, which anticipated both hardlinked prior objects
+and a future compiler-supplied diff.
+
+Changing the persisted record encoding, for example by adopting `rkyv`, is not a direct solution to
+the remaining seed foreground cost. Index and section publication is already deferred after output
+completion on the normal path. An alternate zero-copy state format is worth revisiting only if
+profiles show metadata hydration dominating no-change or changed-input relinks.

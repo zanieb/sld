@@ -10635,6 +10635,14 @@ fn snapshot_loaded_input_file(
     })?;
 
     let target = input_snapshot_path(state_dir, path);
+    // Fresh Rust seeds do not need a temporary snapshot name. If a prior snapshot already
+    // exists, this hardlink attempt fails and we retain the atomic replacement path below.
+    if hardlink_rust_snapshot_bytes(path, &target) {
+        let _ = std::fs::remove_file(compressed_input_snapshot_path(state_dir, path));
+        let snapshot_identity = FileIdentity::from_path(&target)?;
+        let hash = should_hash.then(|| hash_loaded_input_bytes(bytes));
+        return Ok((true, hash, snapshot_identity));
+    }
     let tmp = target.with_file_name(format!(
         "{}.{}.tmp",
         target
@@ -12000,6 +12008,26 @@ mod tests {
             read_verified_input_snapshot(&state_dir, &input_files[0]).unwrap(),
             Some(b"object".to_vec())
         );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn installed_rust_snapshot_refreshes_after_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        std::fs::write(&input, b"object").unwrap();
+
+        snapshot_loaded_input_file(&state_dir, &input, b"object", true).unwrap();
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        let (_, _, snapshot_identity) =
+            snapshot_loaded_input_file(&state_dir, &input, b"changed", true).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"changed");
+        assert_eq!(snapshot_identity, FileIdentity::from_path(&input).unwrap());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
