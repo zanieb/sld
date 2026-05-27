@@ -669,6 +669,9 @@ fn run_once(
             command.arg(arg);
         }
     }
+    let sld_log_offset = should_verify_sld_incremental_log(bin, bench, check_sld_log)
+        .then(|| incremental_log_len(&output_path))
+        .transpose()?;
 
     let (mut pipe_read, pipe_write) = std::io::pipe()?;
     command
@@ -707,8 +710,8 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
-    if should_verify_sld_incremental_log(bin, bench, check_sld_log) {
-        verify_sld_incremental_log(&output_path, &bench.config.expect_sld_log)?;
+    if let Some(log_offset) = sld_log_offset {
+        verify_sld_incremental_log(&output_path, &bench.config.expect_sld_log, log_offset)?;
     }
 
     // However long we took to run, sleep for half of that. If the linker forked on startup, then
@@ -832,14 +835,25 @@ fn should_verify_sld_incremental_log(bin: &Bin, bench: &Benchmark, check_sld_log
         && !bench.config.expect_sld_log.is_empty()
 }
 
-fn verify_sld_incremental_log(output_path: &Path, expected: &[String]) -> Result {
+fn incremental_log_len(output_path: &Path) -> Result<u64> {
+    let path = incremental_log_path(output_path);
+    match std::fs::metadata(&path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error)
+            .with_context(|| format!("Failed to read sld incremental log `{}`", path.display())),
+    }
+}
+
+fn verify_sld_incremental_log(output_path: &Path, expected: &[String], offset: u64) -> Result {
     let path = incremental_log_path(output_path);
     let log = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read sld incremental log `{}`", path.display()))?;
+    let current_log = log.get(offset as usize..).unwrap_or(&log);
     for expected in expected {
-        if !log.contains(expected) {
+        if !current_log.contains(expected) {
             bail!(
-                "sld incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
+                "sld incremental log `{}` did not contain expected text `{expected}` for the current run.\nCurrent log:\n{current_log}",
                 path.display()
             );
         }
@@ -945,6 +959,7 @@ mod tests {
     use super::ensure_relative_path;
     use super::find_first_relocatable_elf_with_section;
     use super::grow_elf_section;
+    use super::incremental_log_len;
     use super::incremental_log_path;
     use super::make_executable;
     use super::mutate_elf_section_byte;
@@ -1164,13 +1179,47 @@ mod tests {
                 "patched 1 changed input file".to_owned(),
                 "before loading inputs".to_owned(),
             ],
+            0,
         )
         .unwrap();
 
-        let error = verify_sld_incremental_log(&output, &["reused existing output".to_owned()])
+        let error = verify_sld_incremental_log(&output, &["reused existing output".to_owned()], 0)
             .unwrap_err();
 
         assert!(error.to_string().contains("did not contain expected text"));
+    }
+
+    #[test]
+    fn sld_incremental_log_expectations_ignore_previous_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let log_path = incremental_log_path(&output);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            "patched 1 changed input file before loading inputs\n",
+        )
+        .unwrap();
+        let offset = incremental_log_len(&output).unwrap();
+        std::fs::write(
+            &log_path,
+            "patched 1 changed input file before loading inputs\nfull relink: input file changed\n",
+        )
+        .unwrap();
+
+        let error = verify_sld_incremental_log(
+            &output,
+            &["patched 1 changed input file".to_owned()],
+            offset,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("for the current run"));
+        assert!(
+            error
+                .to_string()
+                .contains("full relink: input file changed")
+        );
     }
 
     #[test]
