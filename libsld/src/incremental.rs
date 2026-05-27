@@ -3614,22 +3614,20 @@ impl PersistedState {
 
     #[cfg(test)]
     fn write_rendered_sections(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        write_rendered_records(
-            out,
-            &self.sections,
-            &self.relocations,
-            &self.fdes,
-            &self.dynamic_relocations,
-        )
+        let sections = self.sections.iter().collect::<Vec<_>>();
+        let relocations = self.relocations.iter().collect::<Vec<_>>();
+        let fdes = self.fdes.iter().collect::<Vec<_>>();
+        let dynamic_relocations = self.dynamic_relocations.iter().collect::<Vec<_>>();
+        write_rendered_records(out, &sections, &relocations, &fdes, &dynamic_relocations)
     }
 }
 
 fn write_rendered_records(
     mut out: &mut impl std::fmt::Write,
-    sections: &[SectionRecord],
-    relocations: &[RelocationRecord],
-    fdes: &[FdeRecord],
-    dynamic_relocations: &[DynamicRelocationRecord],
+    sections: &[&SectionRecord],
+    relocations: &[&RelocationRecord],
+    fdes: &[&FdeRecord],
+    dynamic_relocations: &[&DynamicRelocationRecord],
 ) -> std::fmt::Result {
     let mut section_inputs = Vec::new();
     let mut section_input_ids = HashMap::new();
@@ -3848,29 +3846,13 @@ fn write_indexed_records_streaming(
         .into_par_iter()
         .map(|input_file| {
             let records = &records_by_input[input_file];
-            let mut sections = records
-                .sections
-                .iter()
-                .map(|record| (*record).clone())
-                .collect::<Vec<_>>();
+            let mut sections = records.sections.clone();
             sections.sort_unstable();
-            let mut relocations = records
-                .relocations
-                .iter()
-                .map(|record| (*record).clone())
-                .collect::<Vec<_>>();
+            let mut relocations = records.relocations.clone();
             relocations.sort_unstable();
-            let mut fdes = records
-                .fdes
-                .iter()
-                .map(|record| (*record).clone())
-                .collect::<Vec<_>>();
+            let mut fdes = records.fdes.clone();
             fdes.sort_unstable();
-            let mut dynamic_relocations = records
-                .dynamic_relocations
-                .iter()
-                .map(|record| (*record).clone())
-                .collect::<Vec<_>>();
+            let mut dynamic_relocations = records.dynamic_relocations.clone();
             dynamic_relocations.sort_unstable();
             let mut block = String::new();
             write_rendered_records(
