@@ -5246,19 +5246,35 @@ fn append_to_path(path: &Path, extra: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+const PUBLISHING_SECTIONS_FILE: &str = "sections-publishing";
+
 fn read_incremental_state_text(output: &Path) -> Result<String> {
     let state_dir = append_to_path(output, ".incr");
     let index_path = state_dir.join("index");
-    let mut state_text = std::fs::read_to_string(&index_path).with_context(|| {
-        format!(
-            "Failed to read incremental state `{}`",
-            index_path.display()
-        )
-    })?;
-    if let Some(sections_file) = state_text.lines().find_map(|line| {
-        line.strip_prefix("sections-file\t")
-            .or_else(|| line.strip_prefix("indexed-sections-file\t"))
-    }) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut state_text = std::fs::read_to_string(&index_path).with_context(|| {
+            format!(
+                "Failed to read incremental state `{}`",
+                index_path.display()
+            )
+        })?;
+        let Some(sections_file) = state_text.lines().find_map(|line| {
+            line.strip_prefix("sections-file\t")
+                .or_else(|| line.strip_prefix("indexed-sections-file\t"))
+        }) else {
+            return Ok(state_text);
+        };
+        if sections_file == PUBLISHING_SECTIONS_FILE {
+            if Instant::now() >= deadline {
+                bail!(
+                    "Timed out waiting for incremental state publication in `{}`",
+                    index_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         let sections_path = state_dir.join(sections_file);
         let sections = if sections_file.starts_with("sections-zstd-") {
             let bytes = std::fs::read(&sections_path).with_context(|| {
@@ -5283,8 +5299,8 @@ fn read_incremental_state_text(output: &Path) -> Result<String> {
         };
         state_text.push('\n');
         state_text.push_str(&sections);
+        return Ok(state_text);
     }
-    Ok(state_text)
 }
 
 fn add_inputs_to_command(config: &Config, inputs: &[LinkerInput], command: &mut Command) {

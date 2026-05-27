@@ -709,12 +709,10 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         .map(|(index, input)| {
             let path = decode_path(&input.path)?;
             if input.content.identity_matches_path(&path)? {
-                if input_identity_is_anchored_by_snapshot(input) {
-                    return Ok((None, None, false));
-                }
-                if !input
-                    .content
-                    .identity_is_ambiguous_since(previous.link_start.as_ref())
+                if input_content_is_anchored_before_link_start(input, previous.link_start.as_ref())
+                    || !input
+                        .content
+                        .identity_is_ambiguous_since(previous.link_start.as_ref())
                 {
                     return Ok((None, None, false));
                 }
@@ -935,7 +933,7 @@ fn maybe_reuse_output_during_publication(
             if !input.content.identity_matches_path(&path)? {
                 return Ok(false);
             }
-            if input_identity_is_anchored_by_snapshot(input)
+            if input_content_is_anchored_before_link_start(input, previous.link_start.as_ref())
                 || !input
                     .content
                     .identity_is_ambiguous_since(previous.link_start.as_ref())
@@ -964,6 +962,21 @@ fn input_identity_is_anchored_by_snapshot(input: &FileState) -> bool {
         .as_ref()
         .zip(input.content.identity.as_ref())
         .is_some_and(|(snapshot, content)| snapshot == content)
+}
+
+// Creating a hardlink advances ctime without changing bytes. Only use that anchor when mtime
+// proves the content predates this link; otherwise the stored hash must validate the input.
+fn input_content_is_anchored_before_link_start(
+    input: &FileState,
+    link_start: Option<&FileIdentity>,
+) -> bool {
+    input_identity_is_anchored_by_snapshot(input)
+        && input
+            .content
+            .identity
+            .as_ref()
+            .zip(link_start)
+            .is_some_and(|(identity, link_start)| !identity.modified_on_or_after(link_start))
 }
 
 fn metadata_update_indices_for_inputs(
@@ -4729,18 +4742,23 @@ impl FileContentState {
 }
 
 impl FileIdentity {
-    fn may_have_changed_since(&self, lower_bound: &Self) -> bool {
+    fn modified_on_or_after(&self, lower_bound: &Self) -> bool {
         timestamp_on_or_after(
             self.modified_sec,
             self.modified_nsec,
             lower_bound.modified_sec,
             lower_bound.modified_nsec,
-        ) || timestamp_on_or_after(
-            self.changed_sec,
-            self.changed_nsec,
-            lower_bound.modified_sec,
-            lower_bound.modified_nsec,
         )
+    }
+
+    fn may_have_changed_since(&self, lower_bound: &Self) -> bool {
+        self.modified_on_or_after(lower_bound)
+            || timestamp_on_or_after(
+                self.changed_sec,
+                self.changed_nsec,
+                lower_bound.modified_sec,
+                lower_bound.modified_nsec,
+            )
     }
 
     fn from_path(path: &Path) -> Result<Option<Self>> {
@@ -10435,7 +10453,7 @@ fn hash_pending_reuse_input_files(
             let index = input_indices.get(&path).copied()?;
             let input = &input_files[index];
             (input.content.hash.is_empty()
-                && !input_identity_is_anchored_by_snapshot(input)
+                && !input_content_is_anchored_before_link_start(input, link_start)
                 && input.content.identity_is_ambiguous_since(link_start))
             .then_some((index, *input_file))
         })
@@ -16746,6 +16764,61 @@ mod tests {
         std::fs::write(&input, b"changed").unwrap();
 
         assert!(!maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn publishing_metadata_rejects_ambiguous_mutated_hardlink_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        let state_dir = state_dir_for_output(&output);
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let mut state = publishing_metadata_state(&args, &output, &input);
+
+        std::fs::write(&input, b"other").unwrap();
+        state.input_files[0].content.identity = FileIdentity::from_path(&input).unwrap();
+        state.input_files[0].snapshot_identity = FileIdentity::from_path(&snapshot).unwrap();
+        state.link_start = state.input_files[0].content.identity.clone();
+        state.write_publishing_index(&state_dir).unwrap();
+        mark_incremental_update_started(&state_dir, "publishing").unwrap();
+
+        assert!(!maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_rejects_ambiguous_mutated_hardlink_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        let state_dir = state_dir_for_output(&output);
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        assert!(hardlink_rust_snapshot_bytes(&input, &snapshot));
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let mut state = publishing_metadata_state(&args, &output, &input);
+
+        std::fs::write(&input, b"other").unwrap();
+        state.input_files[0].content.identity = FileIdentity::from_path(&input).unwrap();
+        state.input_files[0].snapshot_identity = FileIdentity::from_path(&snapshot).unwrap();
+        state.link_start = state.input_files[0].content.identity.clone();
+        state.write(&state_dir).unwrap();
+
+        assert!(!maybe_reuse_output_before_loading(&args).unwrap());
     }
 
     fn publishing_metadata_state(
