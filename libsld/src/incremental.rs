@@ -284,17 +284,20 @@ impl<T> RecordBuffers<T> {
     }
 
     fn take_all(&self) -> Vec<T> {
-        let mut shards = self
-            .values
-            .iter()
-            .map(|shard| std::mem::take(&mut *shard.lock().unwrap()))
-            .collect::<Vec<_>>();
+        let mut shards = self.take_shards();
         let total_len = shards.iter().map(Vec::len).sum::<usize>();
         let mut records = Vec::with_capacity(total_len);
         for shard in &mut shards {
             records.append(shard);
         }
         records
+    }
+
+    fn take_shards(&self) -> Vec<Vec<T>> {
+        self.values
+            .iter()
+            .map(|shard| std::mem::take(&mut *shard.lock().unwrap()))
+            .collect()
     }
 }
 
@@ -318,6 +321,7 @@ pub(crate) struct PreparedState {
 pub(crate) struct PendingStateWrite {
     state_dir: PathBuf,
     state: PersistedState,
+    relocation_shards: Vec<Vec<RelocationRecord>>,
     build_id_tree: Option<Vec<[u8; blake3::OUT_LEN]>>,
     reused_sections: usize,
     _lock: Option<IncrementalStateLock>,
@@ -2625,7 +2629,7 @@ impl PreparedState {
             }
         };
 
-        let (sections, relocations, fdes, dynamic_relocations) = {
+        let (sections, relocations, relocation_shards, fdes, dynamic_relocations) = {
             timing_phase!("Collect incremental records");
 
             let mut sections = self.current_sections.take_all();
@@ -2633,10 +2637,14 @@ impl PreparedState {
                 sections.extend(self.previous_sections.iter().cloned());
             }
 
-            let mut relocations = self.current_relocations.take_all();
-            if relocations.is_empty() && self.mode == IncrementalMode::Reuse {
-                relocations.extend(self.previous_relocations.iter().cloned());
-            }
+            let relocation_shards = self.current_relocations.take_shards();
+            let relocations = if relocation_shards.iter().all(Vec::is_empty)
+                && self.mode == IncrementalMode::Reuse
+            {
+                self.previous_relocations.clone()
+            } else {
+                Vec::new()
+            };
 
             let mut fdes = self.current_fdes.take_all();
             if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
@@ -2648,7 +2656,13 @@ impl PreparedState {
                 dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
             }
 
-            (sections, relocations, fdes, dynamic_relocations)
+            (
+                sections,
+                relocations,
+                relocation_shards,
+                fdes,
+                dynamic_relocations,
+            )
         };
 
         let mut input_files = self.current.input_files.clone();
@@ -2687,6 +2701,7 @@ impl PreparedState {
         Ok(Some(PendingStateWrite {
             state_dir: self.current.state_dir.clone(),
             state,
+            relocation_shards,
             build_id_tree,
             reused_sections: self.reused_sections.load(Ordering::Relaxed),
             _lock: lock,
@@ -2695,8 +2710,13 @@ impl PreparedState {
 }
 
 impl PendingStateWrite {
-    pub(crate) fn publish(self) -> Result {
+    pub(crate) fn publish(mut self) -> Result {
         timing_phase!("Persist prepared incremental state");
+        let total_relocations = self.relocation_shards.iter().map(Vec::len).sum::<usize>();
+        self.state.relocations.reserve(total_relocations);
+        for shard in &mut self.relocation_shards {
+            self.state.relocations.append(shard);
+        }
         {
             timing_phase!("Persist incremental build ID state");
             write_build_id_hash_tree(&self.state_dir, self.build_id_tree.as_deref())?;
