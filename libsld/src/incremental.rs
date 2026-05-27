@@ -17,7 +17,9 @@ use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
 use object::ObjectSymbol as _;
+use rayon::iter::IndexedParallelIterator as _;
 use rayon::iter::IntoParallelIterator as _;
+use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::ParallelIterator as _;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -615,30 +617,41 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
     let mut checked_ambiguous_inputs = false;
-    for (index, input) in previous.input_files.iter().enumerate() {
-        let path = decode_path(&input.path)?;
-        if input.content.identity_matches_path(&path)? {
-            if input_identity_is_anchored_by_snapshot(input) {
-                continue;
+    let input_checks = previous
+        .input_files
+        .par_iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let path = decode_path(&input.path)?;
+            if input.content.identity_matches_path(&path)? {
+                if input_identity_is_anchored_by_snapshot(input) {
+                    return Ok((None, None, false));
+                }
+                if !input
+                    .content
+                    .identity_is_ambiguous_since(previous.link_start.as_ref())
+                {
+                    return Ok((None, None, false));
+                }
+                if input_content_matches_previous(&state_dir, input, &path)? {
+                    return Ok((None, None, true));
+                }
+                return Ok((Some((index, path)), None, true));
             }
-            if !input
-                .content
-                .identity_is_ambiguous_since(previous.link_start.as_ref())
-            {
-                continue;
-            }
-            checked_ambiguous_inputs = true;
             if input_content_matches_previous(&state_dir, input, &path)? {
-                continue;
+                return Ok((None, Some((index, path)), false));
             }
-            changed_inputs.push((index, path));
-            continue;
+            Ok((Some((index, path)), None, false))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (changed_input, rewritten_input, checked_ambiguous_input) in input_checks {
+        if let Some(changed_input) = changed_input {
+            changed_inputs.push(changed_input);
         }
-        if input_content_matches_previous(&state_dir, input, &path)? {
-            rewritten_inputs.push((index, path));
-            continue;
+        if let Some(rewritten_input) = rewritten_input {
+            rewritten_inputs.push(rewritten_input);
         }
-        changed_inputs.push((index, path));
+        checked_ambiguous_inputs |= checked_ambiguous_input;
     }
 
     if !rewritten_inputs.is_empty() {
@@ -5378,11 +5391,7 @@ fn match_patch_sections_from_current_hashes(
     input_file_path: &str,
     sections: &[PatchSection],
 ) -> Result<Option<MatchedPatchSections>> {
-    if sections.is_empty()
-        || sections
-            .iter()
-            .any(|section| section.section_name.is_none() || section.data_hash.is_none())
-    {
+    if sections.is_empty() || sections.iter().any(|section| section.data_hash.is_none()) {
         return Ok(None);
     }
 
@@ -5399,6 +5408,13 @@ fn match_patch_sections_from_current_hashes(
     let mut matched_sections = Vec::with_capacity(sections.len());
     let mut changed_sections = Vec::new();
     for (previous, current) in sections.iter().cloned().zip(current_sections) {
+        // A locally-generated name cannot identify a moved or changed section. It can still
+        // remain at its recorded index when its content is unchanged; fingerprint validation
+        // below rejects layout or non-patchable changes, and a later content change falls back
+        // to reference-based matching.
+        if previous.section_name.is_none() && previous.data_hash != current.data_hash {
+            return Ok(None);
+        }
         if previous.data_hash != current.data_hash {
             changed_sections.push(current.clone());
         }
@@ -10141,25 +10157,23 @@ fn input_content_mismatch_reason(expected_inputs: &[ExpectedInputContent]) -> Op
 }
 
 fn input_identity_mismatch_reason(input_files: &[FileState]) -> Result<Option<String>> {
-    for input in input_files {
-        let path = decode_path(&input.path)?;
-        match input.content.identity_matches_path(&path) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(Some(format!(
+    input_files
+        .par_iter()
+        .map(|input| {
+            let path = decode_path(&input.path)?;
+            match input.content.identity_matches_path(&path) {
+                Ok(true) => Ok(None),
+                Ok(false) => Ok(Some(format!(
                     "input file changed while incremental fast path was running: {}",
                     path.display()
-                )));
-            }
-            Err(error) => {
-                return Ok(Some(format!(
+                ))),
+                Err(error) => Ok(Some(format!(
                     "input file could not be rechecked while incremental fast path was running: {} ({error:?})",
                     path.display()
-                )));
+                ))),
             }
-        }
-    }
-    Ok(None)
+        })
+        .try_reduce(|| None, |left, right| Ok(left.or(right)))
 }
 
 fn refresh_input_file_identities(input_files: &mut [FileState]) {
@@ -12039,7 +12053,7 @@ mod tests {
     }
 
     #[test]
-    fn current_hash_matching_requires_stable_names_and_hashes() {
+    fn current_hash_matching_requires_hashes_and_rejects_changed_anonymous_sections() {
         let bytes = growable_data_elf();
         let input_ref = encode_path(Path::new("input.o"));
         let mut patch_section = PatchSection {
@@ -12064,8 +12078,19 @@ mod tests {
 
         patch_section.data_hash = Some(hash_bytes(&[1, 2, 3, 4]));
         patch_section.section_name = None;
+        let matched = match_patch_sections_from_current_hashes(
+            &bytes,
+            &input_ref,
+            std::slice::from_ref(&patch_section),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matched.changed_sections.is_empty());
+
+        let mut current = bytes.clone();
+        current[0x40] = 9;
         assert!(
-            match_patch_sections_from_current_hashes(&bytes, &input_ref, &[patch_section])
+            match_patch_sections_from_current_hashes(&current, &input_ref, &[patch_section])
                 .unwrap()
                 .is_none()
         );
