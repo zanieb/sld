@@ -160,6 +160,15 @@ logged reuse while state publication was pending. Fresh-seed peak RSS also remai
 in the alternating sample (`4,133,086 KiB` versus `4,111,380 KiB`). A log-asserted candidate proof
 retained both the no-change reuse and changed-input patch fast paths.
 
+The first changed-input link immediately after a fresh forked seed is a separate case from
+steady-state patching. In a four-pair alternating Linux `uv` run, that first edit was flat across
+the patchable-input collection change (`395.19 ms` before versus `398.09 ms` after, with one
+`4.20 s` cold baseline outlier retained in the sample). Log-inspected immediate-edit runs patched
+correctly, but first had to derive missing patch metadata while seed publication was completing;
+an already-established changed-input state patched in `163.09 ms`. A directional thread-count
+probe reduced concurrent no-change reuse, but lengthened publication completion, so simply
+throttling background publication would make the first real edit wait longer.
+
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
 mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
@@ -179,5 +188,7 @@ and a future compiler-supplied diff.
 
 Changing the persisted record encoding, for example by adopting `rkyv`, is not a direct solution to
 the remaining seed foreground cost. Index and section publication is already deferred after output
-completion on the normal path. An alternate zero-copy state format is worth revisiting only if
-profiles show metadata hydration dominating no-change or changed-input relinks.
+completion on the normal path. It may be worth prototyping for first-edit availability, because the
+synchronous profile attributes `763.70-805.42 ms` to persisting the incremental index and section
+sidecar, but only if more detailed profiling shows representation or compression work dominating
+that phase and the versioned compatibility cost remains justified.
