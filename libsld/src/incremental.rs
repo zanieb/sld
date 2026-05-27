@@ -10318,7 +10318,7 @@ fn snapshot_loaded_input_file(
     ));
     let _ = std::fs::remove_file(&tmp);
 
-    if !(clone_snapshot_bytes(path, &tmp) || hardlink_rust_snapshot_bytes(path, &tmp)) {
+    if !(hardlink_rust_snapshot_bytes(path, &tmp) || clone_snapshot_bytes(path, &tmp)) {
         let compressed_target = compressed_input_snapshot_path(state_dir, path);
         let compressed_tmp = compressed_target.with_file_name(format!(
             "{}.{}.tmp",
@@ -10356,7 +10356,7 @@ fn snapshot_loaded_input_file(
 }
 
 fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
-    if clone_snapshot_bytes(source, target) || hardlink_rust_snapshot_bytes(source, target) {
+    if hardlink_rust_snapshot_bytes(source, target) || clone_snapshot_bytes(source, target) {
         return Ok(());
     }
 
