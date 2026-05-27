@@ -10323,6 +10323,8 @@ fn clone_snapshot_bytes(source: &Path, target: &Path) -> bool {
     let Ok(output) = OpenOptions::new().create_new(true).write(true).open(target) else {
         return false;
     };
+    // SAFETY: Both file descriptors are live for the duration of this ioctl, and FICLONE
+    // copies data into `output` without retaining either descriptor.
     if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
         return true;
     }
