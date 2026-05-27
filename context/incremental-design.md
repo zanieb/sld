@@ -143,11 +143,26 @@ installed 651 patchable input snapshots, including 645 hardlinked Rust artifacts
 the median `Snapshot incremental inputs` phase from `114.40 ms` to `105.58 ms`. This is useful for
 such a small change, but also indicates diminishing returns from linker-local syscall reductions.
 
+The same change was checked against its immediate parent on post-seed `uv` relinks with cooled,
+order-balanced Linux samples and asserted incremental logs. No-change reuse was flat
+(`485.28 ms` before versus `482.19 ms` after over five pairs). Changed-input patching showed a
+small drift (`470.44 ms` before versus `481.27 ms` after over ten pairs), but that fast path calls
+the existing single-input snapshot refresh rather than the fresh-seed snapshot installation changed
+here. Balanced first-position RSS measurements for changed-input patching were effectively equal
+(`1516.40 MiB` before versus `1516.31 MiB` after). Keep monitoring the timing drift, but it is not
+evidence that the fresh-seed hardlink shortcut executes on post-seed patches.
+
 `uv`'s package cache is not directly a replacement for these snapshots. Its link modes install
 files from an immutable cache tree and explicitly copy a file such as `RECORD` before installation
 mutates it. The linker instead receives rustc output paths whose old bytes must survive a possible
 subsequent replacement so changed-input diffing remains correct. Wild already takes the applicable
 part of that approach by hardlinking atomically replaced `.rlib` and `.rcgu.o` files.
+
+Related Cargo-native cache experiments reinforce that distinction. A root-output contract plus
+native transient-input stabilization produced strong edit-loop wins on macOS, but a Cargo-native
+`rlib` cache did not provide immutable old inputs to the linker: simultaneous cache and incremental
+SLD use changed dependency `rlib`s and forced full relinks, while a staged cache handoff remained
+slower than ordinary linking for its measured `ty` edit loop.
 
 A larger seed win would require a producer-side contract: for example, Cargo or rustc could provide
 immutable, content-addressed prior input objects, or eventually provide the section diff directly.
