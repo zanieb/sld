@@ -80,8 +80,11 @@ fn read_eh_frame_hdr_fields(object: &crate::Binary) -> Result<FieldValues> {
     );
     values.insert(
         "frame_pointer",
-        (address1 as i64 + i64::from(header.frame_pointer)) as u64
-            + offset_of!(EhFrameHdr, frame_pointer) as u64,
+        decode_pcrel_sdata4(
+            address1,
+            offset_of!(EhFrameHdr, frame_pointer),
+            header.frame_pointer,
+        ),
         Converter::SectionAddress,
         object,
     );
@@ -102,6 +105,11 @@ fn read_eh_frame_hdr_fields(object: &crate::Binary) -> Result<FieldValues> {
 
     verify_frames(object, &mut values, header_entries, address1)?;
     Ok(values)
+}
+
+fn decode_pcrel_sdata4(base: u64, field_offset: usize, displacement: i32) -> u64 {
+    base.wrapping_add(field_offset as u64)
+        .wrapping_add_signed(i64::from(displacement))
 }
 
 fn verify_frames(
@@ -213,4 +221,17 @@ struct EhFrameHdr {
 struct EhFrameHdrEntry {
     frame_ptr: i32,
     frame_info_ptr: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcrel_frame_pointer_can_decode_to_address_zero() {
+        assert_eq!(
+            decode_pcrel_sdata4(0x1000, offset_of!(EhFrameHdr, frame_pointer), -0x1004,),
+            0
+        );
+    }
 }
