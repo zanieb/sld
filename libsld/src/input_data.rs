@@ -33,6 +33,7 @@ use rayon::iter::ParallelIterator;
 use std::fmt::Display;
 use std::fs::File;
 use std::ops::Deref;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +92,9 @@ pub(crate) struct InputFile {
     pub(crate) modifiers: Modifiers,
 
     data: Option<FileData>,
+
+    /// The architecture-specific contents of a universal Mach-O input.
+    data_range: Option<Range<usize>>,
 }
 
 #[derive(Debug)]
@@ -134,7 +138,11 @@ pub(crate) struct InputRef<'data> {
 
 impl InputFile {
     pub(crate) fn data(&self) -> &[u8] {
-        self.data.as_deref().unwrap_or_default()
+        let data = self.data.as_deref().unwrap_or_default();
+        match &self.data_range {
+            Some(range) => &data[range.clone()],
+            None => data,
+        }
     }
 
     #[cfg(test)]
@@ -144,6 +152,7 @@ impl InputFile {
             original_filename: std::path::PathBuf::new(),
             modifiers: crate::args::Modifiers::default(),
             data: None,
+            data_range: None,
         }
     }
 
@@ -154,6 +163,7 @@ impl InputFile {
             original_filename: path.to_owned(),
             modifiers: crate::args::Modifiers::default(),
             data: Some(FileData::new(path, false).unwrap()),
+            data_range: None,
         }
     }
 }
@@ -558,6 +568,7 @@ fn process_thin_archive<'data, P: Platform>(
                         ..input_file.modifiers
                     },
                     data: Some(file_data),
+                    data_range: None,
                 };
 
                 let input_file = &*state.inputs_arena.alloc(input_file);
@@ -616,20 +627,20 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             None => result,
         }?;
 
+        let (kind, data_range) = FileKind::identify_input_bytes(&data.bytes)?;
+
         let input_file = self.inputs_arena.alloc(InputFile {
             filename: absolute_path.to_owned(),
             original_filename: request.paths.original,
             modifiers: request.modifiers,
             data: Some(data),
+            data_range,
         });
 
         let input_ref = InputRef {
             file: input_file,
             entry: None,
         };
-
-        let data = input_ref.file.data.as_ref().unwrap();
-        let kind = FileKind::identify_bytes(&data.bytes)?;
 
         match kind {
             FileKind::Archive => process_archive(input_file, &Arc::new(file), self),
@@ -759,6 +770,7 @@ fn read_script_data<'data>(
         original_filename: path.to_owned(),
         modifiers: Default::default(),
         data: Some(data),
+        data_range: None,
     });
 
     Ok(ScriptData { raw: file.data() })

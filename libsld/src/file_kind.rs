@@ -11,6 +11,9 @@ use object::macho;
 use object::read::elf::FileHeader;
 use object::read::elf::SectionHeader;
 use object::read::macho::MachHeader;
+use object::read::macho::MachOFatFile32;
+use object::read::macho::MachOFatFile64;
+use std::ops::Range;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -86,6 +89,15 @@ impl FileKind {
         }
     }
 
+    pub(crate) fn identify_input_bytes(bytes: &[u8]) -> Result<(FileKind, Option<Range<usize>>)> {
+        let data_range = macho_arm64_slice_range(bytes)?;
+        let selected_bytes = match &data_range {
+            Some(range) => &bytes[range.clone()],
+            None => bytes,
+        };
+        Ok((Self::identify_bytes(selected_bytes)?, data_range))
+    }
+
     pub(crate) fn is_compiler_ir(self) -> bool {
         matches!(self, FileKind::LlvmIr | FileKind::GccIr)
     }
@@ -93,6 +105,38 @@ impl FileKind {
     pub(crate) fn is_relocatable_object(self) -> bool {
         matches!(self, FileKind::ElfObject | FileKind::MachOObject)
     }
+}
+
+/// Selects the ARM64 payload of a universal Mach-O input, if `bytes` is universal.
+fn macho_arm64_slice_range(bytes: &[u8]) -> Result<Option<Range<usize>>> {
+    let range = if bytes.starts_with(&macho::FAT_MAGIC.to_be_bytes()) {
+        let file = MachOFatFile32::parse(bytes)?;
+        arm64_slice_range(bytes, file.arches())?
+    } else if bytes.starts_with(&macho::FAT_MAGIC_64.to_be_bytes()) {
+        let file = MachOFatFile64::parse(bytes)?;
+        arm64_slice_range(bytes, file.arches())?
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some(range))
+}
+
+fn arm64_slice_range<Arch: object::read::macho::FatArch>(
+    bytes: &[u8],
+    arches: &[Arch],
+) -> Result<Range<usize>> {
+    let arch = arches
+        .iter()
+        .find(|arch| arch.cputype() == macho::CPU_TYPE_ARM64)
+        .ok_or_else(|| crate::error!("Universal Mach-O input contains no ARM64 slice"))?;
+    let slice = arch.data(bytes)?;
+    let start = usize::try_from(arch.file_range().0)
+        .map_err(|_| crate::error!("Universal Mach-O slice offset exceeds usize"))?;
+    let end = start
+        .checked_add(slice.len())
+        .ok_or_else(|| crate::error!("Universal Mach-O slice range overflow"))?;
+    Ok(start..end)
 }
 
 /// Returns whether the supplied file contents is GCC IR. Scanning the entire section table would be
@@ -136,5 +180,49 @@ impl std::fmt::Display for FileKind {
             FileKind::GccIr => "GCC-IR",
         };
         std::fmt::Display::fmt(s, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileKind;
+    use object::macho;
+
+    #[test]
+    fn selects_arm64_archive_from_universal_macho_input() {
+        const X86_64_OFFSET: usize = 0x1000;
+        const ARM64_OFFSET: usize = 0x2000;
+        let archive = object::archive::MAGIC;
+        let mut bytes = Vec::new();
+
+        push_be_u32(&mut bytes, macho::FAT_MAGIC);
+        push_be_u32(&mut bytes, 2);
+        push_fat_arch(&mut bytes, macho::CPU_TYPE_X86_64, X86_64_OFFSET, 4);
+        push_fat_arch(
+            &mut bytes,
+            macho::CPU_TYPE_ARM64,
+            ARM64_OFFSET,
+            archive.len(),
+        );
+        bytes.resize(X86_64_OFFSET, 0);
+        bytes.extend_from_slice(b"x86!");
+        bytes.resize(ARM64_OFFSET, 0);
+        bytes.extend_from_slice(&archive);
+
+        let (kind, range) = FileKind::identify_input_bytes(&bytes).unwrap();
+        assert_eq!(kind, FileKind::Archive);
+        assert_eq!(&bytes[range.unwrap()], &archive);
+    }
+
+    fn push_fat_arch(bytes: &mut Vec<u8>, cpu_type: u32, offset: usize, size: usize) {
+        push_be_u32(bytes, cpu_type);
+        push_be_u32(bytes, 0);
+        push_be_u32(bytes, offset as u32);
+        push_be_u32(bytes, size as u32);
+        push_be_u32(bytes, 0);
+    }
+
+    fn push_be_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_be_bytes());
     }
 }
