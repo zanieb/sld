@@ -57,7 +57,7 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@7448805ee055a120c89af897795ebbf25efddd52 # cargo-zigbuild
+      - uses: taiki-e/install-action@7be9fd86bd1707236395105d6e9329dd1511a7e1 # cargo-zigbuild
         if: matrix.build == 'zigbuild'
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: matrix.build == 'zigbuild'
